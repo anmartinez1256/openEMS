@@ -22,7 +22,13 @@
 #include <vector>
 #include <cmath>
 #include <complex>
+#include <cstdlib>
 #include <iostream>
+
+#ifdef __APPLE__
+#include <Accelerate/Accelerate.h>
+#define NF2FF_HAVE_CBLAS
+#endif
 
 using namespace std;
 
@@ -350,6 +356,118 @@ bool nf2ff_calc::AddPlane(float **lines, unsigned int* numLines, ArrayLib::Array
 	return true;
 }
 
+/***********************************************************************/
+
+void nf2ff_calc::CalcPlaneSeparable(int ny, float **lines, unsigned int* numLines, const float* normDir, const float* edge_length_P, const float* edge_length_PP,
+									ArrayLib::ArrayNIJK<std::complex<float>> &E_field, ArrayLib::ArrayNIJK<std::complex<float>> &H_field,
+									ArrayLib::ArrayIJ<std::complex<float>> &Nt, ArrayLib::ArrayIJ<std::complex<float>> &Np, ArrayLib::ArrayIJ<std::complex<float>> &Lt, ArrayLib::ArrayIJ<std::complex<float>> &Lp)
+{
+	// On a Cartesian plane exp(jk r.cos(psi)) = exp(jk a (x_i-cx)) * exp(jk b (y_j-cy)) * exp(jk c (z0-cz)), so for every
+	// direction the surface integral of a current component is  sum_i Q_i  sum_j P_j F(i,j)  with per-line phasors P and Q
+	// (the cell areas folded in). The inner sum over all directions at once is one matrix product per plane:
+	//   G[d][c,i] = sum_j P[d][j] F[c,i][j]   (cgemm on Apple's Accelerate, a plain loop elsewhere), then S_c[d] = sum_i Q[d][i] G[d][c,i].
+	// The legacy loop (one complex exp per cell and direction) stays for cylindrical meshes and OPENEMS_NF2FF_LEGACY=1.
+	const int nP  = (ny+1)%3;
+	const int nPP = (ny+2)%3;
+	const unsigned int NP = numLines[nP], NPP = numLines[nPP];
+	const unsigned int numDir = m_numTheta*m_numPhi;
+	if (NP==0 || NPP==0 || numDir==0)
+		return;
+
+	// F[c][i][j]: Js_x,Js_y,Js_z,Ms_x,Ms_y,Ms_z at cell (i along nP, j along nPP); Js = n x H, Ms = -n x E (eq. 8.15a/b)
+	vector<complex<float>> F((size_t)6*NP*NPP);
+	unsigned int pos[3] = {0,0,0};
+	for (unsigned int i=0; i<NP; ++i)
+	{
+		pos[nP] = i;
+		for (unsigned int j=0; j<NPP; ++j)
+		{
+			pos[nPP] = j;
+			const complex<float> H0 = H_field(0, pos[0], pos[1], pos[2]), H1 = H_field(1, pos[0], pos[1], pos[2]), H2 = H_field(2, pos[0], pos[1], pos[2]);
+			const complex<float> E0 = E_field(0, pos[0], pos[1], pos[2]), E1 = E_field(1, pos[0], pos[1], pos[2]), E2 = E_field(2, pos[0], pos[1], pos[2]);
+			const size_t ij = (size_t)i*NPP + j;
+			F[(size_t)0*NP*NPP + ij] = normDir[1]*H2 - normDir[2]*H1;
+			F[(size_t)1*NP*NPP + ij] = normDir[2]*H0 - normDir[0]*H2;
+			F[(size_t)2*NP*NPP + ij] = normDir[0]*H1 - normDir[1]*H0;
+			F[(size_t)3*NP*NPP + ij] = normDir[2]*E1 - normDir[1]*E2;
+			F[(size_t)4*NP*NPP + ij] = normDir[0]*E2 - normDir[2]*E0;
+			F[(size_t)5*NP*NPP + ij] = normDir[1]*E0 - normDir[0]*E1;
+		}
+	}
+
+	const float k = 2*PI*m_freq/C0*sqrt(m_permittivity*m_permeability);
+	// direction cosines per axis: x: cosP*sinT, y: sinP*sinT, z: cosT; and the angle factors of eq. 8.23/8.24
+	vector<float> dcos((size_t)3*numDir), cosT_cosP(numDir), cosT_sinP(numDir), sinTv(numDir), cosPv(numDir), sinPv(numDir);
+	for (unsigned int tn=0, d=0; tn<m_numTheta; ++tn)
+		for (unsigned int pn=0; pn<m_numPhi; ++pn, ++d)
+		{
+			const float sinT = sin(m_theta[tn]), cosT = cos(m_theta[tn]);
+			const float sinP = sin(m_phi[pn]),   cosP = cos(m_phi[pn]);
+			dcos[3*d+0] = cosP*sinT;
+			dcos[3*d+1] = sinP*sinT;
+			dcos[3*d+2] = cosT;
+			cosT_cosP[d] = cosT*cosP; cosT_sinP[d] = cosT*sinP;
+			sinTv[d] = sinT; cosPv[d] = cosP; sinPv[d] = sinP;
+		}
+
+	const float x0 = lines[ny][0] - m_centerCoord[ny];
+	vector<float> xP(NP), xPP(NPP);
+	for (unsigned int i=0; i<NP; ++i)  xP[i]  = lines[nP][i]  - m_centerCoord[nP];
+	for (unsigned int j=0; j<NPP; ++j) xPP[j] = lines[nPP][j] - m_centerCoord[nPP];
+
+	// directions in blocks so that G (block x 6*NP) stays cache friendly
+	unsigned int block = (unsigned int)max<size_t>(16, min<size_t>(numDir, (1u<<21)/(6*NP)));
+	vector<complex<float>> P((size_t)block*NPP), Q((size_t)block*NP), G((size_t)block*6*NP);
+	const complex<float> _I_(0,1);
+	for (unsigned int d0=0; d0<numDir; d0+=block)
+	{
+		const unsigned int nd = min(block, numDir-d0);
+		for (unsigned int b=0; b<nd; ++b)
+		{
+			const float* dc = &dcos[3*(size_t)(d0+b)];
+			const complex<float> ez = exp(_I_*(k*dc[ny]*x0));
+			for (unsigned int j=0; j<NPP; ++j)
+				P[(size_t)b*NPP+j] = edge_length_PP[j]*exp(_I_*(k*dc[nPP]*xPP[j]));
+			for (unsigned int i=0; i<NP; ++i)
+				Q[(size_t)b*NP+i] = edge_length_P[i]*exp(_I_*(k*dc[nP]*xP[i]))*ez;
+		}
+#ifdef NF2FF_HAVE_CBLAS
+		const complex<float> one(1,0), zero(0,0);
+		cblas_cgemm(CblasRowMajor, CblasNoTrans, CblasTrans, nd, 6*NP, NPP, &one, P.data(), NPP, F.data(), NPP, &zero, G.data(), 6*NP);
+#else
+		for (unsigned int b=0; b<nd; ++b)
+			for (unsigned int ci=0; ci<6*NP; ++ci)
+			{
+				complex<float> acc(0,0);
+				const complex<float>* f = &F[(size_t)ci*NPP];
+				const complex<float>* p = &P[(size_t)b*NPP];
+				for (unsigned int j=0; j<NPP; ++j)
+					acc += p[j]*f[j];
+				G[(size_t)b*6*NP+ci] = acc;
+			}
+#endif
+		for (unsigned int b=0; b<nd; ++b)
+		{
+			const unsigned int d = d0+b;
+			complex<double> S[6];
+			for (int c=0; c<6; ++c)
+			{
+				complex<double> acc(0,0);
+				const complex<float>* g = &G[(size_t)b*6*NP + (size_t)c*NP];
+				const complex<float>* q = &Q[(size_t)b*NP];
+				for (unsigned int i=0; i<NP; ++i)
+					acc += complex<double>(q[i]*g[i]);
+				S[c] = acc;
+			}
+			const unsigned int tn = d/m_numPhi, pn = d%m_numPhi;
+			Nt(tn, pn) += complex<float>(S[0]*(double)cosT_cosP[d] + S[1]*(double)cosT_sinP[d] - S[2]*(double)sinTv[d]);
+			Np(tn, pn) += complex<float>(S[1]*(double)cosPv[d] - S[0]*(double)sinPv[d]);
+			Lt(tn, pn) += complex<float>(S[3]*(double)cosT_cosP[d] + S[4]*(double)cosT_sinP[d] - S[5]*(double)sinTv[d]);
+			Lp(tn, pn) += complex<float>(S[4]*(double)cosPv[d] - S[3]*(double)sinPv[d]);
+		}
+	}
+}
+
 bool nf2ff_calc::AddSinglePlane(float **lines, unsigned int* numLines, ArrayLib::ArrayNIJK<std::complex<float>> &E_field, ArrayLib::ArrayNIJK<std::complex<float>> &H_field, int MeshType)
 {
 	//find normal direction
@@ -361,9 +479,6 @@ bool nf2ff_calc::AddSinglePlane(float **lines, unsigned int* numLines, ArrayLib:
 	}
 	int nP  = (ny+1)%3;
 	int nPP = (ny+2)%3;
-
-	ArrayLib::ArrayNIJK<std::complex<float>> Js("Js", numLines);
-	ArrayLib::ArrayNIJK<std::complex<float>> Ms("Ms", numLines);
 
 	float normDir[3]= {0,0,0};
 	if (lines[ny][0]>=m_centerCoord[ny])
@@ -415,6 +530,21 @@ bool nf2ff_calc::AddSinglePlane(float **lines, unsigned int* numLines, ArrayLib:
 			}
 	unsigned int numAngles[2] = {m_numTheta, m_numPhi};
 
+	ArrayLib::ArrayIJ<complex<float>> Nt("l_Nt", numAngles);
+	ArrayLib::ArrayIJ<complex<float>> Np("l_Np", numAngles);
+	ArrayLib::ArrayIJ<complex<float>> Lt("l_Lt", numAngles);
+	ArrayLib::ArrayIJ<complex<float>> Lp("l_Lp", numAngles);
+
+	static const bool legacy = getenv("OPENEMS_NF2FF_LEGACY")!=NULL;
+	if (MeshType==0 && !legacy)
+	{
+		CalcPlaneSeparable(ny, lines, numLines, normDir, edge_length_P, edge_length_PP, E_field, H_field, Nt, Np, Lt, Lp);
+	}
+	else
+	{
+	ArrayLib::ArrayNIJK<std::complex<float>> Js("Js", numLines);
+	ArrayLib::ArrayNIJK<std::complex<float>> Ms("Ms", numLines);
+
 	// setup multi-threading jobs
 	vector<unsigned int> jpt = AssignJobs2Threads(numLines[nP], m_numThreads, true);
 	m_numThreads = jpt.size();
@@ -457,11 +587,6 @@ bool nf2ff_calc::AddSinglePlane(float **lines, unsigned int* numLines, ArrayLib:
 
 	m_Barrier->wait(); //combine all thread local Nt,Np,Lt and Lp
 
-	ArrayLib::ArrayIJ<complex<float>> Nt("l_Nt", numAngles);
-	ArrayLib::ArrayIJ<complex<float>> Np("l_Np", numAngles);
-	ArrayLib::ArrayIJ<complex<float>> Lt("l_Lt", numAngles);
-	ArrayLib::ArrayIJ<complex<float>> Lp("l_Lp", numAngles);
-
 	for (unsigned int n=0; n<m_numThreads; n++)
 	{
 		for (unsigned int tn=0;tn<m_numTheta;++tn)
@@ -482,10 +607,12 @@ bool nf2ff_calc::AddSinglePlane(float **lines, unsigned int* numLines, ArrayLib:
 	m_thread_group.join_all(); // wait for termination
 	delete m_Barrier;
 	m_Barrier = NULL;
+	delete[] thread_data; thread_data=NULL;
 
 	//cleanup Js & Ms
 	Js.Reset();
 	Ms.Reset();
+	}
 
 	ArrayLib::ArrayIJ<std::complex<double>>& E_theta = *m_E_theta;
 	ArrayLib::ArrayIJ<std::complex<double>>& E_phi   = *m_E_phi;
@@ -518,7 +645,6 @@ bool nf2ff_calc::AddSinglePlane(float **lines, unsigned int* numLines, ArrayLib:
 	//cleanup Nx and Lx
 	delete[] edge_length_P; edge_length_P=NULL;
 	delete[] edge_length_PP; edge_length_PP=NULL;
-	delete[] thread_data; thread_data=NULL;
 
 	// Maximum directivity (unitless) across sampled angles theta and phi
 	// P_max (W/m^2), m_radPower (W), m_radius (m)

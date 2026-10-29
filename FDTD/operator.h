@@ -164,6 +164,8 @@ public:
 
 	//! Get the disc line delta in \a n direction (in drawing units)
 	virtual double GetDiscDelta(int n, unsigned int pos, bool dualMesh=false) const;
+	//! GetDiscDelta() without the per-axis table (the formula); Init_EC() fills m_DiscDelta from it
+	double CalcDiscDelta(int n, unsigned int pos, bool dualMesh) const;
 
 	//! Get the coordinates for a given node index and component, according to the yee-algorithm. Returns true if inside the FDTD domain.
 	virtual bool GetYeeCoords(int ny, unsigned int pos[3], double* coords, bool dualMesh) const;
@@ -272,12 +274,14 @@ protected:
 
 	double CalcTimestep_Var1();
 	double CalcTimestep_Var3();
+	//! Number of threads for the setup loops (timestep search, Calc_ECOperatorPos); the multithreaded operator overrides this
+	virtual unsigned int GetNumSetupThreads() const {return 1;}
 
 	//! Calculate the FDTD equivalent circuit parameter for the given position and direction ny. \sa Calc_EffMat_Pos
 	virtual bool Calc_ECPos(
 		int ny,
 		const unsigned int* pos,
-		double* EC, std::vector<CSPrimitives *> vPrims
+		double* EC, const std::vector<CSPrimitives*>& vPrims
 	) const;
 
 	//! Get the FDTD raw disc delta, needed by Calc_EffMatPos() \sa Calc_EffMatPos
@@ -293,7 +297,7 @@ protected:
 		int ny,
 		const double coords[3],
 		int MatType,
-		std::vector<CSPrimitives*> vPrims,
+		const std::vector<CSPrimitives*>& vPrims,
 		bool markAsUsed=true
 	) const;
 
@@ -304,21 +308,21 @@ protected:
 		int ny,
 		const unsigned int* pos,
 		double* EffMat,
-		std::vector<CSPrimitives*> vPrims
+		const std::vector<CSPrimitives*>& vPrims
 	) const;
 
 	virtual bool AverageMatCellCenter(
 		int ny,
 		const unsigned int* pos,
 		double* EffMat,
-		std::vector<CSPrimitives*> vPrims
+		const std::vector<CSPrimitives*>& vPrims
 	) const;
 
 	virtual bool AverageMatQuarterCell(
 		int ny,
 		const unsigned int* pos,
 		double* EffMat,
-		std::vector<CSPrimitives*> vPrims
+		const std::vector<CSPrimitives*>& vPrims
 	) const;
 
 	//! Calc operator at certain \a pos
@@ -349,6 +353,7 @@ protected:
 	FDTD_FLOAT* EC_R[3];
 
 	AdrOp* MainOp;
+	std::vector<double> m_DiscDelta[3][2]; //!< GetDiscDelta() per axis and mesh (0: main, 1: dual), filled by Init_EC(), cleared by Reset()
 
 	std::vector<Operator_Extension*> m_Op_exts;
 

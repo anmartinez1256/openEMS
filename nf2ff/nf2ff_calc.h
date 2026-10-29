@@ -120,6 +120,10 @@ protected:
 
 	int GetNormalDir(unsigned int* numLines);
 	bool AddSinglePlane(float **lines, unsigned int* numLines, ArrayLib::ArrayNIJK<std::complex<float>> &E_field, ArrayLib::ArrayNIJK<std::complex<float>> &H_field, int MeshType=0);
+	//! Cartesian plane: the phase factor separates per mesh line, so N and L become matrix products (no exp per cell and direction)
+	void CalcPlaneSeparable(int ny, float **lines, unsigned int* numLines, const float* normDir, const float* edge_length_P, const float* edge_length_PP,
+							ArrayLib::ArrayNIJK<std::complex<float>> &E_field, ArrayLib::ArrayNIJK<std::complex<float>> &H_field,
+							ArrayLib::ArrayIJ<std::complex<float>> &Nt, ArrayLib::ArrayIJ<std::complex<float>> &Np, ArrayLib::ArrayIJ<std::complex<float>> &Lt, ArrayLib::ArrayIJ<std::complex<float>> &Lp);
 	bool AddMirrorPlane(int n, float **lines, unsigned int* numLines, ArrayLib::ArrayNIJK<std::complex<float>> &E_field, ArrayLib::ArrayNIJK<std::complex<float>> &H_field, int MeshType=0);
 
 	//boost multi-threading

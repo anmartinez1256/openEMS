@@ -18,6 +18,25 @@
 #include <fstream>
 #include <algorithm>
 #include <stdexcept>
+#include <thread>
+#include <chrono>
+#include <iostream>
+
+// OPENEMS_SETUP_TIMING=1 prints the time of every phase of the operator setup to stderr
+struct SetupTimer
+{
+	SetupTimer(const char* what) : m_what(what), m_t0(std::chrono::steady_clock::now()) {}
+	static bool Enabled() { static const bool on = getenv("OPENEMS_SETUP_TIMING")!=NULL; return on; }
+	void Lap(const std::string& step)
+	{
+		if (!Enabled()) return;
+		std::chrono::steady_clock::time_point t = std::chrono::steady_clock::now();
+		std::cerr << "setup timing: " << m_what << " " << step << ": " << std::chrono::duration<double>(t-m_t0).count() << " s" << std::endl;
+		m_t0 = t;
+	}
+	const char* m_what;
+	std::chrono::steady_clock::time_point m_t0;
+};
 #include "operator.h"
 #include "engine.h"
 #include "extensions/operator_extension.h"
@@ -138,6 +157,11 @@ void Operator::Delete()
 
 void Operator::Reset()
 {
+	for (int n=0; n<3; ++n)
+	{
+		m_DiscDelta[n][0].clear();
+		m_DiscDelta[n][1].clear();
+	}
 	Delete();
 	Operator_Base::Reset();
 }
@@ -161,6 +185,14 @@ double Operator::GetDiscDelta(int n, unsigned int pos, bool dualMesh) const
 {
 	if ((n<0) || (n>2)) return 0.0;
 	if (pos>=numLines[n]) return 0.0;
+	const std::vector<double>& table = m_DiscDelta[n][dualMesh ? 1 : 0];
+	if (pos<table.size())
+		return table[pos];
+	return CalcDiscDelta(n, pos, dualMesh);
+}
+
+double Operator::CalcDiscDelta(int n, unsigned int pos, bool dualMesh) const
+{
 	double delta=0;
 	if (dualMesh==false)
 	{
@@ -956,7 +988,8 @@ void Operator::SetExcitationSignal(Excitation* exc)
 
 void Operator::Calc_ECOperatorPos(int n, unsigned int* pos)
 {
-	unsigned int i = MainOp->SetPos(pos[0],pos[1],pos[2]);
+	// linear index as MainOp->SetPos() would return it, without touching the shared address operator (thread safe)
+	unsigned int i = pos[0] + pos[1]*numLines[0] + pos[2]*numLines[0]*numLines[1];
 	double C = EC_C[n][i];
 	double G = EC_G[n][i];
 	if (C>0)
@@ -986,11 +1019,14 @@ void Operator::Calc_ECOperatorPos(int n, unsigned int* pos)
 
 int Operator::CalcECOperator( DebugFlags debugFlags )
 {
+	SetupTimer timer("Operator::CalcECOperator");
 	Init_EC();
 	InitDataStorage();
+	timer.Lap("Init_EC");
 
 	if (Calc_EC()==0)
 		return -1;
+	timer.Lap("Calc_EC (material averaging)");
 
 	m_InvaildTimestep = false;
 	opt_dT = 0;
@@ -1021,24 +1057,33 @@ int Operator::CalcECOperator( DebugFlags debugFlags )
 	}
 
 	m_Exc->Reset(dT);
+	timer.Lap("CalcTimestep");
 
 	InitOperator();
+	timer.Lap("InitOperator");
 
-	unsigned int pos[3];
-
-	for (int n=0; n<3; ++n)
+	// operator coefficients per cell, one x-range per setup thread (every cell writes only its own entries)
 	{
-		for (pos[0]=0; pos[0]<numLines[0]; ++pos[0])
+		const unsigned int nThreads = std::max(1u, std::min(GetNumSetupThreads(), numLines[0]));
+		auto job = [this, nThreads](unsigned int t)
 		{
-			for (pos[1]=0; pos[1]<numLines[1]; ++pos[1])
-			{
-				for (pos[2]=0; pos[2]<numLines[2]; ++pos[2])
-				{
-					Calc_ECOperatorPos(n,pos);
-				}
-			}
-		}
+			unsigned int pos[3];
+			const unsigned int x0 = (unsigned int)((unsigned long long)numLines[0]*t/nThreads);
+			const unsigned int x1 = (unsigned int)((unsigned long long)numLines[0]*(t+1)/nThreads);
+			for (int n=0; n<3; ++n)
+				for (pos[0]=x0; pos[0]<x1; ++pos[0])
+					for (pos[1]=0; pos[1]<numLines[1]; ++pos[1])
+						for (pos[2]=0; pos[2]<numLines[2]; ++pos[2])
+							Calc_ECOperatorPos(n,pos);
+		};
+		std::vector<std::thread> threads;
+		for (unsigned int t=1; t<nThreads; ++t)
+			threads.emplace_back(job, t);
+		job(0);
+		for (size_t t=0; t<threads.size(); ++t)
+			threads[t].join();
 	}
+	timer.Lap("Calc_ECOperatorPos");
 
 	//Apply PEC to all boundary's
 	bool PEC[6]={1,1,1,1,1,1};
@@ -1047,20 +1092,27 @@ int Operator::CalcECOperator( DebugFlags debugFlags )
 		if (m_BC[n]==-1)
 			PEC[n] = false;
 	ApplyElectricBC(PEC);
+	timer.Lap("ApplyElectricBC");
 
 	CalcPEC();
+	timer.Lap("CalcPEC");
 
 	Calc_LumpedElements();
+	timer.Lap("Calc_LumpedElements");
 
 	bool PMC[6];
 	for (int n=0; n<6; ++n)
 		PMC[n] = m_BC[n]==1;
 	ApplyMagneticBC(PMC);
+	timer.Lap("ApplyMagneticBC");
 
 	//all information available for extension... create now...
 	for (size_t n=0; n<m_Op_exts.size(); ++n)
+	{
 		if (m_Op_exts.at(n)->BuildExtension()==false)
 			m_Op_exts.at(n)->SetActive(false); //extension has nothing to do or failed to build, drop it below
+		timer.Lap(std::string("BuildExtension ") + m_Op_exts.at(n)->GetExtensionName());
+	}
 
 	//remove inactive extensions
 	std::vector<Operator_Extension*>::iterator it = m_Op_exts.begin();
@@ -1192,7 +1244,7 @@ bool Operator::Calc_ECPos(
 	int ny,
 	const unsigned int* pos,
 	double* EC,
-	std::vector<CSPrimitives*> vPrims
+	const std::vector<CSPrimitives*>& vPrims
 ) const
 {
 	double EffMat[4];
@@ -1279,13 +1331,25 @@ double Operator::GetMaterial(
 	int ny,
 	const double* coords,
 	int MatType,
-	std::vector<CSPrimitives*> vPrims,
+	const std::vector<CSPrimitives*>& vPrims,
 	bool markAsUsed
 ) const
 {
-	CSProperties* prop = CSX->GetPropertyByCoordPriority(coords,vPrims,markAsUsed);
-
-	CSPropMaterial* mat = dynamic_cast<CSPropMaterial*>(prop);
+	// The material averaging asks for two types at the same coordinate in a row (epsilon+kappa, mue+sigma):
+	// remember the last lookup per thread, the primitives do not change during the setup.
+	struct LastLookup { double coords[3]; const CSPrimitives* const* prims; size_t num; CSPropMaterial* mat; bool valid; };
+	static thread_local LastLookup last = {{0,0,0}, NULL, 0, NULL, false};
+	CSPropMaterial* mat;
+	if (last.valid && last.coords[0]==coords[0] && last.coords[1]==coords[1] && last.coords[2]==coords[2]
+		&& last.prims==vPrims.data() && last.num==vPrims.size())
+		mat = last.mat;
+	else
+	{
+		CSProperties* prop = CSX->FindPropertyByCoordPriority(coords,vPrims,markAsUsed);
+		mat = dynamic_cast<CSPropMaterial*>(prop);
+		last.coords[0]=coords[0]; last.coords[1]=coords[1]; last.coords[2]=coords[2];
+		last.prims = vPrims.data(); last.num = vPrims.size(); last.mat = mat; last.valid = markAsUsed;
+	}
 	if (mat)
 	{
 		switch (MatType)
@@ -1328,7 +1392,7 @@ bool Operator::AverageMatCellCenter(
 	int ny,
 	const unsigned int* pos,
 	double* EffMat,
-	std::vector<CSPrimitives *> vPrims
+	const std::vector<CSPrimitives*>& vPrims
 ) const
 {
 	int n=ny;
@@ -1439,7 +1503,7 @@ bool Operator::AverageMatQuarterCell(
 	int ny,
 	const unsigned int* pos,
 	double* EffMat,
-	std::vector<CSPrimitives*> vPrims
+	const std::vector<CSPrimitives*>& vPrims
 ) const
 {
 	int n=ny;
@@ -1558,7 +1622,7 @@ bool Operator::Calc_EffMatPos(
 	int ny,
 	const unsigned int* pos,
 	double* EffMat,
-	std::vector<CSPrimitives *> vPrims
+	const std::vector<CSPrimitives*>& vPrims
 ) const
 {
 	switch (m_MatAverageMethod)
@@ -1765,6 +1829,15 @@ bool Operator::IsLEparRC(const CSPropLumpedElement* const p_prop)
 
 void Operator::Init_EC()
 {
+	// the material averaging asks for every edge length many times per cell: tabulate GetDiscDelta()
+	for (int n=0; n<3; ++n)
+		for (int dual=0; dual<2; ++dual)
+		{
+			m_DiscDelta[n][dual].clear();
+			m_DiscDelta[n][dual].reserve(numLines[n]);
+			for (unsigned int pos=0; pos<numLines[n]; ++pos)
+				m_DiscDelta[n][dual].push_back(CalcDiscDelta(n, pos, dual!=0));
+		}
 	for (int n=0; n<3; ++n)
 	{
 		//init x-cell-array
@@ -1944,65 +2017,99 @@ double Operator::CalcTimestep_Var3()
 {
 	dT=1e200;
 	m_Used_TS_Name = std::string("Rennings_2");
-	double newT;
-	unsigned int pos[3];
 	unsigned int smallest_pos[3] = {0, 0, 0};
 	unsigned int smallest_n = 0;
-	unsigned int ipos;
-	double w_total=0;
-	double wqp=0,wt1=0,wt2=0;
-	double wt_4[4]={0,0,0,0};
 	MainOp->SetReflection2Cell();
-	for (int n=0; n<3; ++n)
+
+	// One z-range per setup thread. The result is the same as the single loop: the first cell in loop order
+	// (n, z, y, x) with the smallest timestep.
+	struct Best { double dT; unsigned int n; unsigned int pos[3]; };
+	const unsigned int nThreads = std::max(1u, std::min(GetNumSetupThreads(), numLines[2]));
+	std::vector<Best> best(nThreads, Best{1e200, 0, {0, 0, 0}});
+	auto job = [this, nThreads, &best](unsigned int t)
 	{
-		int nP = (n+1)%3;
-		int nPP = (n+2)%3;
-
-		for (pos[2]=0; pos[2]<numLines[2]; ++pos[2])
+		Best& b = best[t];
+		double newT;
+		unsigned int pos[3];
+		unsigned int ipos;
+		double w_total=0;
+		double wqp=0,wt1=0,wt2=0;
+		double wt_4[4]={0,0,0,0};
+		const unsigned int z0 = (unsigned int)((unsigned long long)numLines[2]*t/nThreads);
+		const unsigned int z1 = (unsigned int)((unsigned long long)numLines[2]*(t+1)/nThreads);
+		// MainOp with SetReflection2Cell(): a shift by +-1 that leaves the domain stays in the cell, so the shifted
+		// index is plain arithmetic on the clamped position (same memory reads as the address operator)
+		const unsigned int stride[3] = {1, numLines[0], numLines[0]*numLines[1]};
+		auto shifted = [&](const unsigned int* p, int ny, int step) -> unsigned int
 		{
-			for (pos[1]=0; pos[1]<numLines[1]; ++pos[1])
+			const int q = (int)p[ny]+step;
+			return (q>=0 && q<(int)numLines[ny]) ? (unsigned int)q : p[ny];
+		};
+		for (int n=0; n<3; ++n)
+		{
+			int nP = (n+1)%3;
+			int nPP = (n+2)%3;
+
+			for (pos[2]=z0; pos[2]<z1; ++pos[2])
 			{
-				for (pos[0]=0; pos[0]<numLines[0]; ++pos[0])
+				for (pos[1]=0; pos[1]<numLines[1]; ++pos[1])
 				{
-					MainOp->ResetShift();
-					ipos = MainOp->SetPos(pos[0],pos[1],pos[2]);
-					wqp  = 1/(EC_L[nPP][ipos]*EC_C[n][MainOp->GetShiftedPos(nP ,1)]) + 1/(EC_L[nPP][ipos]*EC_C[n][ipos]);
-					wqp += 1/(EC_L[nP ][ipos]*EC_C[n][MainOp->GetShiftedPos(nPP,1)]) + 1/(EC_L[nP ][ipos]*EC_C[n][ipos]);
-					ipos = MainOp->Shift(nP,-1);
-					wqp += 1/(EC_L[nPP][ipos]*EC_C[n][MainOp->GetShiftedPos(nP ,1)]) + 1/(EC_L[nPP][ipos]*EC_C[n][ipos]);
-					ipos = MainOp->Shift(nPP,-1);
-					wqp += 1/(EC_L[nP ][ipos]*EC_C[n][MainOp->GetShiftedPos(nPP,1)]) + 1/(EC_L[nP ][ipos]*EC_C[n][ipos]);
-
-					MainOp->ResetShift();
-					ipos = MainOp->SetPos(pos[0],pos[1],pos[2]);
-					wt_4[0] = 1/(EC_L[nPP][ipos]						  *EC_C[nP ][ipos]);
-					wt_4[1] = 1/(EC_L[nPP][MainOp->GetShiftedPos(nP ,-1)] *EC_C[nP ][ipos]);
-					wt_4[2] = 1/(EC_L[nP ][ipos]						  *EC_C[nPP][ipos]);
-					wt_4[3] = 1/(EC_L[nP ][MainOp->GetShiftedPos(nPP,-1)] *EC_C[nPP][ipos]);
-
-					wt1 = wt_4[0]+wt_4[1]+wt_4[2]+wt_4[3] - 2*min(wt_4,4);
-
-					MainOp->ResetShift();
-					ipos = MainOp->SetPos(pos[0],pos[1],pos[2]);
-					wt_4[0] = 1/(EC_L[nPP][ipos]						  *EC_C[nP ][MainOp->GetShiftedPos(n,1)]);
-					wt_4[1] = 1/(EC_L[nPP][MainOp->GetShiftedPos(nP ,-1)] *EC_C[nP ][MainOp->GetShiftedPos(n,1)]);
-					wt_4[2] = 1/(EC_L[nP ][ipos]						  *EC_C[nPP][MainOp->GetShiftedPos(n,1)]);
-					wt_4[3] = 1/(EC_L[nP ][MainOp->GetShiftedPos(nPP,-1)] *EC_C[nPP][MainOp->GetShiftedPos(n,1)]);
-
-					wt2 = wt_4[0]+wt_4[1]+wt_4[2]+wt_4[3] - 2*min(wt_4,4);
-
-					w_total = wqp + wt1 + wt2;
-					newT = 2/sqrt( w_total );
-					if ((newT<dT) && (newT>0.0))
+					for (pos[0]=0; pos[0]<numLines[0]; ++pos[0])
 					{
-						dT=newT;
-						smallest_pos[0]=pos[0];smallest_pos[1]=pos[1];smallest_pos[2]=pos[2];
-						smallest_n = n;
+						ipos = pos[0] + pos[1]*stride[1] + pos[2]*stride[2];
+						const unsigned int iP1  = ipos + (shifted(pos,nP ,1)-pos[nP ])*stride[nP ];  // +1 along nP
+						const unsigned int iPP1 = ipos + (shifted(pos,nPP,1)-pos[nPP])*stride[nPP];  // +1 along nPP
+						const unsigned int iPm  = ipos + (shifted(pos,nP ,-1)-pos[nP ])*stride[nP ]; // -1 along nP
+						const unsigned int iPPm = ipos + (shifted(pos,nPP,-1)-pos[nPP])*stride[nPP]; // -1 along nPP
+						const unsigned int iPmPPm = iPm + (iPPm-ipos);                                 // -1 along nP and nPP
+						const unsigned int iN1  = ipos + (shifted(pos,n,1)-pos[n])*stride[n];        // +1 along n
+
+						wqp  = 1/(EC_L[nPP][ipos]*EC_C[n][iP1]) + 1/(EC_L[nPP][ipos]*EC_C[n][ipos]);
+						wqp += 1/(EC_L[nP ][ipos]*EC_C[n][iPP1]) + 1/(EC_L[nP ][ipos]*EC_C[n][ipos]);
+						wqp += 1/(EC_L[nPP][iPm]*EC_C[n][ipos]) + 1/(EC_L[nPP][iPm]*EC_C[n][iPm]);
+						wqp += 1/(EC_L[nP ][iPmPPm]*EC_C[n][iPm]) + 1/(EC_L[nP ][iPmPPm]*EC_C[n][iPmPPm]);
+
+						wt_4[0] = 1/(EC_L[nPP][ipos]*EC_C[nP ][ipos]);
+						wt_4[1] = 1/(EC_L[nPP][iPm] *EC_C[nP ][ipos]);
+						wt_4[2] = 1/(EC_L[nP ][ipos]*EC_C[nPP][ipos]);
+						wt_4[3] = 1/(EC_L[nP ][iPPm]*EC_C[nPP][ipos]);
+
+						wt1 = wt_4[0]+wt_4[1]+wt_4[2]+wt_4[3] - 2*min(wt_4,4);
+
+						wt_4[0] = 1/(EC_L[nPP][ipos]*EC_C[nP ][iN1]);
+						wt_4[1] = 1/(EC_L[nPP][iPm] *EC_C[nP ][iN1]);
+						wt_4[2] = 1/(EC_L[nP ][ipos]*EC_C[nPP][iN1]);
+						wt_4[3] = 1/(EC_L[nP ][iPPm]*EC_C[nPP][iN1]);
+
+						wt2 = wt_4[0]+wt_4[1]+wt_4[2]+wt_4[3] - 2*min(wt_4,4);
+
+						w_total = wqp + wt1 + wt2;
+						newT = 2/sqrt( w_total );
+						if ((newT<b.dT) && (newT>0.0))
+						{
+							b.dT=newT;
+							b.pos[0]=pos[0];b.pos[1]=pos[1];b.pos[2]=pos[2];
+							b.n = n;
+						}
 					}
 				}
 			}
 		}
-	}
+	};
+	std::vector<std::thread> threads;
+	for (unsigned int t=1; t<nThreads; ++t)
+		threads.emplace_back(job, t);
+	job(0);
+	for (size_t t=0; t<threads.size(); ++t)
+		threads[t].join();
+	// combine in loop order: smaller dT wins, on a tie the smaller n, then the lower z-range (= lower t)
+	for (unsigned int t=0; t<nThreads; ++t)
+		if ((best[t].dT<dT) || ((best[t].dT==dT) && (best[t].dT<1e200) && (best[t].n<smallest_n)))
+		{
+			dT = best[t].dT;
+			smallest_n = best[t].n;
+			smallest_pos[0]=best[t].pos[0];smallest_pos[1]=best[t].pos[1];smallest_pos[2]=best[t].pos[2];
+		}
 	if (dT==0)
 	{
 		throw std::runtime_error("Operator::CalcTimestep: Timestep is zero... this is not supposed to happen!");
@@ -2045,7 +2152,7 @@ void Operator::CalcPEC_Range(unsigned int startX, unsigned int stopX, unsigned i
 				for (int n=0; n<3; ++n)
 				{
 					GetYeeCoords(n,pos,coord,false);
-					CSProperties* prop = CSX->GetPropertyByCoordPriority(coord, vPrims, true);
+					CSProperties* prop = CSX->FindPropertyByCoordPriority(coord, vPrims, true);
 					if (prop)
 					{
 						if (prop->GetType()==CSProperties::METAL) //set to PEC

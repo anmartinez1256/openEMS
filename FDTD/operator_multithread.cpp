@@ -115,8 +115,9 @@ void Operator_Multithread::CalcStartStopLines(
 
 int Operator_Multithread::CalcECOperator( DebugFlags debugFlags )
 {
-	if ((m_numThreads == 0) || (m_numThreads > AvailableThreads()))
-		m_numThreads = AvailableThreads();
+	// the setup pool (Calc_EC, CalcPEC, timestep search, Calc_ECOperatorPos) uses every core; the engine
+	// gets its own count (m_orig_numThreads) in CreateEngine()
+	m_numThreads = AvailableThreads();
 
 	std::vector<unsigned int> m_Start_Lines;
 	std::vector<unsigned int> m_Stop_Lines;

@@ -47,6 +47,7 @@ protected:
 	virtual bool CalcPEC(); //this method is using multi-threading
 
 	virtual int CalcECOperator( DebugFlags debugFlags = None );
+	virtual unsigned int GetNumSetupThreads() const {return m_numThreads;}
 
 	//Calc_EC barrier
 	boost::barrier* m_CalcEC_Start;

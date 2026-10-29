@@ -6,6 +6,10 @@
 #if BOOST_ARCH_X86
 #include <xmmintrin.h>
 #endif
+#if defined(__aarch64__)
+#include <cstdint>
+#include <cstdlib>
+#endif
 
 // Disable denormal (subnormal) floating point numbers. These exceedingly
 // small numbers may create a substantial overhead depending on the CPU
@@ -36,6 +40,17 @@ inline void Denormal::Disable()
 
 	// write the new MXCSR setting to the MXCSR
 	_mm_setcsr( newMXCSR );
+#elif defined(__aarch64__)
+	// Apple cores have no subnormal penalty, so the default keeps them (bit-identical to upstream).
+	// OPENEMS_FTZ=1 sets FPCR.FZ, which makes the CPU engines match a GPU that flushes subnormals.
+	static const bool on = getenv("OPENEMS_FTZ")!=NULL;
+	if (on)
+	{
+		uint64_t fpcr;
+		__asm__ volatile("mrs %0, fpcr" : "=r"(fpcr));
+		fpcr |= (1ull<<24);
+		__asm__ volatile("msr fpcr, %0" : : "r"(fpcr));
+	}
 #endif
 }
 

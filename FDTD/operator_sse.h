@@ -27,6 +27,7 @@ class Operator_sse : public Operator
 public:
 	//! Create a new operator
 	static Operator_sse* New();
+	unsigned int GetNumVectors() const {return numVectors;}
 	virtual ~Operator_sse();
 
 	virtual Engine* CreateEngine();

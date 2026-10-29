@@ -82,7 +82,7 @@ double Operator_Cylinder::GetMaterial(
 	int ny,
 	const double* coords,
 	int MatType,
-	std::vector<CSPrimitives*> vPrims,
+	const std::vector<CSPrimitives*>& vPrims,
 	bool markAsUsed
 ) const
 {

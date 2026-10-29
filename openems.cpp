@@ -45,6 +45,9 @@
 #include "Common/processmodematch.h"
 #include "Common/processfields_td.h"
 #include "Common/processfields_fd.h"
+#include "FDTD/operator_sse_compressed.h"
+#include "FDTD/engine_sse.h"
+#include <cstdlib>
 #include "Common/processfields_sar.h"
 #include <hdf5.h>            // only for H5get_libversion()
 #include <boost/version.hpp> // only for BOOST_LIB_VERSION
@@ -1195,6 +1198,117 @@ ContinuousStructure* openEMS::GetCSX() const
 	return m_CSX;
 }
 
+
+/***********************************************************************************************************
+ Raw export for external engines (the Swift/Metal prototype in openems-metal/swift_engine):
+   OPENEMS_EXPORT_OPERATOR=dir  after the operator is built: compressed operator tables, index, excitation, signal
+   OPENEMS_EXPORT_FIELDS=dir    after the run: the engine's voltage and current arrays (scalar n,x,y,z order)
+ Plain little-endian binary files plus header.json; no HDF5 so that any language can read them.
+***********************************************************************************************************/
+static bool RawWrite(const std::string& fn, const void* data, size_t bytes)
+{
+	std::ofstream f(fn.c_str(), std::ios::binary);
+	if (!f)
+	{
+		cerr << "openEMS: raw export: cannot write " << fn << endl;
+		return false;
+	}
+	f.write((const char*)data, bytes);
+	return true;
+}
+
+static void ExportOperatorRaw(Operator* op, const std::string& dir)
+{
+	Operator_SSE_Compressed* cop = dynamic_cast<Operator_SSE_Compressed*>(op);
+	if ((cop==NULL) || (cop->f4_vv_Compressed[0].size()==0))
+	{
+		cerr << "openEMS: OPENEMS_EXPORT_OPERATOR needs the compressed SSE operator, nothing exported" << endl;
+		return;
+	}
+	unsigned int nl[3] = {op->GetNumberOfLines(0,true), op->GetNumberOfLines(1,true), op->GetNumberOfLines(2,true)};
+	const unsigned int nv = cop->GetNumVectors();
+	const size_t numOps = cop->f4_vv_Compressed[0].size();
+	// op_index.u32: [x][y][zv]
+	std::vector<unsigned int> idx((size_t)nl[0]*nl[1]*nv);
+	for (unsigned int x=0; x<nl[0]; ++x)
+		for (unsigned int y=0; y<nl[1]; ++y)
+			for (unsigned int zv=0; zv<nv; ++zv)
+				idx[((size_t)x*nl[1]+y)*nv+zv] = cop->m_Op_index(x,y,zv);
+	RawWrite(dir+"/op_index.u32", idx.data(), idx.size()*sizeof(unsigned int));
+	// tables: [3][numOps][4] floats
+	const std::vector<f4vector,aligned_allocator<f4vector> >* tabs[4] = {cop->f4_vv_Compressed, cop->f4_vi_Compressed, cop->f4_ii_Compressed, cop->f4_iv_Compressed};
+	const char* names[4] = {"vv", "vi", "ii", "iv"};
+	for (int t=0; t<4; ++t)
+	{
+		std::vector<float> buf((size_t)3*numOps*4);
+		for (int n=0; n<3; ++n)
+			for (size_t k=0; k<numOps; ++k)
+				for (int l=0; l<4; ++l)
+					buf[((size_t)n*numOps+k)*4+l] = tabs[t][n][k].f[l];
+		RawWrite(dir+"/"+names[t]+".f32", buf.data(), buf.size()*sizeof(float));
+	}
+	// excitation (voltage entries) and the signal
+	Operator_Ext_Excitation* exc = NULL;
+	std::string extNames;
+	for (size_t n=0; n<op->GetNumberOfExtentions(); ++n)
+	{
+		if (n) extNames += "\", \"";
+		extNames += op->GetExtension(n)->GetExtensionName();
+		if (exc==NULL)
+			exc = dynamic_cast<Operator_Ext_Excitation*>(op->GetExtension(n));
+	}
+	unsigned int voltCount = 0, currCount = 0;
+	if (exc)
+	{
+		voltCount = exc->GetVoltCount();
+		currCount = exc->GetCurrCount();
+		std::vector<unsigned int> vi((size_t)3*voltCount), vdir(voltCount), vdel(voltCount);
+		std::vector<float> vamp(voltCount);
+		for (unsigned int k=0; k<voltCount; ++k)
+		{
+			for (int c=0; c<3; ++c) vi[(size_t)c*voltCount+k] = exc->GetVoltIndex(c)[k];
+			vdir[k] = exc->GetVoltDir()[k]; vdel[k] = exc->GetVoltDelay()[k]; vamp[k] = exc->GetVoltAmp()[k];
+		}
+		RawWrite(dir+"/exc_index.u32", vi.data(), vi.size()*sizeof(unsigned int));
+		RawWrite(dir+"/exc_dir.u32", vdir.data(), vdir.size()*sizeof(unsigned int));
+		RawWrite(dir+"/exc_delay.u32", vdel.data(), vdel.size()*sizeof(unsigned int));
+		RawWrite(dir+"/exc_amp.f32", vamp.data(), vamp.size()*sizeof(float));
+	}
+	Excitation* sig = op->GetExcitationSignal();
+	unsigned int sigLen = sig ? sig->GetLength() : 0;
+	if (sig && sigLen)
+		RawWrite(dir+"/exc_signal.f32", sig->GetVoltageSignal(), sigLen*sizeof(float));
+	std::ofstream h((dir+"/header.json").c_str());
+	h << std::setprecision(17) << "{\n \"numLines\": [" << nl[0] << ", " << nl[1] << ", " << nl[2] << "],\n \"numVectors\": " << nv
+	  << ",\n \"numOps\": " << numOps << ",\n \"dT\": " << op->GetTimestep() << ",\n \"voltCount\": " << voltCount
+	  << ",\n \"currCount\": " << currCount << ",\n \"signalLength\": " << sigLen << ",\n \"signalPeriod\": " << (sig ? sig->GetSignalPeriod() : 0.0)
+	  << ",\n \"extensions\": [\"" << extNames << "\"],\n \"layout\": \"op_index[x][y][zv]; tables [n][op][lane], cell z = lane*numVectors + zv; exc_index [3][count]\"\n}\n";
+	cout << "openEMS: raw operator exported to " << dir << " (" << numOps << " operators, " << voltCount << " voltage excitations)" << endl;
+}
+
+static void ExportFieldsRaw(Operator* op, Engine* eng, const std::string& dir)
+{
+	unsigned int nl[3] = {op->GetNumberOfLines(0,true), op->GetNumberOfLines(1,true), op->GetNumberOfLines(2,true)};
+	const size_t N = (size_t)3*nl[0]*nl[1]*nl[2];
+	std::vector<float> volt(N), curr(N);
+	unsigned int pos[3];
+	size_t k=0;
+	for (int n=0; n<3; ++n)
+		for (pos[0]=0; pos[0]<nl[0]; ++pos[0])
+			for (pos[1]=0; pos[1]<nl[1]; ++pos[1])
+				for (pos[2]=0; pos[2]<nl[2]; ++pos[2], ++k)
+				{
+					volt[k] = eng->GetVolt(n,pos);
+					curr[k] = eng->GetCurr(n,pos);
+				}
+	RawWrite(dir+"/volt.f32", volt.data(), N*sizeof(float));
+	RawWrite(dir+"/curr.f32", curr.data(), N*sizeof(float));
+	std::ofstream h((dir+"/fields.json").c_str());
+	h << "{\n \"numLines\": [" << nl[0] << ", " << nl[1] << ", " << nl[2] << "],\n \"numTS\": " << eng->GetNumberOfTimesteps()
+	  << ",\n \"layout\": \"volt.f32 / curr.f32 [3][x][y][z] float32\"\n}\n";
+	cout << "openEMS: raw fields after " << eng->GetNumberOfTimesteps() << " timesteps exported to " << dir << endl;
+}
+
 int openEMS::SetupFDTD()
 {
 	// of a previous setup that was not run
@@ -1390,6 +1504,8 @@ int openEMS::SetupFDTD()
 	}
 
 	//create FDTD engine
+	if (getenv("OPENEMS_EXPORT_OPERATOR")) // operator, extensions and the excitation signal are complete here
+		ExportOperatorRaw(FDTD_Op, getenv("OPENEMS_EXPORT_OPERATOR"));
 	FDTD_Eng = FDTD_Op->CreateEngine();
 
 	if (Op_Ext_SSD)
@@ -1611,6 +1727,8 @@ void openEMS::RunFDTD()
 
 	if (m_DumpStats)
 		DumpStatistics(OPENEMS_STAT_FILE, t_diff);
+	if (getenv("OPENEMS_EXPORT_FIELDS"))
+		ExportFieldsRaw(FDTD_Op, FDTD_Eng, getenv("OPENEMS_EXPORT_FIELDS"));
 
 	//*************** postproc ************//
 	PA->PostProcess();

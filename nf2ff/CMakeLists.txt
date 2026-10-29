@@ -47,6 +47,10 @@ TARGET_LINK_LIBRARIES( nf2ff
   ${HDF5_LIBRARIES}
   ${Boost_LIBRARIES}
 )
+if (APPLE)
+  # cgemm for the separable far-field sum (nf2ff_calc.cpp)
+  TARGET_LINK_LIBRARIES( nf2ff "-framework Accelerate" )
+endif()
 
 ADD_EXECUTABLE( nf2ff_bin main.cpp )
 SET_TARGET_PROPERTIES(nf2ff_bin PROPERTIES OUTPUT_NAME nf2ff)

@@ -16,6 +16,9 @@
 */
 
 #include "operator_sse_compressed.h"
+#include <chrono>
+#include <cstdlib>
+#include <iostream>
 #include "engine_sse_compressed.h"
 #include "engine_sse.h"
 
