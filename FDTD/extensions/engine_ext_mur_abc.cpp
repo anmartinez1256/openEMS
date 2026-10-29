@@ -21,6 +21,7 @@
 #include "FDTD/engine_sse.h"
 #include "tools/useful.h"
 #include "operator_ext_excitation.h"
+#include <algorithm>
 
 using std::cerr;
 using std::endl;
@@ -62,6 +63,10 @@ Engine_Ext_Mur_ABC::Engine_Ext_Mur_ABC(Operator_Ext_Mur_ABC* op_ext) :
 		cerr << "Engine_Ext_Mur_ABC::Engine_Ext_Mur_ABC: Warning: Excitation inside the Mur-ABC #" <<  m_ny << "-" << (int)(m_LineNr>0) << " found!!!!  Mur-ABC will be switched on after excitation is done at " << m_start_TS << " timesteps!!! " << endl;
 	}
 
+	m_Fast = false;
+	m_FastChecked = false;
+	m_OffsetNyP = m_OffsetNyPP = m_OffsetShift = 0;
+
 	SetNumberOfThreads(1);
 }
 
@@ -79,8 +84,238 @@ void Engine_Ext_Mur_ABC::SetNumberOfThreads(int nrThread)
 	m_start.at(0)=0;
 	for (size_t n=1; n<m_numX.size(); ++n)
 		m_start.at(n) = m_start.at(n-1) + m_numX.at(n-1);
+
+	if (!m_FastChecked && m_Eng)
+		SetupFast();
 }
 
+void Engine_Ext_Mur_ABC::SetupFast()
+{
+	m_FastChecked = true;
+	m_Fast = false;
+	if (m_Eng->GetType()!=Engine::SSE)
+		return;
+	ArrayLib::ArrayENG<f4vector>* V = ((Engine_sse*)m_Eng)->f4_volt_ptr;
+	const unsigned int nvec = V->extent(3);
+	if ((uint64_t)V->size()*4 >= (1ull<<32))
+		return;
+	// float index of component n at pos: 4*linearIndex(n, x, y, z%nvec) + z/nvec
+	struct FloatIndex
+	{
+		ArrayLib::ArrayENG<f4vector>* V; unsigned int nvec;
+		int64_t operator()(unsigned int n, const unsigned int pos[3]) const
+		{return 4*(int64_t)V->linearIndex({n, pos[0], pos[1], pos[2]%nvec}) + pos[2]/nvec;}
+	} idx = {V, nvec};
+
+	m_FloatIndex.resize((size_t)m_numLines[0]*m_numLines[1]);
+	unsigned int pos[] = {0,0,0};
+	unsigned int pos_shift[] = {0,0,0};
+	pos[m_ny] = m_LineNr;
+	pos_shift[m_ny] = m_LineNr_Shift;
+	for (unsigned int i=0; i<m_numLines[0]; ++i)
+		for (unsigned int j=0; j<m_numLines[1]; ++j)
+		{
+			pos[m_nyP] = pos_shift[m_nyP] = i;
+			pos[m_nyPP] = pos_shift[m_nyPP] = j;
+			const int64_t base = idx(0, pos);
+			const int64_t oP = idx(m_nyP, pos) - base, oPP = idx(m_nyPP, pos) - base;
+			const int64_t oS = idx(m_nyP, pos_shift) - idx(m_nyP, pos);
+			if ((i==0) && (j==0))
+			{
+				m_OffsetNyP = oP;
+				m_OffsetNyPP = oPP;
+				m_OffsetShift = oS;
+			}
+			// the offsets must be the same for all cells of the face
+			if ((oP!=m_OffsetNyP) || (oPP!=m_OffsetNyPP) || (oS!=m_OffsetShift) ||
+				(idx(m_nyPP, pos_shift)-idx(m_nyPP, pos)!=oS))
+				return;
+			m_FloatIndex[(size_t)i*m_numLines[1]+j] = (unsigned int)base;
+		}
+
+	// face cells by x-line in memory order, for the line hooks
+	const unsigned int NX = V->extent(1);
+	std::vector<std::vector<unsigned int> > line(NX);
+	for (unsigned int i=0; i<m_numLines[0]; ++i)
+		for (unsigned int j=0; j<m_numLines[1]; ++j)
+		{
+			pos[m_nyP] = i;
+			pos[m_nyPP] = j;
+			line[pos[0]].push_back(i*m_numLines[1]+j);
+		}
+	const bool aligned = (m_OffsetNyP%4==0) && (m_OffsetNyPP%4==0) && (m_OffsetShift%4==0);
+	const FDTD_FLOAT* cP = m_Mur_Coeff_nyP.data();
+	const FDTD_FLOAT* cPP = m_Mur_Coeff_nyPP.data();
+	m_VecStart.assign(1, 0);
+	m_ScStart.assign(1, 0);
+	m_VecIndex.clear(); m_VecCoeffP.clear(); m_VecCoeffPP.clear();
+	m_ScIndex.clear(); m_ScCoeffP.clear(); m_ScCoeffPP.clear();
+	for (unsigned int x=0; x<NX; ++x)
+	{
+		std::vector<unsigned int>& cells = line[x];
+		std::sort(cells.begin(), cells.end(), [&](unsigned int a, unsigned int b) {return m_FloatIndex[a]<m_FloatIndex[b];});
+		for (size_t n=0; n<cells.size();)
+		{
+			const unsigned int f = m_FloatIndex[cells[n]];
+			if (aligned && (f%4==0) && (n+3<cells.size()) && (m_FloatIndex[cells[n+3]]==f+3))
+			{
+				// sorted and distinct: the four floats of one f4vector
+				f4vector p, pp;
+				for (int l=0; l<4; ++l)
+				{
+					p.f[l] = cP[cells[n+l]];
+					pp.f[l] = cPP[cells[n+l]];
+				}
+				m_VecIndex.push_back(f/4);
+				m_VecCoeffP.push_back(p);
+				m_VecCoeffPP.push_back(pp);
+				n += 4;
+				continue;
+			}
+			m_ScIndex.push_back(f);
+			m_ScCoeffP.push_back(cP[cells[n]]);
+			m_ScCoeffPP.push_back(cPP[cells[n]]);
+			++n;
+		}
+		m_VecStart.push_back(m_VecIndex.size());
+		m_ScStart.push_back(m_ScIndex.size());
+	}
+	m_VecP.resize(m_VecIndex.size());
+	m_VecPP.resize(m_VecIndex.size());
+	m_ScP.resize(m_ScIndex.size());
+	m_ScPP.resize(m_ScIndex.size());
+	m_Fast = true;
+}
+
+namespace
+{
+//! The face cell updates of the fast path, same arithmetic in the same order as the templated hooks (bit-identical).
+struct MurFast
+{
+	FDTD_FLOAT* E;
+	const FDTD_FLOAT* cP;
+	const FDTD_FLOAT* cPP;
+	FDTD_FLOAT* vP;
+	FDTD_FLOAT* vPP;
+	const unsigned int* fi;
+	ptrdiff_t oP, oPP, oS;
+
+	inline void Pre(size_t k) const
+	{
+		const FDTD_FLOAT* e = E + fi[k];
+		vP[k]  = e[oP+oS]  - cP[k]  * e[oP];
+		vPP[k] = e[oPP+oS] - cPP[k] * e[oPP];
+	}
+	inline void Post(size_t k) const
+	{
+		const FDTD_FLOAT* e = E + fi[k];
+		vP[k]  += cP[k]  * e[oP+oS];
+		vPP[k] += cPP[k] * e[oPP+oS];
+	}
+	inline void Apply(size_t k) const
+	{
+		FDTD_FLOAT* e = E + fi[k];
+		e[oP]  = vP[k];
+		e[oPP] = vPP[k];
+	}
+};
+}
+
+#define MUR_FAST_DATA \
+	const MurFast d = {(FDTD_FLOAT*)((Engine_sse*)m_Eng)->f4_volt_ptr->data(), m_Mur_Coeff_nyP.data(), m_Mur_Coeff_nyPP.data(), \
+					   m_volt_nyP.data(), m_volt_nyPP.data(), m_FloatIndex.data(), m_OffsetNyP, m_OffsetNyPP, m_OffsetShift};
+
+void Engine_Ext_Mur_ABC::DoPreVoltageUpdatesFast(int threadID)
+{
+	if (IsActive()==false) return;
+	if (threadID>=m_NrThreads)
+		return;
+	MUR_FAST_DATA
+	const size_t k0 = (size_t)m_start.at(threadID)*m_numLines[1];
+	const size_t k1 = k0 + (size_t)m_numX.at(threadID)*m_numLines[1];
+	for (size_t k=k0; k<k1; ++k)
+		d.Pre(k);
+}
+
+void Engine_Ext_Mur_ABC::DoPostVoltageUpdatesFast(int threadID)
+{
+	if (IsActive()==false) return;
+	if (threadID>=m_NrThreads)
+		return;
+	MUR_FAST_DATA
+	const size_t k0 = (size_t)m_start.at(threadID)*m_numLines[1];
+	const size_t k1 = k0 + (size_t)m_numX.at(threadID)*m_numLines[1];
+	for (size_t k=k0; k<k1; ++k)
+		d.Post(k);
+}
+
+void Engine_Ext_Mur_ABC::Apply2VoltagesFast(int threadID)
+{
+	if (IsActive()==false) return;
+	if (threadID>=m_NrThreads)
+		return;
+	MUR_FAST_DATA
+	const size_t k0 = (size_t)m_start.at(threadID)*m_numLines[1];
+	const size_t k1 = k0 + (size_t)m_numX.at(threadID)*m_numLines[1];
+	for (size_t k=k0; k<k1; ++k)
+		d.Apply(k);
+}
+
+// The line hooks: the vectors with the same arithmetic per lane as MurFast (bit-identical), then the single cells
+#define MUR_LINE_DATA \
+	f4vector* E4 = ((Engine_sse*)m_Eng)->f4_volt_ptr->data(); \
+	const ptrdiff_t oP = m_OffsetNyP/4, oPP = m_OffsetNyPP/4, oS = m_OffsetShift/4; \
+	const MurFast d = {(FDTD_FLOAT*)E4, m_ScCoeffP.data(), m_ScCoeffPP.data(), m_ScP.data(), m_ScPP.data(), m_ScIndex.data(), \
+					   m_OffsetNyP, m_OffsetNyPP, m_OffsetShift};
+
+void Engine_Ext_Mur_ABC::DoPreVoltageUpdatesLines(unsigned int x0, unsigned int x1)
+{
+	if (IsActive()==false) return;
+	MUR_LINE_DATA
+	for (unsigned int g=m_VecStart[x0]; g<m_VecStart[x1]; ++g)
+	{
+		const f4vector* e = E4 + m_VecIndex[g];
+		m_VecP[g].v  = e[oP+oS].v  - m_VecCoeffP[g].v  * e[oP].v;
+		m_VecPP[g].v = e[oPP+oS].v - m_VecCoeffPP[g].v * e[oPP].v;
+	}
+	for (unsigned int k=m_ScStart[x0]; k<m_ScStart[x1]; ++k)
+		d.Pre(k);
+}
+
+void Engine_Ext_Mur_ABC::DoPostVoltageUpdatesLines(unsigned int x0, unsigned int x1)
+{
+	if (IsActive()==false) return;
+	MUR_LINE_DATA
+	for (unsigned int g=m_VecStart[x0]; g<m_VecStart[x1]; ++g)
+	{
+		const f4vector* e = E4 + m_VecIndex[g];
+		m_VecP[g].v  += m_VecCoeffP[g].v  * e[oP+oS].v;
+		m_VecPP[g].v += m_VecCoeffPP[g].v * e[oPP+oS].v;
+	}
+	for (unsigned int k=m_ScStart[x0]; k<m_ScStart[x1]; ++k)
+		d.Post(k);
+}
+
+void Engine_Ext_Mur_ABC::Apply2VoltagesLines(unsigned int x0, unsigned int x1)
+{
+	if (IsActive()==false) return;
+	MUR_LINE_DATA
+	for (unsigned int g=m_VecStart[x0]; g<m_VecStart[x1]; ++g)
+	{
+		f4vector* e = E4 + m_VecIndex[g];
+		e[oP].v  = m_VecP[g].v;
+		e[oPP].v = m_VecPP[g].v;
+	}
+	for (unsigned int k=m_ScStart[x0]; k<m_ScStart[x1]; ++k)
+		d.Apply(k);
+}
+
+void Engine_Ext_Mur_ABC::GetCoupledLines(std::vector<unsigned int>& lines) const
+{
+	// on an x-face the hooks read the line next to the face
+	if (m_ny==0)
+		lines.push_back(std::min<unsigned int>(m_LineNr, m_LineNr_Shift));
+}
 
 template <typename EngType>
 void Engine_Ext_Mur_ABC::DoPreVoltageUpdatesImpl(EngType* eng, int threadID)
@@ -117,6 +352,8 @@ void Engine_Ext_Mur_ABC::DoPreVoltageUpdatesImpl(EngType* eng, int threadID)
 
 void Engine_Ext_Mur_ABC::DoPreVoltageUpdates(int threadID)
 {
+	if (m_Fast)
+		return DoPreVoltageUpdatesFast(threadID);
 	ENG_DISPATCH_ARGS(DoPreVoltageUpdatesImpl, threadID);
 }
 
@@ -148,6 +385,8 @@ void Engine_Ext_Mur_ABC::DoPostVoltageUpdatesImpl(EngType* eng, int threadID)
 
 void Engine_Ext_Mur_ABC::DoPostVoltageUpdates(int threadID)
 {
+	if (m_Fast)
+		return DoPostVoltageUpdatesFast(threadID);
 	ENG_DISPATCH_ARGS(DoPostVoltageUpdatesImpl, threadID);
 }
 
@@ -177,5 +416,7 @@ void Engine_Ext_Mur_ABC::Apply2VoltagesImpl(EngType* eng, int threadID)
 
 void Engine_Ext_Mur_ABC::Apply2Voltages(int threadID)
 {
+	if (m_Fast)
+		return Apply2VoltagesFast(threadID);
 	ENG_DISPATCH_ARGS(Apply2VoltagesImpl, threadID);
 }

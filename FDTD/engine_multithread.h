@@ -20,6 +20,8 @@
 
 #include "operator_multithread.h"
 #include "engine_sse_compressed.h"
+#include "tools/spin_barrier.h"
+#include <atomic>
 
 #include <boost/thread.hpp>
 #include <boost/fusion/include/list.hpp>
@@ -107,13 +109,89 @@ protected:
 	const Operator_Multithread* m_Op_MT;
 	boost::thread_group *m_thread_group;
 	boost::barrier *m_startBarrier, *m_stopBarrier;
-	boost::barrier *m_IterateBarrier;
+	SpinBarrier *m_IterateBarrier;
+
+	//! One extension hook call in a timestep, optionally followed by a barrier
+	struct HookStep
+	{
+		Engine_Extension* ext;
+		bool barrier;   //!< wait on m_IterateBarrier after the call
+		bool inc_numTS; //!< this is the last barrier of the timestep: it increments numTS
+	};
+	//! Per hook group (pre/post/apply voltages, pre/post/apply currents): the calls and barriers, see BuildHookPlan()
+	std::vector<HookStep> m_HookPlan[6];
+	std::vector<Engine_Extension*> m_HookPlanExts; //!< the extensions the plan was built for (the list can change after Init)
+	bool m_IncNumTS_AtCurrBarrier; //!< no current hooks run after the current update: its barrier increments numTS
+	void BuildHookPlan();
+	void RunHooks(int group, int threadID);
+
+	//! Fused sweep: every thread runs the voltage update, the voltage hooks, and the current update with
+	//! its hooks x-line by x-line over its own slab, so a line is still in the cache when its currents are
+	//! updated (one pass over the fields per timestep instead of two) and a timestep needs two barriers.
+	//! It needs the IJKN field layout and extensions that all implement the line hooks (LINE_HOOKS).
+	bool m_Fused;
+	std::vector<unsigned int> m_Blocks;     //!< x-line blocks [m_Blocks[b], m_Blocks[b+1]) of the fused sweep
+	std::vector<unsigned int> m_SlabBlocks; //!< thread t sweeps the blocks [m_SlabBlocks[t], m_SlabBlocks[t+1])
+	std::vector<Engine_Extension*> m_LineHooks[6]; //!< per hook group: the extensions to call, in order
+	void SetupFused();
+	void FusedTimestep(int threadID);
+	//! time and x-lines of each thread's sweep, to size the slabs (threads on efficiency cores are slower, PML lines cost more)
+	struct FusedStat
+	{
+		double busy;
+		double lines;
+		char pad[64-2*sizeof(double)]; // about one per cache line (C++11: new does not align to 64)
+	};
+	FusedStat* m_FusedStat;
+	bool m_Balance;
+	std::vector<double> m_LineCost; //!< smoothed time per x-line (s), from the threads' measurements
+	//! Between two IterateTS() calls: move the slab boundaries so that every thread gets the same estimated time
+	void BalanceSlabs();
+	void RunLineHooks(int group, unsigned int x0, unsigned int x1);
+	//! hooks and update of the currents of the x-lines [x0, x1)
+	void FusedCurrents(unsigned int x0, unsigned int x1);
+
+	//! x-lines of one thread for the voltage or current update; idle threads take lines from the others
+	struct WorkRange
+	{
+		std::atomic<int> next; //!< next x-line to update
+		int start, stop;       //!< first and last x-line of this range
+		char pad[64-sizeof(std::atomic<int>)-2*sizeof(int)]; // one range per cache line
+	};
+	WorkRange* m_VoltRange;
+	WorkRange* m_CurrRange;
+	//! Update all lines of the own range in order, then help with the ranges of the other threads.
+	void UpdateStealing(WorkRange* ranges, int threadID, bool voltages);
+	void ResetRanges(WorkRange* ranges);
 	volatile unsigned int m_iterTS;
 	unsigned int m_numThreads; //!< number of worker threads
 	unsigned int m_max_numThreads; //!< max. number of worker threads
 	volatile bool m_stopThreads;
 	bool m_opt_speed;
 	float m_last_speed;
+
+	//! numThreads==0: IterateTS() times the engine itself and picks the thread count, see TuneThreads()
+	bool m_auto_threads;
+	struct ThreadTuner
+	{
+		unsigned int start;  //!< first thread count tried
+		unsigned int best;   //!< fastest thread count so far
+		double best_speed;   //!< its speed (timesteps/s)
+		std::vector<unsigned int> todo;   //!< thread counts still to time, in this order
+		std::vector<double> speed;        //!< timesteps/s by thread count (0: not timed)
+		bool refined;        //!< the neighbours of the best coarse count are queued
+		double settle;       //!< time left before the timing of the current thread count starts (s)
+		unsigned int ts;     //!< timesteps timed with the current thread count
+		double time;         //!< and their time (s)
+		double window;       //!< time to measure each thread count (s)
+		double ts_per_s;     //!< last speed, for the length of the pieces of IterateTS()
+	} m_Tuner;
+	//! Run \a n timesteps on the threads, returns the time (s)
+	double RunTimesteps(unsigned int n);
+	//! Times the performance core count P, then P+2, P+4, .. up to the maximum (until one is clearly
+	//! slower than the best) and P-2, then the two neighbours of the fastest; keeps the fastest count.
+	//! (Coarse steps: the speed is not monotonic, e.g. P+1 threads can be slower than P and P+2.)
+	void TuneThreads(unsigned int iterTS, double seconds);
 
 #ifdef ENABLE_DEBUG_TIME
 	std::map<boost::thread::id, std::vector<double> > m_timer_list;

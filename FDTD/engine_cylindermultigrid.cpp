@@ -45,6 +45,13 @@ Engine_CylinderMultiGrid::Engine_CylinderMultiGrid(const Operator_CylinderMultiG
 
 	Engine* eng = op->GetInnerOperator()->CreateEngine();
 	m_InnerEngine = dynamic_cast<Engine_Multithread*>(eng);
+	// the inner engine runs in step with this one: it must not change its thread count on its own
+	// (it stays at one thread, as before the automatic search moved into IterateTS)
+	if (m_InnerEngine->m_auto_threads)
+	{
+		m_InnerEngine->m_auto_threads = false;
+		m_InnerEngine->changeNumThreads(1);
+	}
 
 	Engine_Ext_CylinderMultiGrid* m_InnerEng_Ext_MG = new Engine_Ext_CylinderMultiGrid(NULL,false);
 	m_InnerEng_Ext_MG->SetBarrier(m_WaitOnBase, m_WaitOnChild, m_WaitOnSync);
@@ -90,6 +97,14 @@ Engine_CylinderMultiGrid::~Engine_CylinderMultiGrid()
 void Engine_CylinderMultiGrid::Init()
 {
 	Engine_Multithread::Init();
+	// IterateTS() runs in an iterator thread here: keep the old search via NextInterval()
+	if (m_auto_threads)
+	{
+		m_auto_threads = false;
+		m_opt_speed = true;
+		m_numThreads = 1;
+		changeNumThreads(1);
+	}
 
 	m_Eng_exts.push_back(m_Eng_Ext_MG);
 

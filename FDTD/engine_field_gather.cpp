@@ -17,6 +17,7 @@
 
 #include "engine_field_gather.h"
 #include "operator.h"
+#include "engine_sse.h"
 
 // The same values as GetEField()/GetHField() of Engine_Interface_FDTD: an engine interface
 // that changes the field evaluation has to change the nodes it asks for accordingly
@@ -129,5 +130,42 @@ Field_Gather_FDTD* Field_Gather_FDTD::New(const Operator* op, Engine_Interface_B
 					}
 				}
 			}
+	return gather;
+}
+
+Field_Gather_SSE* Field_Gather_SSE::New(const Operator* op, Engine_Interface_Base::InterpolationType interpol, const Engine_sse* eng,
+                                        bool h_field, const unsigned int numLines[3], unsigned int* const posLines[3])
+{
+	const ArrayLib::ArrayENG<f4vector>* V = eng->f4_volt_ptr;
+	const ArrayLib::ArrayENG<f4vector>* I = eng->f4_curr_ptr;
+	if (((uint64_t)V->size()*4 >= (1ull<<32)) || ((uint64_t)I->size()*4 >= (1ull<<32)))
+		return NULL;
+	for (int d=0; d<4; ++d)
+		if (V->stride(d)!=I->stride(d))
+			return NULL;
+	unsigned int N[3];
+	for (int n=0; n<3; ++n)
+		N[n] = op->GetNumberOfLines(n, true);
+	const unsigned int nvec = V->extent(3);
+
+	// the entries for the basic layout, then their indices moved to the f4vector layout:
+	// component n of (x,y,z) is lane z/nvec of the f4vector (n,x,y,z%nvec)
+	Field_Gather_FDTD* basic = Field_Gather_FDTD::New(op, interpol, NULL, NULL, h_field, numLines, posLines);
+	Field_Gather_SSE* gather = new Field_Gather_SSE((const float*)V->data(), (const float*)I->data(), h_field, numLines[1], numLines[2]);
+	gather->entries.swap(basic->entries);
+	delete basic;
+	for (size_t e=0; e<gather->entries.size(); ++e)
+	{
+		Entry& entry = gather->entries[e];
+		for (int m=0; m<4; ++m)
+		{
+			unsigned int i = entry.idx[m];
+			const unsigned int z = i%N[2]; i/=N[2];
+			const unsigned int y = i%N[1]; i/=N[1];
+			const unsigned int x = i%N[0]; i/=N[0];
+			const unsigned int n = i;
+			entry.idx[m] = 4*V->linearIndex({n, x, y, z%nvec}) + z/nvec;
+		}
+	}
 	return gather;
 }

@@ -139,4 +139,24 @@ protected:
 	size_t m_Offset;
 };
 
+class Engine_sse;
+
+//! The same evaluation on the f4vector fields of the SSE engines: the entries index the fields as floats.
+class Field_Gather_SSE : public Field_Gather_FDTD
+{
+public:
+	//! As Field_Gather_FDTD::New(), reading the fields of \a eng; NULL if they cannot be indexed with 32 bit
+	static Field_Gather_SSE* New(const Operator* op, Engine_Interface_Base::InterpolationType interpol, const Engine_sse* eng,
+	                             bool h_field, const unsigned int numLines[3], unsigned int* const posLines[3]);
+	virtual void Evaluate(size_t line_start, size_t line_stop, ArrayLib::ArrayNIJK<float> &field, const float* src=NULL) const
+	{
+		Field_Gather_FDTD::Evaluate(line_start, line_stop, field, src ? src : (m_H ? m_C : m_V));
+	}
+protected:
+	Field_Gather_SSE(const float* volt, const float* curr, bool h_field, unsigned int nj, unsigned int nk)
+		: Field_Gather_FDTD(NULL, NULL, h_field, nj, nk), m_V(volt), m_C(curr) {}
+	const float* m_V;
+	const float* m_C;
+};
+
 #endif // ENGINE_FIELD_GATHER_H

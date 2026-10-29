@@ -31,17 +31,28 @@ public:
 	Engine_Ext_Excitation(Operator_Ext_Excitation* op_ext);
 	virtual ~Engine_Ext_Excitation();
 
+	virtual unsigned int GetUsedHooks() const {return APPLY_VOLT | APPLY_CURR | LINE_HOOKS;}
+
 	virtual void Apply2Voltages();
 	virtual void Apply2Current();
 
+	virtual void Apply2VoltagesLines(unsigned int x0, unsigned int x1);
+	virtual void Apply2CurrentLines(unsigned int x0, unsigned int x1);
+
 protected:
+	//! excite the points order[n0..n1) (the points n0..n1 if order is NULL)
 	template <typename EngType>
-	void Apply2VoltagesImpl(EngType* eng);
+	void Apply2VoltagesImpl(EngType* eng, const unsigned int* order, unsigned int n0, unsigned int n1);
 
 	template <typename EngType>
-	void Apply2CurrentImpl(EngType* eng);
+	void Apply2CurrentImpl(EngType* eng, const unsigned int* order, unsigned int n0, unsigned int n1);
 
 	Operator_Ext_Excitation* m_Op_Exc;
+
+	//! the excitation points sorted by x-line (stable, so points on the same cell keep their order), for the line hooks
+	std::vector<unsigned int> m_VoltOrder, m_VoltX;
+	std::vector<unsigned int> m_CurrOrder, m_CurrX;
+	static void SortByLine(const unsigned int* x, unsigned int count, std::vector<unsigned int>& order, std::vector<unsigned int>& sorted_x);
 };
 
 #endif // ENGINE_EXT_EXCITATION_H

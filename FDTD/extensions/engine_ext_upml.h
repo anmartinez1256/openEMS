@@ -19,6 +19,9 @@
 #define ENGINE_EXT_UPML_H
 
 #include "engine_extension.h"
+#include "tools/global.h"
+#include "tools/aligned_allocator.h"
+#include "tools/array_ops.h"
 #include "FDTD/engine.h"
 #include "FDTD/operator.h"
 #include "engine_extension_dispatcher.h"
@@ -32,6 +35,12 @@ public:
 	virtual ~Engine_Ext_UPML();
 
 	virtual void SetNumberOfThreads(int nrThread);
+	virtual unsigned int GetUsedHooks() const {return PRE_VOLT | POST_VOLT | PRE_CURR | POST_CURR | PREPOST_WRITES_FIELDS | (m_Vec ? LINE_HOOKS : 0);}
+
+	virtual void DoPreVoltageUpdatesLines(unsigned int x0, unsigned int x1);
+	virtual void DoPostVoltageUpdatesLines(unsigned int x0, unsigned int x1);
+	virtual void DoPreCurrentUpdatesLines(unsigned int x0, unsigned int x1);
+	virtual void DoPostCurrentUpdatesLines(unsigned int x0, unsigned int x1);
 
 	virtual void DoPreVoltageUpdates() {Engine_Ext_UPML::DoPreVoltageUpdates(0);};
 	virtual void DoPreVoltageUpdates(int threadID);
@@ -60,6 +69,28 @@ protected:
 
 	std::vector<unsigned int> m_start;
 	std::vector<unsigned int> m_numX;
+
+	//! f4vector path for the SSE engines when the PML covers the full z range (see SetupVectorized())
+	bool m_Vec;
+	bool m_VecChecked;
+	unsigned int m_nvec;
+	std::vector<unsigned int> m_RowStart, m_RowNum; //!< (x,y)-rows of the PML per thread
+	//! coefficients and fluxes in the engine order: index ((x*Ny+y)*nvec+v)*3+n, lane l = z/nvec
+	std::vector<f4vector, aligned_allocator<f4vector> > m_f4_vv, m_f4_vvfo, m_f4_vvfn, m_f4_ii, m_f4_iifo, m_f4_iifn;
+	std::vector<f4vector, aligned_allocator<f4vector> > m_f4_volt_flux, m_f4_curr_flux;
+	std::vector<f4vector, aligned_allocator<f4vector> > m_f4_LaneMask; //!< per z-vector: all bits set in lanes inside the mesh
+	void SetupVectorized();
+	void DoPreVoltageUpdatesVec(int threadID);
+	void DoPostVoltageUpdatesVec(int threadID);
+	void DoPreCurrentUpdatesVec(int threadID);
+	void DoPostCurrentUpdatesVec(int threadID);
+	//! the f4vector hooks for the PML (x,y)-rows [r0, r1)
+	void DoPreVoltageUpdatesRows(unsigned int r0, unsigned int r1);
+	void DoPostVoltageUpdatesRows(unsigned int r0, unsigned int r1);
+	void DoPreCurrentUpdatesRows(unsigned int r0, unsigned int r1);
+	void DoPostCurrentUpdatesRows(unsigned int r0, unsigned int r1);
+	//! the PML rows of the x-lines [x0, x1), false if there are none
+	bool LineRows(unsigned int x0, unsigned int x1, unsigned int& r0, unsigned int& r1) const;
 
 	ArrayLib::ArrayNIJK<FDTD_FLOAT> volt_flux;
 	ArrayLib::ArrayNIJK<FDTD_FLOAT> curr_flux;

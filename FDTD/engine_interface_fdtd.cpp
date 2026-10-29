@@ -16,6 +16,7 @@
 */
 
 #include "engine_interface_fdtd.h"
+#include "engine_sse.h"
 #include "engine_field_gather.h"
 #include <stdexcept>
 
@@ -307,9 +308,11 @@ Engine_Field_Gather* Engine_Interface_FDTD::CreateFieldGather(bool h_field, cons
 {
 	const ArrayLib::ArrayNIJK<FDTD_FLOAT>* volt = NULL;
 	const ArrayLib::ArrayNIJK<FDTD_FLOAT>* curr = NULL;
-	if (!m_Eng->GetBasicFieldArrays(volt, curr))
-		return NULL;   // no gather, the caller reads the fields node by node
-	return Field_Gather_FDTD::New(m_Op, m_InterpolType, volt, curr, h_field, numLines, posLines);
+	if (m_Eng->GetBasicFieldArrays(volt, curr))
+		return Field_Gather_FDTD::New(m_Op, m_InterpolType, volt, curr, h_field, numLines, posLines);
+	if (m_Eng->GetType()==Engine::SSE)
+		return Field_Gather_SSE::New(m_Op, m_InterpolType, (const Engine_sse*)m_Eng, h_field, numLines, posLines);
+	return NULL;   // no gather, the caller reads the fields node by node
 }
 
 int Engine_Interface_FDTD::CreateFieldDFT(const Engine_Field_Gather* gather, unsigned int count)

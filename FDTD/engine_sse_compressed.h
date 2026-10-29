@@ -33,6 +33,16 @@ protected:
 
 	virtual void UpdateVoltages(unsigned int startX, unsigned int numX);
 	virtual void UpdateCurrents(unsigned int startX, unsigned int numX);
+
+	//! The original updates, for any array layout.
+	void UpdateVoltages_Generic(unsigned int startX, unsigned int numX);
+	void UpdateCurrents_Generic(unsigned int startX, unsigned int numX);
+	//! Same arithmetic in the same order (bit-identical), for the default I-J-K-N layout with
+	//! loop invariants in local restrict pointers (union stores otherwise make the compiler reload them).
+	void UpdateVoltages_IJKN(unsigned int startX, unsigned int numX);
+	void UpdateCurrents_IJKN(unsigned int startX, unsigned int numX);
+	//! true if both field arrays use the I-J-K-N layout (component stride 1, z stride 3)
+	bool UseIJKN() const;
 };
 
 #endif // ENGINE_SSE_COMPRESSED_H

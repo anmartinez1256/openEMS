@@ -29,6 +29,7 @@
 #define ENG_EXT_PRIO_CYLINDERMULTIGRID	-3000 //cylindrial multi-grid extension priority
 
 #include <string>
+#include <vector>
 
 class Operator_Extension;
 class Engine;
@@ -40,6 +41,23 @@ public:
 	virtual ~Engine_Extension();
 
 	virtual void SetNumberOfThreads(int nrThread);
+
+	//! Hook flags for GetUsedHooks()
+	enum Hooks {PRE_VOLT=1, POST_VOLT=2, APPLY_VOLT=4, PRE_CURR=8, POST_CURR=16, APPLY_CURR=32,
+				PREPOST_WRITES_FIELDS=64, //!< its Pre/Post hooks do change engine fields (e.g. the UPML)
+				LINE_HOOKS=128, //!< implements the *Lines() hooks below, for the fused sweep
+				LEGACY_HOOKS=~0u};
+	//! Which of the six update hooks this extension implements (or'ed Hooks).
+	/*!
+	  The multithreaded engine skips the hooks an extension does not implement, and runs the
+	  Pre/Post hooks of all extensions that declare them before a single barrier, as long as they
+	  only read engine fields (as documented below). An extension whose Pre/Post hooks write engine
+	  fields must add PREPOST_WRITES_FIELDS: it then gets a barrier before and after each of these
+	  hooks. Apply2* hooks keep one barrier per extension, because they write engine fields in
+	  priority order.
+	  The default LEGACY_HOOKS keeps the old behaviour: every hook is called, followed by a barrier.
+	  */
+	virtual unsigned int GetUsedHooks() const {return LEGACY_HOOKS;}
 
 	//! This method will be called __before__ the main engine does the usual voltage updates. This method may __not__ change the engine voltages!!!
 	virtual void DoPreVoltageUpdates() {}
@@ -60,6 +78,23 @@ public:
 	//! This method will be called __after__ all updates to the current and extensions and may add/set its results to the engine current, but may __not__ rely on the current value of the engine current!!!
 	virtual void Apply2Current() {}
 	virtual void Apply2Current(int threadID);
+
+	//! Hooks for the fused sweep of the multithreaded engine (extensions with LINE_HOOKS).
+	/*!
+	  The fused sweep runs the voltage update, its hooks and the current update x-line by x-line
+	  and calls these instead of the hooks above: the same work, for the x-lines [x0, x1) only, with
+	  the same order of hooks and extensions for every cell. A line hook may touch the fields of its
+	  own lines only (and of the line next to a line from GetCoupledLines()). Different threads call
+	  them for disjoint line ranges at the same time.
+	  */
+	virtual void DoPreVoltageUpdatesLines(unsigned int /*x0*/, unsigned int /*x1*/) {}
+	virtual void DoPostVoltageUpdatesLines(unsigned int /*x0*/, unsigned int /*x1*/) {}
+	virtual void Apply2VoltagesLines(unsigned int /*x0*/, unsigned int /*x1*/) {}
+	virtual void DoPreCurrentUpdatesLines(unsigned int /*x0*/, unsigned int /*x1*/) {}
+	virtual void DoPostCurrentUpdatesLines(unsigned int /*x0*/, unsigned int /*x1*/) {}
+	virtual void Apply2CurrentLines(unsigned int /*x0*/, unsigned int /*x1*/) {}
+	//! x-lines x whose voltage hooks also touch line x+1 (e.g. a Mur ABC on an x-face): x and x+1 are swept as one block
+	virtual void GetCoupledLines(std::vector<unsigned int>& /*lines*/) const {}
 
 	//! Set the Engine to this extension. This will usually done automatically by Engine::AddExtension
 	virtual void SetEngine(Engine* eng) {m_Eng=eng;}

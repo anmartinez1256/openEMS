@@ -23,6 +23,9 @@
 #include "FDTD/engine.h"
 #include "FDTD/operator.h"
 #include "engine_extension_dispatcher.h"
+#include <atomic>
+#include <mutex>
+#include <vector>
 
 class Operator_Ext_LumpedRLC;
 
@@ -37,12 +40,31 @@ public:
 	Engine_Ext_LumpedRLC(Operator_Ext_LumpedRLC *op_ext_RLC);
 	virtual ~Engine_Ext_LumpedRLC();
 
+	virtual unsigned int GetUsedHooks() const {return PRE_VOLT | APPLY_VOLT | LINE_HOOKS;}
+
 	virtual void DoPreVoltageUpdates();
 	virtual void Apply2Voltages();
 
+	virtual void DoPreVoltageUpdatesLines(unsigned int x0, unsigned int x1);
+	virtual void Apply2VoltagesLines(unsigned int x0, unsigned int x1);
+
 protected:
+	//! update the elements order[n0..n1) (the elements n0..n1 if order is NULL)
 	template <typename EngType>
-	void Apply2VoltagesImpl(EngType* eng);
+	void Apply2VoltagesImpl(EngType* eng, const unsigned int* order, unsigned int n0, unsigned int n1);
+	void UpdateInductorCurrents(const unsigned int* order, unsigned int n0, unsigned int n1);
+
+	//! the [n],[n-1],[n-2] containers move on once per timestep
+	static void Rotate(FDTD_FLOAT** c);
+	//! line hooks: the first call of a timestep rotates (the other threads wait for it)
+	void RotateOnce(std::atomic<int>& stamp, FDTD_FLOAT** c);
+	std::mutex m_RotateMutex;
+	std::atomic<int> m_RotatedVd, m_RotatedJ; //!< timestep of the last rotation by a line hook
+
+	//! the elements sorted by x-line, for the line hooks
+	std::vector<unsigned int> m_Order, m_X;
+	//! elements [n0, n1) of m_Order are on the x-lines [x0, x1)
+	void LineRange(unsigned int x0, unsigned int x1, unsigned int& n0, unsigned int& n1) const;
 
 	Operator_Ext_LumpedRLC* m_Op_Ext_RLC;
 

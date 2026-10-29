@@ -33,6 +33,7 @@ public:
 	virtual ~Engine_Ext_Mur_ABC();
 
 	virtual void SetNumberOfThreads(int nrThread);
+	virtual unsigned int GetUsedHooks() const {return PRE_VOLT | POST_VOLT | APPLY_VOLT | (m_Fast ? LINE_HOOKS : 0);}
 
 	virtual void DoPreVoltageUpdates() {Engine_Ext_Mur_ABC::DoPreVoltageUpdates(0);}
 	virtual void DoPreVoltageUpdates(int threadID);
@@ -43,6 +44,11 @@ public:
 
 	//! The ABC is switched off until this timestep, if an excitation lies on its plane
 	unsigned int GetStartTimestep() const {return m_start_TS;}
+
+	virtual void DoPreVoltageUpdatesLines(unsigned int x0, unsigned int x1);
+	virtual void DoPostVoltageUpdatesLines(unsigned int x0, unsigned int x1);
+	virtual void Apply2VoltagesLines(unsigned int x0, unsigned int x1);
+	virtual void GetCoupledLines(std::vector<unsigned int>& lines) const;
 
 protected:
 	template <typename EngType>
@@ -72,6 +78,26 @@ protected:
 	ArrayLib::ArrayIJ<FDTD_FLOAT>& m_Mur_Coeff_nyPP;
 	ArrayLib::ArrayIJ<FDTD_FLOAT> m_volt_nyP; //n+1 direction
 	ArrayLib::ArrayIJ<FDTD_FLOAT> m_volt_nyPP; //n+2 direction
+
+	//! Fast path for the SSE engines: the float index of every face cell in the f4vector field array
+	//! (component 0), so the hooks need no z%numVectors, z/numVectors per cell. The other component
+	//! and the shifted line are constant offsets from it.
+	bool m_Fast;
+	bool m_FastChecked;
+	std::vector<unsigned int> m_FloatIndex;
+	ptrdiff_t m_OffsetNyP, m_OffsetNyPP, m_OffsetShift;
+	//! The face cells of the line hooks by x-line, in memory order: runs of four cells that fill one
+	//! f4vector (the z-lines of x- and y-faces) are updated as vectors, the other cells one by one.
+	//! Line x: vectors m_VecStart[x] .. m_VecStart[x+1], cells m_ScStart[x] .. m_ScStart[x+1].
+	//! Own coefficient and save arrays in that order (the threaded hooks keep m_volt_nyP/nyPP).
+	std::vector<unsigned int> m_VecStart, m_VecIndex;   //!< f4vector index of component 0
+	std::vector<f4vector> m_VecCoeffP, m_VecCoeffPP, m_VecP, m_VecPP;
+	std::vector<unsigned int> m_ScStart, m_ScIndex;     //!< float index of component 0
+	std::vector<FDTD_FLOAT> m_ScCoeffP, m_ScCoeffPP, m_ScP, m_ScPP;
+	void SetupFast();
+	void DoPreVoltageUpdatesFast(int threadID);
+	void DoPostVoltageUpdatesFast(int threadID);
+	void Apply2VoltagesFast(int threadID);
 };
 
 #endif // ENGINE_EXT_MUR_ABC_H
