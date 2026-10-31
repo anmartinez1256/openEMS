@@ -32,6 +32,10 @@ public:
 
 	virtual void DoPreCurrentUpdates();
 
+	virtual unsigned int GetUsedHooks() const;
+	virtual void DoPreVoltageUpdatesLines(unsigned int x0, unsigned int x1);
+	virtual void DoPreCurrentUpdatesLines(unsigned int x0, unsigned int x1);
+
 protected:
 	template <typename EngType>
 	void DoPreVoltageUpdatesImpl(EngType* eng);

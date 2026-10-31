@@ -825,6 +825,11 @@ void Operator::DumpMaterial2File(std::string filename)
 
 bool Operator::SetupCSXGrid(CSRectGrid* grid)
  {
+	for (int n=0; n<3; ++n)   // the tabulated mesh deltas belong to the old mesh
+	{
+		m_DiscDelta[n][0].clear();
+		m_DiscDelta[n][1].clear();
+	}
 	 for (int n=0; n<3; ++n)
 	 {
 		 discLines[n] = grid->GetLines(n,discLines[n],numLines[n],true);
@@ -1337,18 +1342,21 @@ double Operator::GetMaterial(
 {
 	// The material averaging asks for two types at the same coordinate in a row (epsilon+kappa, mue+sigma):
 	// remember the last lookup per thread, the primitives do not change during the setup.
-	struct LastLookup { double coords[3]; const CSPrimitives* const* prims; size_t num; CSPropMaterial* mat; bool valid; };
-	static thread_local LastLookup last = {{0,0,0}, NULL, 0, NULL, false};
+	// (keyed by the vector's address, size and first/last entry: a later vector may reuse a freed address)
+	struct LastLookup { double coords[3]; const CSPrimitives* const* prims; size_t num; const CSPrimitives* first; const CSPrimitives* back; CSPropMaterial* mat; bool valid; };
+	static thread_local LastLookup last = {{0,0,0}, NULL, 0, NULL, NULL, NULL, false};
+	const CSPrimitives* first = vPrims.empty() ? NULL : vPrims.front();
+	const CSPrimitives* back = vPrims.empty() ? NULL : vPrims.back();
 	CSPropMaterial* mat;
 	if (last.valid && last.coords[0]==coords[0] && last.coords[1]==coords[1] && last.coords[2]==coords[2]
-		&& last.prims==vPrims.data() && last.num==vPrims.size())
+		&& last.prims==vPrims.data() && last.num==vPrims.size() && last.first==first && last.back==back)
 		mat = last.mat;
 	else
 	{
 		CSProperties* prop = CSX->FindPropertyByCoordPriority(coords,vPrims,markAsUsed);
 		mat = dynamic_cast<CSPropMaterial*>(prop);
 		last.coords[0]=coords[0]; last.coords[1]=coords[1]; last.coords[2]=coords[2];
-		last.prims = vPrims.data(); last.num = vPrims.size(); last.mat = mat; last.valid = markAsUsed;
+		last.prims = vPrims.data(); last.num = vPrims.size(); last.first = first; last.back = back; last.mat = mat; last.valid = markAsUsed;
 	}
 	if (mat)
 	{

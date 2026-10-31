@@ -19,6 +19,7 @@
 #define ENGINE_EXT_DISPERSIVE_H
 
 #include "engine_extension.h"
+#include <vector>
 #include "FDTD/engine.h"
 #include "FDTD/operator.h"
 #include "engine_extension_dispatcher.h"
@@ -34,7 +35,24 @@ public:
 	virtual void Apply2Voltages();
 	virtual void Apply2Current();
 
+	virtual void SetNumberOfThreads(int nrThread);
+	virtual unsigned int GetUsedHooks() const;
+	virtual void Apply2VoltagesLines(unsigned int x0, unsigned int x1);
+	virtual void Apply2CurrentLines(unsigned int x0, unsigned int x1);
+
 protected:
+	//! Line hooks for the SSE engines: the positions of every order sorted by x, with the float index of each
+	//! component in the f4vector field arrays precomputed (same per-position arithmetic as the templates).
+	bool m_LinesReady;
+	bool m_LinesChecked;
+	std::vector<std::vector<unsigned int> > m_SortedIdx; //!< [order][k]: original position index, sorted by x
+	std::vector<std::vector<unsigned int> > m_SortedX;   //!< [order][k]: its x
+	std::vector<std::vector<unsigned int> > m_FloatIdx;  //!< [order][3*k+n]: float index of component n
+	void SetupLines();
+	void LineRange(int o, unsigned int x0, unsigned int x1, unsigned int& k0, unsigned int& k1) const;
+	bool AnyVoltADE() const;
+	bool AnyCurrADE() const;
+
 	template <typename EngType>
 	void Apply2VoltagesImpl(EngType* eng);
 

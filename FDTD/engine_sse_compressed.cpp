@@ -16,6 +16,7 @@
 */
 
 #include "engine_sse_compressed.h"
+#include <cstdlib>
 
 // enable AltiVec mode on ppc64le in GCC's emmintrin.h
 #include <boost/predef.h>
@@ -46,6 +47,42 @@ Engine_SSE_Compressed::Engine_SSE_Compressed(const Operator_SSE_Compressed* op) 
 
 Engine_SSE_Compressed::~Engine_SSE_Compressed()
 {
+}
+
+void Engine_SSE_Compressed::Init()
+{
+	Engine_sse::Init();
+	BuildPackedCoeffs();
+}
+
+void Engine_SSE_Compressed::Reset()
+{
+	m_PackedV.clear();
+	m_PackedI.clear();
+	Engine_sse::Reset();
+}
+
+void Engine_SSE_Compressed::BuildPackedCoeffs()
+{
+	m_PackedV.clear();
+	m_PackedI.clear();
+	if (std::getenv("OPENEMS_NO_PACKED_COEFF") != NULL)
+		return;
+	const size_t numOps = Op->f4_vv_Compressed[0].size();
+	for (int n=0; n<3; ++n)
+		if ((Op->f4_vv_Compressed[n].size()!=numOps) || (Op->f4_vi_Compressed[n].size()!=numOps) ||
+		    (Op->f4_ii_Compressed[n].size()!=numOps) || (Op->f4_iv_Compressed[n].size()!=numOps))
+			return;
+	m_PackedV.resize(numOps);
+	m_PackedI.resize(numOps);
+	for (size_t i=0; i<numOps; ++i)
+		for (int n=0; n<3; ++n)
+		{
+			m_PackedV[i].c[2*n]   = Op->f4_vv_Compressed[n][i];
+			m_PackedV[i].c[2*n+1] = Op->f4_vi_Compressed[n][i];
+			m_PackedI[i].c[2*n]   = Op->f4_ii_Compressed[n][i];
+			m_PackedI[i].c[2*n+1] = Op->f4_iv_Compressed[n][i];
+		}
 }
 
 void Engine_SSE_Compressed::UpdateVoltages_Generic(unsigned int startX, unsigned int numX)
@@ -315,7 +352,7 @@ bool Engine_SSE_Compressed::UseIJKN() const
 	return (f4_volt_ptr->stride(0)==1) && (f4_volt_ptr->stride(3)==3) &&
 		   (f4_curr_ptr->stride(0)==1) && (f4_curr_ptr->stride(3)==3) &&
 		   (f4_volt_ptr->stride(1)==f4_curr_ptr->stride(1)) && (f4_volt_ptr->stride(2)==f4_curr_ptr->stride(2)) &&
-		   (Op->m_Op_index.stride(2)==1);
+		   (Op->m_Op_index.stride(2)==1) && (m_PackedV.size()==Op->f4_vv_Compressed[0].size()) && (m_PackedV.size()>0);
 }
 
 void Engine_SSE_Compressed::UpdateVoltages(unsigned int startX, unsigned int numX)
@@ -374,12 +411,7 @@ void Engine_SSE_Compressed::UpdateVoltages_IJKN(unsigned int startX, unsigned in
 	f4vector* __restrict volt = f4_volt_ptr->data();
 	const f4vector* __restrict curr = f4_curr_ptr->data();
 	const unsigned int* __restrict op_idx = Op->m_Op_index.data();
-	const f4vector* __restrict vv0 = Op->f4_vv_Compressed[0].data();
-	const f4vector* __restrict vv1 = Op->f4_vv_Compressed[1].data();
-	const f4vector* __restrict vv2 = Op->f4_vv_Compressed[2].data();
-	const f4vector* __restrict vi0 = Op->f4_vi_Compressed[0].data();
-	const f4vector* __restrict vi1 = Op->f4_vi_Compressed[1].data();
-	const f4vector* __restrict vi2 = Op->f4_vi_Compressed[2].data();
+	const PackedCoeff* __restrict pk = m_PackedV.data();   // per operator: vv0 vi0 vv1 vi1 vv2 vi2
 	const ptrdiff_t sx = f4_curr_ptr->stride(1);
 	const ptrdiff_t sy = f4_curr_ptr->stride(2);
 	const ptrdiff_t isx = Op->m_Op_index.stride(0);
@@ -399,41 +431,41 @@ void Engine_SSE_Compressed::UpdateVoltages_IJKN(unsigned int startX, unsigned in
 			f4vector_t a, t;
 			for (unsigned int z=1; z<nvec; ++z)
 			{
-				const unsigned int i = ip[z];
+				const f4vector* __restrict k = pk[ip[z]].c;
 				f4vector* __restrict vz = v + 3*z;
 				const f4vector* __restrict cz = c + 3*z;
 
 				// x-polarization
 				t = cz[2].v - cz[2-shy].v - cz[1].v + cz[1-3].v;
-				a = vz[0].v * vv0[i].v;
-				vz[0].v = a + vi0[i].v * t;
+				a = vz[0].v * k[0].v;
+				vz[0].v = a + k[1].v * t;
 
 				// y-polarization
 				t = cz[0].v - cz[0-3].v - cz[2].v + cz[2-shx].v;
-				a = vz[1].v * vv1[i].v;
-				vz[1].v = a + vi1[i].v * t;
+				a = vz[1].v * k[2].v;
+				vz[1].v = a + k[3].v * t;
 
 				// z-polarization
 				t = cz[1].v - cz[1-shx].v - cz[0].v + cz[0-shy].v;
-				a = vz[2].v * vv2[i].v;
-				vz[2].v = a + vi2[i].v * t;
+				a = vz[2].v * k[4].v;
+				vz[2].v = a + k[5].v * t;
 			}
 
 			// z-vector 0
-			const unsigned int i = ip[0];
+			const f4vector* __restrict k = pk[ip[0]].c;
 			const f4vector* __restrict ce = c + 3*(nvec-1);
 
 			t = c[2].v - c[2-shy].v - c[1].v + ShiftLanesUp(ce[1]).v;
-			a = v[0].v * vv0[i].v;
-			v[0].v = a + vi0[i].v * t;
+			a = v[0].v * k[0].v;
+			v[0].v = a + k[1].v * t;
 
 			t = c[0].v - ShiftLanesUp(ce[0]).v - c[2].v + c[2-shx].v;
-			a = v[1].v * vv1[i].v;
-			v[1].v = a + vi1[i].v * t;
+			a = v[1].v * k[2].v;
+			v[1].v = a + k[3].v * t;
 
 			t = c[1].v - c[1-shx].v - c[0].v + c[0-shy].v;
-			a = v[2].v * vv2[i].v;
-			v[2].v = a + vi2[i].v * t;
+			a = v[2].v * k[4].v;
+			v[2].v = a + k[5].v * t;
 		}
 	}
 }
@@ -443,12 +475,7 @@ void Engine_SSE_Compressed::UpdateCurrents_IJKN(unsigned int startX, unsigned in
 	const f4vector* __restrict volt = f4_volt_ptr->data();
 	f4vector* __restrict curr = f4_curr_ptr->data();
 	const unsigned int* __restrict op_idx = Op->m_Op_index.data();
-	const f4vector* __restrict ii0 = Op->f4_ii_Compressed[0].data();
-	const f4vector* __restrict ii1 = Op->f4_ii_Compressed[1].data();
-	const f4vector* __restrict ii2 = Op->f4_ii_Compressed[2].data();
-	const f4vector* __restrict iv0 = Op->f4_iv_Compressed[0].data();
-	const f4vector* __restrict iv1 = Op->f4_iv_Compressed[1].data();
-	const f4vector* __restrict iv2 = Op->f4_iv_Compressed[2].data();
+	const PackedCoeff* __restrict pk = m_PackedI.data();   // per operator: ii0 iv0 ii1 iv1 ii2 iv2
 	const ptrdiff_t sx = f4_volt_ptr->stride(1);
 	const ptrdiff_t sy = f4_volt_ptr->stride(2);
 	const ptrdiff_t isx = Op->m_Op_index.stride(0);
@@ -466,42 +493,42 @@ void Engine_SSE_Compressed::UpdateCurrents_IJKN(unsigned int startX, unsigned in
 			f4vector_t a, t;
 			for (unsigned int z=0; z+1<nvec; ++z)
 			{
-				const unsigned int i = ip[z];
+				const f4vector* __restrict k = pk[ip[z]].c;
 				const f4vector* __restrict vz = v + 3*z;
 				f4vector* __restrict cz = c + 3*z;
 
 				// x-pol
 				t = vz[2].v - vz[2+sy].v - vz[1].v + vz[1+3].v;
-				a = cz[0].v * ii0[i].v;
-				cz[0].v = a + iv0[i].v * t;
+				a = cz[0].v * k[0].v;
+				cz[0].v = a + k[1].v * t;
 
 				// y-pol
 				t = vz[0].v - vz[0+3].v - vz[2].v + vz[2+sx].v;
-				a = cz[1].v * ii1[i].v;
-				cz[1].v = a + iv1[i].v * t;
+				a = cz[1].v * k[2].v;
+				cz[1].v = a + k[3].v * t;
 
 				// z-pol
 				t = vz[1].v - vz[1+sx].v - vz[0].v + vz[0+sy].v;
-				a = cz[2].v * ii2[i].v;
-				cz[2].v = a + iv2[i].v * t;
+				a = cz[2].v * k[4].v;
+				cz[2].v = a + k[5].v * t;
 			}
 
 			// last z-vector
-			const unsigned int i = ip[nvec-1];
+			const f4vector* __restrict k = pk[ip[nvec-1]].c;
 			const f4vector* __restrict ve = v + 3*(nvec-1);
 			f4vector* __restrict ce = c + 3*(nvec-1);
 
 			t = ve[2].v - ve[2+sy].v - ve[1].v + ShiftLanesDown(v[1]).v;
-			a = ce[0].v * ii0[i].v;
-			ce[0].v = a + iv0[i].v * t;
+			a = ce[0].v * k[0].v;
+			ce[0].v = a + k[1].v * t;
 
 			t = ve[0].v - ShiftLanesDown(v[0]).v - ve[2].v + ve[2+sx].v;
-			a = ce[1].v * ii1[i].v;
-			ce[1].v = a + iv1[i].v * t;
+			a = ce[1].v * k[2].v;
+			ce[1].v = a + k[3].v * t;
 
 			t = ve[1].v - ve[1+sx].v - ve[0].v + ve[0+sy].v;
-			a = ce[2].v * ii2[i].v;
-			ce[2].v = a + iv2[i].v * t;
+			a = ce[2].v * k[4].v;
+			ce[2].v = a + k[5].v * t;
 		}
 	}
 }

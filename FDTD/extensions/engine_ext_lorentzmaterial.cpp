@@ -76,6 +76,98 @@ Engine_Ext_LorentzMaterial::~Engine_Ext_LorentzMaterial()
 	volt_Lor_ADE=NULL;
 }
 
+unsigned int Engine_Ext_LorentzMaterial::GetUsedHooks() const
+{
+	return Engine_Ext_Dispersive::GetUsedHooks() | (AnyVoltADE() ? PRE_VOLT : 0) | (AnyCurrADE() ? PRE_CURR : 0);
+}
+
+// the same per-position operations as DoPreVoltageUpdatesImpl, for the positions on x-lines [x0,x1)
+void Engine_Ext_LorentzMaterial::DoPreVoltageUpdatesLines(unsigned int x0, unsigned int x1)
+{
+	const float* __restrict volt = (const float*)((Engine_sse*)m_Eng)->f4_volt_ptr->data();
+	for (int o=0;o<m_Order;++o)
+	{
+		if (m_Op_Ext_Lor->m_volt_ADE_On[o]==false) continue;
+		unsigned int k0, k1;
+		LineRange(o, x0, x1, k0, k1);
+		const unsigned int* __restrict idx = m_SortedIdx[o].data();
+		const unsigned int* __restrict fi = m_FloatIdx[o].data();
+		FDTD_FLOAT* const* ade = volt_ADE[o];
+		FDTD_FLOAT* const* v_int = m_Op_Ext_Lor->v_int_ADE[o];
+		FDTD_FLOAT* const* v_ext = m_Op_Ext_Lor->v_ext_ADE[o];
+		if (m_Op_Ext_Lor->m_volt_Lor_ADE_On[o])
+		{
+			FDTD_FLOAT* const* lor = volt_Lor_ADE[o];
+			FDTD_FLOAT* const* v_lor = m_Op_Ext_Lor->v_Lor_ADE[o];
+			for (unsigned int k=k0; k<k1; ++k)
+			{
+				const unsigned int i = idx[k];
+				for (unsigned int n=0; n<3; ++n)
+				{
+					lor[n][i]+=v_lor[n][i]*ade[n][i];
+					ade[n][i] *= v_int[n][i];
+					ade[n][i] += v_ext[n][i] * (volt[fi[3*k+n]]-lor[n][i]);
+				}
+			}
+		}
+		else
+		{
+			for (unsigned int k=k0; k<k1; ++k)
+			{
+				const unsigned int i = idx[k];
+				for (unsigned int n=0; n<3; ++n)
+				{
+					ade[n][i] *= v_int[n][i];
+					ade[n][i] += v_ext[n][i] * volt[fi[3*k+n]];
+				}
+			}
+		}
+	}
+}
+
+void Engine_Ext_LorentzMaterial::DoPreCurrentUpdatesLines(unsigned int x0, unsigned int x1)
+{
+	const float* __restrict curr = (const float*)((Engine_sse*)m_Eng)->f4_curr_ptr->data();
+	for (int o=0;o<m_Order;++o)
+	{
+		if (m_Op_Ext_Lor->m_curr_ADE_On[o]==false) continue;
+		unsigned int k0, k1;
+		LineRange(o, x0, x1, k0, k1);
+		const unsigned int* __restrict idx = m_SortedIdx[o].data();
+		const unsigned int* __restrict fi = m_FloatIdx[o].data();
+		FDTD_FLOAT* const* ade = curr_ADE[o];
+		FDTD_FLOAT* const* i_int = m_Op_Ext_Lor->i_int_ADE[o];
+		FDTD_FLOAT* const* i_ext = m_Op_Ext_Lor->i_ext_ADE[o];
+		if (m_Op_Ext_Lor->m_curr_Lor_ADE_On[o])
+		{
+			FDTD_FLOAT* const* lor = curr_Lor_ADE[o];
+			FDTD_FLOAT* const* i_lor = m_Op_Ext_Lor->i_Lor_ADE[o];
+			for (unsigned int k=k0; k<k1; ++k)
+			{
+				const unsigned int i = idx[k];
+				for (unsigned int n=0; n<3; ++n)
+				{
+					lor[n][i]+=i_lor[n][i]*ade[n][i];
+					ade[n][i] *= i_int[n][i];
+					ade[n][i] += i_ext[n][i] * (curr[fi[3*k+n]]-lor[n][i]);
+				}
+			}
+		}
+		else
+		{
+			for (unsigned int k=k0; k<k1; ++k)
+			{
+				const unsigned int i = idx[k];
+				for (unsigned int n=0; n<3; ++n)
+				{
+					ade[n][i] *= i_int[n][i];
+					ade[n][i] += i_ext[n][i] * curr[fi[3*k+n]];
+				}
+			}
+		}
+	}
+}
+
 template <typename EngType>
 void Engine_Ext_LorentzMaterial::DoPreVoltageUpdatesImpl(EngType* eng)
 {

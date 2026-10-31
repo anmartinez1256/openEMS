@@ -26,6 +26,9 @@
 
 
 #include "engine_multithread.h"
+#ifdef __APPLE__
+#include <pthread/qos.h>
+#endif
 #include "extensions/engine_extension.h"
 #include "tools/denormal.h"
 #include "tools/useful.h"
@@ -525,16 +528,28 @@ void Engine_Multithread::SetupFused()
 		}
 	}
 
-	// blocks: single x-lines, except that a coupled line x is swept together with x+1
+	// blocks: OPENEMS_FUSED_BLOCK x-lines each (a coupled line x is always swept together with x+1),
+	// fewer blocks = fewer hook calls and loop set-ups per timestep; kept to >= 4 blocks per thread
 	const unsigned int NX = numLines[0];
 	std::vector<bool> joined(NX, false);
 	for (size_t n=0; n<coupled.size(); ++n)
 		if (coupled[n]+1<NX)
 			joined[coupled[n]] = true;
+	const char* benv = getenv("OPENEMS_FUSED_BLOCK");
+	unsigned int blk = (benv && (atoi(benv)>0)) ? (unsigned int)atoi(benv) : 1;
+	while ((blk>1) && (NX/blk < 4*m_numThreads))
+		blk /= 2;
 	m_Blocks.clear();
+	unsigned int len = 0;
 	for (unsigned int x=0; x<NX; ++x)
-		if ((x==0) || !joined[x-1])
+	{
+		if ((x==0) || ((len>=blk) && !joined[x-1]))
+		{
 			m_Blocks.push_back(x);
+			len = 0;
+		}
+		++len;
+	}
 	m_Blocks.push_back(NX);
 	const unsigned int nb = m_Blocks.size()-1;
 	if (nb<m_numThreads)
@@ -692,6 +707,18 @@ void thread::operator()()
 
 	// speed up the calculation of denormal floating point values (flush-to-zero)
 	Denormal::Disable();
+#ifdef __APPLE__
+	// engine threads at the QoS of the main thread's work: the default (QOS_CLASS_DEFAULT) lets macOS park
+	// them on E-cores or deprioritise them against foreground apps. OPENEMS_QOS=0 off, 2 = user-interactive.
+	{
+		const char* q = getenv("OPENEMS_QOS");
+		const int mode = q ? atoi(q) : 1;
+		if (mode==1)
+			pthread_set_qos_class_self_np(QOS_CLASS_USER_INITIATED, 0);
+		else if (mode==2)
+			pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
+	}
+#endif
 
 	while (!m_enginePtr->m_stopThreads)
 	{

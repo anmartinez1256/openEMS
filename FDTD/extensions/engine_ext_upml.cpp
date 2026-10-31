@@ -16,10 +16,13 @@
 */
 
 #include "engine_ext_upml.h"
+#include <cstdlib>
+#include <map>
 #include "operator_ext_upml.h"
 #include "FDTD/engine.h"
 #include "FDTD/engine_sse.h"
 #include "tools/useful.h"
+#include "tools/global.h"
 #include <cstring>
 #include <algorithm>
 
@@ -34,6 +37,8 @@ Engine_Ext_UPML::Engine_Ext_UPML(Operator_Ext_UPML* op_ext) : Engine_Extension(o
 	curr_flux.Init("curr_flux", m_Op_UPML->m_numLines);
 
 	m_Vec = false;
+	m_Sse = false;
+	m_CoefTable = false;
 	m_VecChecked = false;
 	m_nvec = 0;
 
@@ -55,8 +60,12 @@ void Engine_Ext_UPML::SetNumberOfThreads(int nrThread)
 		m_start.at(n) = m_start.at(n-1) + m_numX.at(n-1);
 
 	if (!m_VecChecked && m_Eng)
+	{
 		SetupVectorized();
-	if (m_Vec)
+		if (!m_Vec)
+			SetupScalarSSE();
+	}
+	if (m_Vec || m_Sse)
 	{
 		// split the (x,y)-rows instead of the few x-lines of a PML slab
 		m_RowNum = AssignJobs2Threads(m_Op_UPML->m_numLines[0]*m_Op_UPML->m_numLines[1], m_NrThreads, false);
@@ -136,6 +145,7 @@ void Engine_Ext_UPML::SetupVectorized()
 			memcpy(&m_f4_LaneMask[v].f[l], &bits, sizeof(bits));
 		}
 	m_Vec = true;
+	SetupCoefTable4();
 #endif
 }
 
@@ -153,9 +163,24 @@ void Engine_Ext_UPML::DoPreVoltageUpdatesRows(unsigned int r0, unsigned int r1)
 	{
 		f4vector* __restrict e = field + (r/NY + m_Op_UPML->m_StartPos[0])*sx + (r%NY + m_Op_UPML->m_StartPos[1])*sy;
 		const size_t b = (size_t)r*nvec*3;
+		f4vector* __restrict flux = &m_f4_volt_flux[b];
+		if (m_CoefTable)
+		{
+			const Coef4* __restrict tab = m_CoefTab4.data();
+			const unsigned int* __restrict ix = m_CoefIdx4.data() + b;
+			for (unsigned int k=0; k<3*nvec; ++k)
+			{
+				const Coef4& c = tab[ix[k]];
+				const v4sf E = e[k].v, F = flux[k].v;
+				const v4sf p = -(c.vvfo.v * F);
+				const v4sf f = c.vv.v * E + p;
+				e[k].v = UPML_Blend(m_f4_LaneMask[k/3].v, F, E);
+				flux[k].v = f;
+			}
+			continue;
+		}
 		const f4vector* __restrict cv  = &m_f4_vv[b];
 		const f4vector* __restrict cfo = &m_f4_vvfo[b];
-		f4vector* __restrict flux = &m_f4_volt_flux[b];
 		for (unsigned int k=0; k<3*nvec; ++k)
 		{
 			const v4sf E = e[k].v, F = flux[k].v;
@@ -182,8 +207,21 @@ void Engine_Ext_UPML::DoPostVoltageUpdatesRows(unsigned int r0, unsigned int r1)
 	{
 		f4vector* __restrict e = field + (r/NY + m_Op_UPML->m_StartPos[0])*sx + (r%NY + m_Op_UPML->m_StartPos[1])*sy;
 		const size_t b = (size_t)r*nvec*3;
-		const f4vector* __restrict cfn = &m_f4_vvfn[b];
 		f4vector* __restrict flux = &m_f4_volt_flux[b];
+		if (m_CoefTable)
+		{
+			const Coef4* __restrict tab = m_CoefTab4.data();
+			const unsigned int* __restrict ix = m_CoefIdx4.data() + b;
+			for (unsigned int k=0; k<3*nvec; ++k)
+			{
+				const v4sf E = e[k].v, f = flux[k].v;
+				const v4sf En = f + tab[ix[k]].vvfn.v * E;
+				flux[k].v = E;
+				e[k].v = UPML_Blend(m_f4_LaneMask[k/3].v, En, E);
+			}
+			continue;
+		}
+		const f4vector* __restrict cfn = &m_f4_vvfn[b];
 		for (unsigned int k=0; k<3*nvec; ++k)
 		{
 			const v4sf E = e[k].v, f = flux[k].v;
@@ -209,9 +247,24 @@ void Engine_Ext_UPML::DoPreCurrentUpdatesRows(unsigned int r0, unsigned int r1)
 	{
 		f4vector* __restrict h = field + (r/NY + m_Op_UPML->m_StartPos[0])*sx + (r%NY + m_Op_UPML->m_StartPos[1])*sy;
 		const size_t b = (size_t)r*nvec*3;
+		f4vector* __restrict flux = &m_f4_curr_flux[b];
+		if (m_CoefTable)
+		{
+			const Coef4* __restrict tab = m_CoefTab4.data();
+			const unsigned int* __restrict ix = m_CoefIdx4.data() + b;
+			for (unsigned int k=0; k<3*nvec; ++k)
+			{
+				const Coef4& c = tab[ix[k]];
+				const v4sf H = h[k].v, F = flux[k].v;
+				const v4sf p = -(c.iifo.v * F);
+				const v4sf f = c.ii.v * H + p;
+				h[k].v = UPML_Blend(m_f4_LaneMask[k/3].v, F, H);
+				flux[k].v = f;
+			}
+			continue;
+		}
 		const f4vector* __restrict ci  = &m_f4_ii[b];
 		const f4vector* __restrict cfo = &m_f4_iifo[b];
-		f4vector* __restrict flux = &m_f4_curr_flux[b];
 		for (unsigned int k=0; k<3*nvec; ++k)
 		{
 			const v4sf H = h[k].v, F = flux[k].v;
@@ -238,8 +291,21 @@ void Engine_Ext_UPML::DoPostCurrentUpdatesRows(unsigned int r0, unsigned int r1)
 	{
 		f4vector* __restrict h = field + (r/NY + m_Op_UPML->m_StartPos[0])*sx + (r%NY + m_Op_UPML->m_StartPos[1])*sy;
 		const size_t b = (size_t)r*nvec*3;
-		const f4vector* __restrict cfn = &m_f4_iifn[b];
 		f4vector* __restrict flux = &m_f4_curr_flux[b];
+		if (m_CoefTable)
+		{
+			const Coef4* __restrict tab = m_CoefTab4.data();
+			const unsigned int* __restrict ix = m_CoefIdx4.data() + b;
+			for (unsigned int k=0; k<3*nvec; ++k)
+			{
+				const v4sf H = h[k].v, f = flux[k].v;
+				const v4sf Hn = f + tab[ix[k]].iifn.v * H;
+				flux[k].v = H;
+				h[k].v = UPML_Blend(m_f4_LaneMask[k/3].v, Hn, H);
+			}
+			continue;
+		}
+		const f4vector* __restrict cfn = &m_f4_iifn[b];
 		for (unsigned int k=0; k<3*nvec; ++k)
 		{
 			const v4sf H = h[k].v, f = flux[k].v;
@@ -275,8 +341,12 @@ void Engine_Ext_UPML::DoPreVoltageUpdatesVec(int threadID)
 void Engine_Ext_UPML::DoPreVoltageUpdatesLines(unsigned int x0, unsigned int x1)
 {
 	unsigned int r0, r1;
-	if (LineRows(x0, x1, r0, r1))
+	if (!LineRows(x0, x1, r0, r1))
+		return;
+	if (m_Vec)
 		DoPreVoltageUpdatesRows(r0, r1);
+	else
+		DoPreVoltageUpdatesSSERows(r0, r1);
 }
 
 void Engine_Ext_UPML::DoPostVoltageUpdatesVec(int threadID)
@@ -288,8 +358,12 @@ void Engine_Ext_UPML::DoPostVoltageUpdatesVec(int threadID)
 void Engine_Ext_UPML::DoPostVoltageUpdatesLines(unsigned int x0, unsigned int x1)
 {
 	unsigned int r0, r1;
-	if (LineRows(x0, x1, r0, r1))
+	if (!LineRows(x0, x1, r0, r1))
+		return;
+	if (m_Vec)
 		DoPostVoltageUpdatesRows(r0, r1);
+	else
+		DoPostVoltageUpdatesSSERows(r0, r1);
 }
 
 void Engine_Ext_UPML::DoPreCurrentUpdatesVec(int threadID)
@@ -301,8 +375,12 @@ void Engine_Ext_UPML::DoPreCurrentUpdatesVec(int threadID)
 void Engine_Ext_UPML::DoPreCurrentUpdatesLines(unsigned int x0, unsigned int x1)
 {
 	unsigned int r0, r1;
-	if (LineRows(x0, x1, r0, r1))
+	if (!LineRows(x0, x1, r0, r1))
+		return;
+	if (m_Vec)
 		DoPreCurrentUpdatesRows(r0, r1);
+	else
+		DoPreCurrentUpdatesSSERows(r0, r1);
 }
 
 void Engine_Ext_UPML::DoPostCurrentUpdatesVec(int threadID)
@@ -314,8 +392,297 @@ void Engine_Ext_UPML::DoPostCurrentUpdatesVec(int threadID)
 void Engine_Ext_UPML::DoPostCurrentUpdatesLines(unsigned int x0, unsigned int x1)
 {
 	unsigned int r0, r1;
-	if (LineRows(x0, x1, r0, r1))
+	if (!LineRows(x0, x1, r0, r1))
+		return;
+	if (m_Vec)
 		DoPostCurrentUpdatesRows(r0, r1);
+	else
+		DoPostCurrentUpdatesSSERows(r0, r1);
+}
+
+void Engine_Ext_UPML::SetupScalarSSE()
+{
+	m_Sse = false;
+	if (m_Eng->GetType()!=Engine::SSE)
+		return;
+	Engine_sse* eng = (Engine_sse*)m_Eng;
+	ArrayLib::ArrayENG<f4vector>* V = eng->f4_volt_ptr;
+	ArrayLib::ArrayENG<f4vector>* I = eng->f4_curr_ptr;
+	if ((V->stride(0)!=1) || (V->stride(3)!=3) || (I->stride(0)!=1) || (I->stride(3)!=3) ||
+		(V->stride(1)!=I->stride(1)) || (V->stride(2)!=I->stride(2)))
+		return;
+	const unsigned int nvec = V->extent(3);
+	m_zoff.resize(m_Op_UPML->m_numLines[2]);
+	for (unsigned int lz=0; lz<m_Op_UPML->m_numLines[2]; ++lz)
+	{
+		const unsigned int z = lz + m_Op_UPML->m_StartPos[2];
+		m_zoff[lz] = 12*(z%nvec) + z/nvec; // f4vector (z%nvec) of the row is 3 vectors = 12 floats further, lane z/nvec
+	}
+	m_Sse = true;
+	SetupCoefTable();
+}
+
+void Engine_Ext_UPML::SetupCoefTable4()
+{
+	m_CoefTable = false;
+	m_CoefTab4.clear();
+	m_CoefIdx4.clear();
+	if (getenv("OPENEMS_NO_PML_TABLE")!=NULL)
+		return;
+	struct Key
+	{
+		f4vector c[6];
+		bool operator<(const Key& o) const { return memcmp(c, o.c, sizeof(c))<0; }
+	};
+	std::map<Key, unsigned int> lut;
+	const size_t size = m_f4_vv.size();
+	m_CoefIdx4.resize(size);
+	for (size_t k=0; k<size; ++k)
+	{
+		Key key;
+		key.c[0] = m_f4_vv[k]; key.c[1] = m_f4_vvfo[k]; key.c[2] = m_f4_vvfn[k];
+		key.c[3] = m_f4_ii[k]; key.c[4] = m_f4_iifo[k]; key.c[5] = m_f4_iifn[k];
+		std::map<Key, unsigned int>::iterator it = lut.find(key);
+		if (it==lut.end())
+		{
+			it = lut.insert(std::make_pair(key, (unsigned int)m_CoefTab4.size())).first;
+			Coef4 cf = {key.c[0], key.c[1], key.c[2], key.c[3], key.c[4], key.c[5]};
+			m_CoefTab4.push_back(cf);
+		}
+		m_CoefIdx4[k] = it->second;
+	}
+	// the six per-cell arrays are not read any more
+	std::vector<f4vector, aligned_allocator<f4vector> >().swap(m_f4_vv);   std::vector<f4vector, aligned_allocator<f4vector> >().swap(m_f4_vvfo);
+	std::vector<f4vector, aligned_allocator<f4vector> >().swap(m_f4_vvfn); std::vector<f4vector, aligned_allocator<f4vector> >().swap(m_f4_ii);
+	std::vector<f4vector, aligned_allocator<f4vector> >().swap(m_f4_iifo); std::vector<f4vector, aligned_allocator<f4vector> >().swap(m_f4_iifn);
+	m_CoefTable = true;
+	if (g_settings.GetVerboseLevel()>1)
+		std::cout << "UPML (f4vector): " << m_CoefTab4.size() << " distinct coefficient sets for " << size/3 << " z-vectors" << std::endl;
+}
+
+void Engine_Ext_UPML::SetupCoefTable()
+{
+	m_CoefTable = false;
+	m_CoefTab.clear();
+	m_CoefIdx.clear();
+	if (getenv("OPENEMS_NO_PML_TABLE")!=NULL)
+		return;
+	const unsigned int NX = m_Op_UPML->m_numLines[0], NY = m_Op_UPML->m_numLines[1], NZ = m_Op_UPML->m_numLines[2];
+	struct Key
+	{
+		FDTD_FLOAT c[6];
+		bool operator<(const Key& o) const { return memcmp(c, o.c, sizeof(c))<0; }
+	};
+	std::map<Key, unsigned int> lut;
+	m_CoefIdx.resize((size_t)NX*NY*3*NZ);
+	for (unsigned int lx=0; lx<NX; ++lx)
+		for (unsigned int ly=0; ly<NY; ++ly)
+			for (unsigned int n=0; n<3; ++n)
+			{
+				unsigned int* __restrict ix = m_CoefIdx.data() + (((size_t)lx*NY+ly)*3+n)*NZ;
+				for (unsigned int lz=0; lz<NZ; ++lz)
+				{
+					Key k;
+					k.c[0] = m_Op_UPML->vv(n, lx, ly, lz);   k.c[1] = m_Op_UPML->vvfo(n, lx, ly, lz); k.c[2] = m_Op_UPML->vvfn(n, lx, ly, lz);
+					k.c[3] = m_Op_UPML->ii(n, lx, ly, lz);   k.c[4] = m_Op_UPML->iifo(n, lx, ly, lz); k.c[5] = m_Op_UPML->iifn(n, lx, ly, lz);
+					std::map<Key, unsigned int>::iterator it = lut.find(k);
+					if (it==lut.end())
+					{
+						it = lut.insert(std::make_pair(k, (unsigned int)m_CoefTab.size())).first;
+						Coef cf = {k.c[0], k.c[1], k.c[2], k.c[3], k.c[4], k.c[5]};
+						m_CoefTab.push_back(cf);
+					}
+					ix[lz] = it->second;
+				}
+			}
+	m_CoefTable = true;
+	if (g_settings.GetVerboseLevel()>1)
+		std::cout << "UPML: " << m_CoefTab.size() << " distinct coefficient sets for " << (size_t)NX*NY*NZ << " cells" << std::endl;
+}
+
+// row r = (x,y) of the PML box: pointers to the floats of component n in the engine field (lane offsets in m_zoff)
+// and to the coefficient / flux rows (contiguous in z)
+#define UPML_SSE_ROW_SETUP(FIELD) \
+	const unsigned int NY = m_Op_UPML->m_numLines[1], NZ = m_Op_UPML->m_numLines[2]; \
+	const unsigned int* __restrict zo = m_zoff.data(); \
+	Engine_sse* eng = (Engine_sse*)m_Eng; \
+	float* __restrict field = (float*)eng->FIELD->data(); \
+	const size_t sx = 4*eng->FIELD->stride(1), sy = 4*eng->FIELD->stride(2);
+
+void Engine_Ext_UPML::DoPreVoltageUpdatesSSERows(unsigned int r0, unsigned int r1)
+{
+	UPML_SSE_ROW_SETUP(f4_volt_ptr)
+	const ArrayLib::ArrayNIJK<FDTD_FLOAT>& cvv = m_Op_UPML->vv;
+	const ArrayLib::ArrayNIJK<FDTD_FLOAT>& cfo = m_Op_UPML->vvfo;
+	for (unsigned int r=r0; r<r1; ++r)
+	{
+		const unsigned int lx = r/NY, ly = r%NY;
+		float* __restrict e = field + (lx + m_Op_UPML->m_StartPos[0])*sx + (ly + m_Op_UPML->m_StartPos[1])*sy;
+		if (m_CoefTable)
+		{
+			const Coef* __restrict tab = m_CoefTab.data();
+			for (unsigned int n=0; n<3; ++n)
+			{
+				const unsigned int* __restrict ix = m_CoefIdx.data() + ((size_t)r*3+n)*NZ;
+				FDTD_FLOAT* __restrict flux = volt_flux.data() + n*volt_flux.stride(0) + lx*volt_flux.stride(1) + ly*volt_flux.stride(2);
+				float* __restrict en = e + 4*n;
+				for (unsigned int lz=0; lz<NZ; ++lz)
+				{
+					float& V = en[zo[lz]];
+					const Coef& c = tab[ix[lz]];
+					const FDTD_FLOAT f_help = c.vv * V - c.vvfo * flux[lz];
+					V = flux[lz];
+					flux[lz] = f_help;
+				}
+			}
+			continue;
+		}
+		for (unsigned int n=0; n<3; ++n)
+		{
+			const size_t b = n*cvv.stride(0) + lx*cvv.stride(1) + ly*cvv.stride(2);
+			const FDTD_FLOAT* __restrict vv = cvv.data() + b;
+			const FDTD_FLOAT* __restrict vvfo = cfo.data() + b;
+			FDTD_FLOAT* __restrict flux = volt_flux.data() + n*volt_flux.stride(0) + lx*volt_flux.stride(1) + ly*volt_flux.stride(2);
+			float* __restrict en = e + 4*n;
+			for (unsigned int lz=0; lz<NZ; ++lz)
+			{
+				float& V = en[zo[lz]];
+				const FDTD_FLOAT f_help = vv[lz] * V - vvfo[lz] * flux[lz];
+				V = flux[lz];
+				flux[lz] = f_help;
+			}
+		}
+	}
+}
+
+void Engine_Ext_UPML::DoPostVoltageUpdatesSSERows(unsigned int r0, unsigned int r1)
+{
+	UPML_SSE_ROW_SETUP(f4_volt_ptr)
+	const ArrayLib::ArrayNIJK<FDTD_FLOAT>& cfn = m_Op_UPML->vvfn;
+	for (unsigned int r=r0; r<r1; ++r)
+	{
+		const unsigned int lx = r/NY, ly = r%NY;
+		float* __restrict e = field + (lx + m_Op_UPML->m_StartPos[0])*sx + (ly + m_Op_UPML->m_StartPos[1])*sy;
+		if (m_CoefTable)
+		{
+			const Coef* __restrict tab = m_CoefTab.data();
+			for (unsigned int n=0; n<3; ++n)
+			{
+				const unsigned int* __restrict ix = m_CoefIdx.data() + ((size_t)r*3+n)*NZ;
+				FDTD_FLOAT* __restrict flux = volt_flux.data() + n*volt_flux.stride(0) + lx*volt_flux.stride(1) + ly*volt_flux.stride(2);
+				float* __restrict en = e + 4*n;
+				for (unsigned int lz=0; lz<NZ; ++lz)
+				{
+					float& V = en[zo[lz]];
+					const FDTD_FLOAT f_help = flux[lz];
+					flux[lz] = V;
+					V = f_help + tab[ix[lz]].vvfn * flux[lz];
+				}
+			}
+			continue;
+		}
+		for (unsigned int n=0; n<3; ++n)
+		{
+			const FDTD_FLOAT* __restrict vvfn = cfn.data() + n*cfn.stride(0) + lx*cfn.stride(1) + ly*cfn.stride(2);
+			FDTD_FLOAT* __restrict flux = volt_flux.data() + n*volt_flux.stride(0) + lx*volt_flux.stride(1) + ly*volt_flux.stride(2);
+			float* __restrict en = e + 4*n;
+			for (unsigned int lz=0; lz<NZ; ++lz)
+			{
+				float& V = en[zo[lz]];
+				const FDTD_FLOAT f_help = flux[lz];
+				flux[lz] = V;
+				V = f_help + vvfn[lz] * flux[lz];
+			}
+		}
+	}
+}
+
+void Engine_Ext_UPML::DoPreCurrentUpdatesSSERows(unsigned int r0, unsigned int r1)
+{
+	UPML_SSE_ROW_SETUP(f4_curr_ptr)
+	const ArrayLib::ArrayNIJK<FDTD_FLOAT>& cii = m_Op_UPML->ii;
+	const ArrayLib::ArrayNIJK<FDTD_FLOAT>& cfo = m_Op_UPML->iifo;
+	for (unsigned int r=r0; r<r1; ++r)
+	{
+		const unsigned int lx = r/NY, ly = r%NY;
+		float* __restrict h = field + (lx + m_Op_UPML->m_StartPos[0])*sx + (ly + m_Op_UPML->m_StartPos[1])*sy;
+		if (m_CoefTable)
+		{
+			const Coef* __restrict tab = m_CoefTab.data();
+			for (unsigned int n=0; n<3; ++n)
+			{
+				const unsigned int* __restrict ix = m_CoefIdx.data() + ((size_t)r*3+n)*NZ;
+				FDTD_FLOAT* __restrict flux = curr_flux.data() + n*curr_flux.stride(0) + lx*curr_flux.stride(1) + ly*curr_flux.stride(2);
+				float* __restrict hn = h + 4*n;
+				for (unsigned int lz=0; lz<NZ; ++lz)
+				{
+					float& C = hn[zo[lz]];
+					const Coef& c = tab[ix[lz]];
+					const FDTD_FLOAT f_help = c.ii * C - c.iifo * flux[lz];
+					C = flux[lz];
+					flux[lz] = f_help;
+				}
+			}
+			continue;
+		}
+		for (unsigned int n=0; n<3; ++n)
+		{
+			const size_t b = n*cii.stride(0) + lx*cii.stride(1) + ly*cii.stride(2);
+			const FDTD_FLOAT* __restrict ii = cii.data() + b;
+			const FDTD_FLOAT* __restrict iifo = cfo.data() + b;
+			FDTD_FLOAT* __restrict flux = curr_flux.data() + n*curr_flux.stride(0) + lx*curr_flux.stride(1) + ly*curr_flux.stride(2);
+			float* __restrict hn = h + 4*n;
+			for (unsigned int lz=0; lz<NZ; ++lz)
+			{
+				float& C = hn[zo[lz]];
+				const FDTD_FLOAT f_help = ii[lz] * C - iifo[lz] * flux[lz];
+				C = flux[lz];
+				flux[lz] = f_help;
+			}
+		}
+	}
+}
+
+void Engine_Ext_UPML::DoPostCurrentUpdatesSSERows(unsigned int r0, unsigned int r1)
+{
+	UPML_SSE_ROW_SETUP(f4_curr_ptr)
+	const ArrayLib::ArrayNIJK<FDTD_FLOAT>& cfn = m_Op_UPML->iifn;
+	for (unsigned int r=r0; r<r1; ++r)
+	{
+		const unsigned int lx = r/NY, ly = r%NY;
+		float* __restrict h = field + (lx + m_Op_UPML->m_StartPos[0])*sx + (ly + m_Op_UPML->m_StartPos[1])*sy;
+		if (m_CoefTable)
+		{
+			const Coef* __restrict tab = m_CoefTab.data();
+			for (unsigned int n=0; n<3; ++n)
+			{
+				const unsigned int* __restrict ix = m_CoefIdx.data() + ((size_t)r*3+n)*NZ;
+				FDTD_FLOAT* __restrict flux = curr_flux.data() + n*curr_flux.stride(0) + lx*curr_flux.stride(1) + ly*curr_flux.stride(2);
+				float* __restrict hn = h + 4*n;
+				for (unsigned int lz=0; lz<NZ; ++lz)
+				{
+					float& C = hn[zo[lz]];
+					const FDTD_FLOAT f_help = flux[lz];
+					flux[lz] = C;
+					C = f_help + tab[ix[lz]].iifn * flux[lz];
+				}
+			}
+			continue;
+		}
+		for (unsigned int n=0; n<3; ++n)
+		{
+			const FDTD_FLOAT* __restrict iifn = cfn.data() + n*cfn.stride(0) + lx*cfn.stride(1) + ly*cfn.stride(2);
+			FDTD_FLOAT* __restrict flux = curr_flux.data() + n*curr_flux.stride(0) + lx*curr_flux.stride(1) + ly*curr_flux.stride(2);
+			float* __restrict hn = h + 4*n;
+			for (unsigned int lz=0; lz<NZ; ++lz)
+			{
+				float& C = hn[zo[lz]];
+				const FDTD_FLOAT f_help = flux[lz];
+				flux[lz] = C;
+				C = f_help + iifn[lz] * flux[lz];
+			}
+		}
+	}
 }
 
 template <typename EngType>
@@ -365,6 +732,12 @@ void Engine_Ext_UPML::DoPreVoltageUpdates(int threadID)
 {
 	if (m_Vec)
 		return DoPreVoltageUpdatesVec(threadID);
+	if (m_Sse)
+	{
+		if (threadID<m_NrThreads)
+			DoPreVoltageUpdatesSSERows(m_RowStart[threadID], m_RowStart[threadID]+m_RowNum[threadID]);
+		return;
+	}
 	ENG_DISPATCH_ARGS(DoPreVoltageUpdatesImpl, threadID);
 }
 
@@ -411,6 +784,12 @@ void Engine_Ext_UPML::DoPostVoltageUpdates(int threadID)
 {
 	if (m_Vec)
 		return DoPostVoltageUpdatesVec(threadID);
+	if (m_Sse)
+	{
+		if (threadID<m_NrThreads)
+			DoPostVoltageUpdatesSSERows(m_RowStart[threadID], m_RowStart[threadID]+m_RowNum[threadID]);
+		return;
+	}
 	ENG_DISPATCH_ARGS(DoPostVoltageUpdatesImpl, threadID);
 }
 
@@ -461,6 +840,12 @@ void Engine_Ext_UPML::DoPreCurrentUpdates(int threadID)
 {
 	if (m_Vec)
 		return DoPreCurrentUpdatesVec(threadID);
+	if (m_Sse)
+	{
+		if (threadID<m_NrThreads)
+			DoPreCurrentUpdatesSSERows(m_RowStart[threadID], m_RowStart[threadID]+m_RowNum[threadID]);
+		return;
+	}
 	ENG_DISPATCH_ARGS(DoPreCurrentUpdatesImpl, threadID);
 }
 
@@ -507,5 +892,11 @@ void Engine_Ext_UPML::DoPostCurrentUpdates(int threadID)
 {
 	if (m_Vec)
 		return DoPostCurrentUpdatesVec(threadID);
+	if (m_Sse)
+	{
+		if (threadID<m_NrThreads)
+			DoPostCurrentUpdatesSSERows(m_RowStart[threadID], m_RowStart[threadID]+m_RowNum[threadID]);
+		return;
+	}
 	ENG_DISPATCH_ARGS(DoPostCurrentUpdatesImpl, threadID);
 }

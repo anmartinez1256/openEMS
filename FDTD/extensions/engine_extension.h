@@ -86,6 +86,9 @@ public:
 	  the same order of hooks and extensions for every cell. A line hook may touch the fields of its
 	  own lines only (and of the line next to a line from GetCoupledLines()). Different threads call
 	  them for disjoint line ranges at the same time.
+	  Note: the fused sweep never calls the *CurrentLines() hooks for the last x-line (NX-1): the
+	  engine does not update the currents there either (they stay 0) and no excitation entry can sit
+	  on it, so this matches the unfused path today; a current hook with real work on NX-1 would not.
 	  */
 	virtual void DoPreVoltageUpdatesLines(unsigned int /*x0*/, unsigned int /*x1*/) {}
 	virtual void DoPostVoltageUpdatesLines(unsigned int /*x0*/, unsigned int /*x1*/) {}

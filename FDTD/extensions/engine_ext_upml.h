@@ -35,7 +35,7 @@ public:
 	virtual ~Engine_Ext_UPML();
 
 	virtual void SetNumberOfThreads(int nrThread);
-	virtual unsigned int GetUsedHooks() const {return PRE_VOLT | POST_VOLT | PRE_CURR | POST_CURR | PREPOST_WRITES_FIELDS | (m_Vec ? LINE_HOOKS : 0);}
+	virtual unsigned int GetUsedHooks() const {return PRE_VOLT | POST_VOLT | PRE_CURR | POST_CURR | PREPOST_WRITES_FIELDS | ((m_Vec || m_Sse) ? LINE_HOOKS : 0);}
 
 	virtual void DoPreVoltageUpdatesLines(unsigned int x0, unsigned int x1);
 	virtual void DoPostVoltageUpdatesLines(unsigned int x0, unsigned int x1);
@@ -80,6 +80,29 @@ protected:
 	std::vector<f4vector, aligned_allocator<f4vector> > m_f4_volt_flux, m_f4_curr_flux;
 	std::vector<f4vector, aligned_allocator<f4vector> > m_f4_LaneMask; //!< per z-vector: all bits set in lanes inside the mesh
 	void SetupVectorized();
+	//! scalar path for the SSE engines when the PML is not a full-z slab: the template above with the
+	//! f4vector lane offsets and the coefficient rows precomputed (same arithmetic, same order)
+	bool m_Sse;
+	std::vector<unsigned int> m_zoff; //!< float offset of local z inside an (n,x,y) row of f4vectors
+	//! The six coefficients of a PML cell component take only a few hundred distinct values (the
+	//! profile along the PML direction times the materials), so the scalar SSE path reads them through
+	//! a per-(row, n, z) index into a small table (24 B per entry) instead of six per-cell arrays
+	//! (72 B per cell). Same values, same arithmetic. OPENEMS_NO_PML_TABLE=1 keeps the arrays.
+	struct Coef { FDTD_FLOAT vv, vvfo, vvfn, ii, iifo, iifn; };
+	std::vector<Coef> m_CoefTab;
+	std::vector<unsigned int> m_CoefIdx; //!< index ((r*3+n)*NZ + lz), r = lx*NY+ly
+	bool m_CoefTable;
+	void SetupCoefTable();
+	//! the same for the f4vector path: one entry (96 B) per distinct set, index per (x,y,z-vector,n)
+	struct Coef4 { f4vector vv, vvfo, vvfn, ii, iifo, iifn; };
+	std::vector<Coef4, aligned_allocator<Coef4> > m_CoefTab4;
+	std::vector<unsigned int> m_CoefIdx4;
+	void SetupCoefTable4();
+	void SetupScalarSSE();
+	void DoPreVoltageUpdatesSSERows(unsigned int r0, unsigned int r1);
+	void DoPostVoltageUpdatesSSERows(unsigned int r0, unsigned int r1);
+	void DoPreCurrentUpdatesSSERows(unsigned int r0, unsigned int r1);
+	void DoPostCurrentUpdatesSSERows(unsigned int r0, unsigned int r1);
 	void DoPreVoltageUpdatesVec(int threadID);
 	void DoPostVoltageUpdatesVec(int threadID);
 	void DoPreCurrentUpdatesVec(int threadID);
