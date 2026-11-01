@@ -57,8 +57,15 @@ public:
 	//! This method will write the TD and FD dump files using CalcIntegral() to calculate the integral parameter
 	virtual int Process();
 
+	//! Largest |integral| seen so far and the latest one (over all rows), kept by Process(): the probe end
+	//! criterion in openEMS::RunFDTD stops a run once every probe has stayed below a fraction of its own peak
+	//! for a hold time (OPENEMS_PROBE_END_DB).
+	double GetPeakAbs() const {return m_peakAbs;}
+	double GetLastAbs() const {return m_lastAbs;}
+
 protected:
 	ProcessIntegral(Engine_Interface_Base* eng_if);
+	double m_peakAbs, m_lastAbs;
 
 	void Dump_FD_Data(double factor, std::string filename);
 

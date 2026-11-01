@@ -48,6 +48,8 @@
 #include "FDTD/operator_sse_compressed.h"
 #include "FDTD/engine_sse.h"
 #include <cstdlib>
+#include <cmath>
+#include <map>
 #include "Common/processfields_sar.h"
 #include <hdf5.h>            // only for H5get_libversion()
 #include <boost/version.hpp> // only for BOOST_LIB_VERSION
@@ -1623,6 +1625,46 @@ void openEMS::RunFDTD()
 		ProcField->SetProcessInterval(endCritInterval);
 	}
 
+	// Probe end criterion, OPENEMS_PROBE_END_DB=-60 (off unless set; Gaussian excitation only): stop once every
+	// enabled integral probe (port voltages and currents, field probes) has stayed below that fraction of its own
+	// peak for OPENEMS_PROBE_END_HOLD excitation lengths (default 1). The energy criterion above stalls on static
+	// charge (the pulse's DC part on open structures) while the port signals have long decayed; this is the port
+	// signal test the post-processing applies anyway, done inside the run. A probe whose peak is below 1e-6 of
+	// the largest peak among probes of its kind (noise far from the excitation) is measured against that peak.
+	double probeEndThr = 0;
+	unsigned int probeHoldTS = 0, probeHoldStart = 0;
+	bool probeEnd = false;
+	std::vector<ProcessIntegral*> endProbes;
+	if (const char* pe = getenv("OPENEMS_PROBE_END_DB"))
+	{
+		double db = atof(pe);
+		if (db<0 && FDTD_Op->GetExcitationSignal()->GetExciteType()==0)
+		{
+			double hold = 1.0;
+			if (const char* ph = getenv("OPENEMS_PROBE_END_HOLD"))
+				hold = atof(ph);
+			probeHoldTS = (unsigned int)(hold * FDTD_Op->GetExcitationSignal()->GetLength());
+			for (size_t n=0; n<PA->GetNumberOfProcessings(); ++n)
+				if (ProcessIntegral* pi = dynamic_cast<ProcessIntegral*>(PA->GetProcessing(n)))
+					if (pi->GetEnable())
+						endProbes.push_back(pi);
+			if (!endProbes.empty())
+			{
+				probeEndThr = pow(10.0, db/20.0);
+				if (g_settings.GetVerboseLevel()>0)
+				{
+					cout << "Probe end criterion: stop once all " << endProbes.size() << " probes stay below " << db
+						 << " dB of their peak for " << probeHoldTS << " timesteps" << endl;
+					if (g_settings.GetVerboseLevel()>1)
+						for (ProcessIntegral* pi : endProbes)
+							cout << "  probe " << pi->GetName() << " (" << pi->GetProcessingName() << ")" << endl;
+				}
+			}
+			else
+				cerr << "openEMS::RunFDTD: OPENEMS_PROBE_END_DB set but the model has no probe, ignored" << endl;
+		}
+	}
+
 	double change=1;
 	int prevTS=0,currTS=0;
 	double numCells = FDTD_Op->GetNumberCells();
@@ -1643,10 +1685,32 @@ void openEMS::RunFDTD()
 	int step=PA->Process();
 	if ((step<0) || (step>(int)NrTS)) step=NrTS;
 	bool aborted = false;
-	while ((FDTD_Eng->GetNumberOfTimesteps()<NrTS) && (change>endCrit) && !(aborted = CheckAbortCond()))
+	while ((FDTD_Eng->GetNumberOfTimesteps()<NrTS) && (change>endCrit) && !probeEnd && !(aborted = CheckAbortCond()))
 	{
 		FDTD_Eng->IterateTS(step);
 		step=PA->Process();
+
+		if (probeEndThr>0)
+		{
+			std::map<std::string,double> kindPeak;
+			for (ProcessIntegral* pi : endProbes)
+				kindPeak[pi->GetProcessingName()] = max(kindPeak[pi->GetProcessingName()], pi->GetPeakAbs());
+			double worst = 0;
+			for (ProcessIntegral* pi : endProbes)
+			{
+				double ref = max(pi->GetPeakAbs(), 1e-6*kindPeak[pi->GetProcessingName()]);
+				if (ref>0)
+					worst = max(worst, pi->GetLastAbs()/ref);
+			}
+			unsigned int ts = FDTD_Eng->GetNumberOfTimesteps();
+			if (worst>probeEndThr || ts<FDTD_Op->GetExcitationSignal()->GetLength())
+				probeHoldStart = ts;
+			else if (ts-probeHoldStart >= probeHoldTS)
+				probeEnd = true;
+			if (g_settings.GetVerboseLevel()>2)
+				cout << "  probe end check @" << ts << ": worst " << std::scientific << setprecision(2) << worst
+					 << " hold since " << probeHoldStart << (probeEnd ? "  -> stop" : "") << endl;
+		}
 
 		if (Eng_Ext_SSD)
 			change = Eng_Ext_SSD->GetLastDiff(); // cheap: extension keeps this up to date itself
@@ -1713,6 +1777,10 @@ void openEMS::RunFDTD()
 			cout << " (-" << setprecision(2) << std::fixed << fabs(10.0*log10(change)) << "dB)";
 		cout << endl;
 	}
+	else if (probeEnd)
+		cout << "RunFDTD: probe end criterion reached after " << FDTD_Eng->GetNumberOfTimesteps() << " timesteps: all probes below "
+			 << setprecision(1) << std::fixed << 20.0*log10(probeEndThr) << " dB of their peak for " << probeHoldTS
+			 << " timesteps (energy -" << setprecision(2) << fabs(10.0*log10(change)) << "dB)" << endl;
 	else if ((change>endCrit) && (FDTD_Op->GetExcitationSignal()->GetExciteType()==0))
 		cerr << "RunFDTD: Warning: Max. number of timesteps was reached before the end-criteria of -" << fabs(10.0*log10(endCrit)) << "dB was reached... " << endl << \
 				"\tYou may want to choose a higher number of max. timesteps... " << endl;

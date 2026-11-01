@@ -19,6 +19,8 @@
 #include "Common/operator_base.h"
 #include <ctime>
 #include <iomanip>
+#include <cmath>
+#include <algorithm>
 
 using namespace std;
 
@@ -27,6 +29,7 @@ ProcessIntegral::ProcessIntegral(Engine_Interface_Base* eng_if)  : Processing(en
 	m_Results=NULL;
 	m_FD_Results=NULL;
 	m_normDir = -1;
+	m_peakAbs = m_lastAbs = 0;
 }
 
 ProcessIntegral::~ProcessIntegral()
@@ -42,6 +45,7 @@ void ProcessIntegral::InitProcess()
 {
 	delete[] m_Results; m_Results = NULL;
 	delete[] m_FD_Results; m_FD_Results = NULL;
+	m_peakAbs = m_lastAbs = 0;
 
 	if (!Enabled)
 		return;
@@ -139,6 +143,14 @@ int ProcessIntegral::Process()
 	CalcMultipleIntegrals();
 	int NrInt = GetNumberOfIntegrals();
 	double time = m_Eng_Interface->GetTime(m_dualTime);
+	{
+		double a = 0;
+		for (int n=0; n<NrInt; ++n)
+			a = std::max(a, fabs(m_Results[n]));
+		m_lastAbs = a;
+		if (a>m_peakAbs)
+			m_peakAbs = a;
+	}
 
 	if (ProcessInterval)
 	{
