@@ -145,7 +145,8 @@ int ProcessIntegral::Process()
 	double time = m_Eng_Interface->GetTime(m_dualTime);
 	{
 		double a = 0;
-		for (int n=0; n<NrInt; ++n)
+		const int NrSig = std::min(NrInt, GetNumberOfSignalIntegrals());
+		for (int n=0; n<NrSig; ++n)
 			a = std::max(a, fabs(m_Results[n]));
 		m_lastAbs = a;
 		if (a>m_peakAbs)

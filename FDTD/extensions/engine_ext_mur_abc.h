@@ -87,7 +87,8 @@ protected:
 	std::vector<unsigned int> m_FloatIndex;
 	ptrdiff_t m_OffsetNyP, m_OffsetNyPP, m_OffsetShift;
 	//! The face cells of the line hooks by x-line, in memory order: runs of four cells that fill one
-	//! f4vector (the z-lines of x- and y-faces) are updated as vectors, the other cells one by one.
+	//! f4vector (its four lanes, cells z, z+n_v, z+2n_v, z+3n_v of a z-line of an x- or y-face) are
+	//! updated as vectors, the other cells one by one.
 	//! Line x: vectors m_VecStart[x] .. m_VecStart[x+1], cells m_ScStart[x] .. m_ScStart[x+1].
 	//! Own coefficient and save arrays in that order (the threaded hooks keep m_volt_nyP/nyPP).
 	std::vector<unsigned int> m_VecStart, m_VecIndex;   //!< f4vector index of component 0

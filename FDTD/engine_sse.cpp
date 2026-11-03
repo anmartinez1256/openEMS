@@ -40,12 +40,17 @@ Engine_sse::Engine_sse(const Operator_sse* op) : Engine(op)
 	numVectors =  ceil((double)numLines[2]/4.0);
 
 	// speed up the calculation of denormal floating point values (flush-to-zero)
+	m_FPState = Denormal::Save();
+	m_FPThread = std::this_thread::get_id();
 	Denormal::Disable();
 }
 
 Engine_sse::~Engine_sse()
 {
 	Reset();
+	// the creating thread (e.g. Python's) gets its flush-to-zero state back (arm64 with OPENEMS_FTZ)
+	if (std::this_thread::get_id()==m_FPThread)
+		Denormal::Restore(m_FPState);
 }
 
 void Engine_sse::Init()

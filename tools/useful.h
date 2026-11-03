@@ -33,6 +33,10 @@ double CalcNyquistFrequency(unsigned int nyquist, double dT);
 //! applies or cannot be determined (non-Linux).
 unsigned int AvailableThreads();
 
+//! On/off switch from the environment (e.g. OPENEMS_FTZ=1): true when the variable is set to a value
+//! other than empty or "0", so that NAME=0 means the same as an unset NAME.
+bool EnvFlag(const char* name);
+
 //! Calculate an optimal job distribution to a given number of threads. Will return a vector with the jobs for each thread.
 std::vector<unsigned int> AssignJobs2Threads(unsigned int jobs, unsigned int nrThreads, bool RemoveEmpty=false);
 

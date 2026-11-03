@@ -22,6 +22,7 @@
 
 #include "CSPrimCurve.h"
 #include "CSPropExcitation.h"
+#include <algorithm>
 
 using std::cout;
 using std::cerr;
@@ -368,6 +369,16 @@ void Operator_Ext_Excitation::setupCurrentExcitation(
 Engine_Extension* Operator_Ext_Excitation::CreateEngineExtention()
 {
 	return new Engine_Ext_Excitation(this);
+}
+
+unsigned int Operator_Ext_Excitation::GetMaxDelay() const
+{
+	unsigned int maxDelay = 0;
+	for (unsigned int i=0; i<Volt_Count; ++i)
+		maxDelay = std::max(maxDelay, Volt_delay[i]);
+	for (unsigned int i=0; i<Curr_Count; ++i)
+		maxDelay = std::max(maxDelay, Curr_delay[i]);
+	return maxDelay;
 }
 
 void Operator_Ext_Excitation::ShowStat(std::ostream &ostr)  const

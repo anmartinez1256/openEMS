@@ -57,6 +57,8 @@ public:
 	void SetWeightOrigin(double x, double y, double z) { m_WeightOrigin[0]=x; m_WeightOrigin[1]=y; m_WeightOrigin[2]=z; }
 
 	virtual int GetNumberOfIntegrals() const {return 2;}
+	//! only the mode amplitude (row 0) is a signal; row 1, the purity, stays near 1 while any field is there
+	virtual int GetNumberOfSignalIntegrals() const {return 1;}
 	virtual double* CalcMultipleIntegrals();
 
 protected:

@@ -22,6 +22,7 @@
 #include "operator_sse.h"
 
 #include "tools/arraylib/array_e.h"
+#include <thread>
 
 class Engine_sse : public Engine
 {
@@ -94,6 +95,10 @@ protected:
 	virtual void UpdateCurrents(unsigned int startX, unsigned int numX);
 
 	unsigned int numVectors;
+
+	//! the creating thread and its flush-to-zero state before Denormal::Disable(), restored by the destructor
+	unsigned long long m_FPState;
+	std::thread::id m_FPThread;
 
 public: //public access to the sse arrays for efficient extensions access... use careful...
 	ArrayLib::ArrayENG<f4vector>* f4_volt_ptr;

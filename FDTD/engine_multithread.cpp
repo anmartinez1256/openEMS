@@ -38,6 +38,8 @@
 #include <iomanip>
 #include <algorithm>
 #include <chrono>
+#include <mutex>
+#include <string>
 #include <cstdlib>
 #ifdef __APPLE__
 #include <sys/sysctl.h>
@@ -135,10 +137,17 @@ void Engine_Multithread::Init()
 	if (m_numThreads == 0)
 	{
 		m_auto_threads = true;
-		m_numThreads = StartThreads(m_max_numThreads);
+		// more threads than the operator has x-lines to hand out cannot be used (the cylindrical multigrid
+		// sweeps only its outer lines): every candidate, the start included, is clamped to that count
+		unsigned int maxUse = m_max_numThreads;
+		{
+			std::vector<unsigned int> start, stop;
+			m_Op_MT->CalcStartStopLines(maxUse, start, stop);
+		}
+		m_Tuner.maxUse = maxUse;
+		m_numThreads = std::min(StartThreads(m_max_numThreads), maxUse);
 		m_Tuner.start = m_Tuner.best = m_numThreads;
 		m_Tuner.best_speed = 0;
-		const unsigned int maxUse = std::min(m_max_numThreads, numLines[0]);   // more threads than x-lines cannot be used
 		m_Tuner.todo.clear();
 		for (unsigned int n=m_numThreads+2; n<m_max_numThreads+2; n+=2)
 			m_Tuner.todo.push_back(std::min(n, maxUse));
@@ -149,7 +158,7 @@ void Engine_Multithread::Init()
 		m_Tuner.ts = 0;
 		m_Tuner.time = 0;
 		const char* env = getenv("OPENEMS_TUNE_WINDOW_MS");
-		m_Tuner.window = (env ? atof(env) : 150)*1e-3;
+		m_Tuner.window = ((env && *env) ? atof(env) : 150)*1e-3;   // an empty value is the same as unset
 		m_Tuner.settle = 0.4*m_Tuner.window;
 		m_Tuner.ts_per_s = 0;
 	}
@@ -378,7 +387,7 @@ void Engine_Multithread::TuneThreads(unsigned int iterTS, double seconds)
 		t.refined = true;
 		if (t.best>1)
 			t.todo.push_back(t.best-1);
-		if (t.best<std::min(m_max_numThreads, numLines[0]))
+		if (t.best<t.maxUse)
 			t.todo.push_back(t.best+1);
 	}
 	if (t.todo.empty())
@@ -499,8 +508,17 @@ void Engine_Multithread::SetupFused()
 	for (int g=0; g<6; ++g)
 		m_LineHooks[g].clear();
 	const char* env = getenv("OPENEMS_FUSED");
-	if ((env && (atoi(env)==0)) || !UseIJKN())
+	if (env && *env && (atoi(env)==0))   // OPENEMS_FUSED=0 off; an empty value is the same as unset
+	{
+		ReportFused("");
 		return;
+	}
+	if (!UseIJKN())
+	{
+		ReportFused(m_PackedV.empty() ? "no fused sweep, no packed coefficient tables"
+									  : "no fused sweep, the field arrays are not in the I-J-K-N layout");
+		return;
+	}
 
 	const unsigned int flags[6] = {Engine_Extension::PRE_VOLT, Engine_Extension::POST_VOLT, Engine_Extension::APPLY_VOLT,
 								   Engine_Extension::PRE_CURR, Engine_Extension::POST_CURR, Engine_Extension::APPLY_CURR};
@@ -511,8 +529,7 @@ void Engine_Multithread::SetupFused()
 		const unsigned int used = m_Eng_exts.at(k)->GetUsedHooks();
 		if ((used==Engine_Extension::LEGACY_HOOKS) || !(used & Engine_Extension::LINE_HOOKS))
 		{
-			if (g_settings.GetVerboseLevel()>0)
-				cout << "Multithreaded engine: no fused sweep, the extension \"" << m_Eng_exts.at(k)->GetExtensionName() << "\" has no line hooks" << endl;
+			ReportFused("no fused sweep, the extension \"" + m_Eng_exts.at(k)->GetExtensionName() + "\" has no line hooks");
 			return;
 		}
 		m_Eng_exts.at(k)->GetCoupledLines(coupled);
@@ -554,7 +571,10 @@ void Engine_Multithread::SetupFused()
 	m_Blocks.push_back(NX);
 	const unsigned int nb = m_Blocks.size()-1;
 	if (nb<m_numThreads)
+	{
+		ReportFused("no fused sweep, " + std::to_string(nb) + " blocks of x-lines for " + std::to_string(m_numThreads) + " threads");
 		return;
+	}
 
 	// slabs of about the same number of lines, on block boundaries
 	m_SlabBlocks.assign(m_numThreads+1, nb);
@@ -575,10 +595,23 @@ void Engine_Multithread::SetupFused()
 		m_FusedStat[t].busy = m_FusedStat[t].lines = 0;
 	m_LineCost.clear();
 	const char* bal = getenv("OPENEMS_BALANCE");
-	m_Balance = (m_numThreads>1) && !(bal && (atoi(bal)==0));
+	m_Balance = (m_numThreads>1) && !(bal && *bal && (atoi(bal)==0));
 	m_Fused = true;
-	if (g_settings.GetVerboseLevel()>0)
-		cout << "Multithreaded engine: fused sweep, " << nb << " blocks of x-lines" << endl;
+	ReportFused("fused sweep, " + std::to_string(nb) + " blocks of x-lines");
+}
+
+// SetupFused() runs after every change of the thread count, and the level engines of a cylindrical multigrid
+// rebuild their plans at the same moment on their own threads: print a line only when it changes, one at a time.
+void Engine_Multithread::ReportFused(const std::string& msg)
+{
+	if (msg==m_FusedMsg)
+		return;
+	m_FusedMsg = msg;
+	if (msg.empty() || (g_settings.GetVerboseLevel()<=0))
+		return;
+	static std::mutex coutLock;
+	std::lock_guard<std::mutex> lock(coutLock);
+	cout << "Multithreaded engine: " << msg << endl;
 }
 
 void Engine_Multithread::RunLineHooks(int group, unsigned int x0, unsigned int x1)
@@ -709,11 +742,11 @@ void thread::operator()()
 	// speed up the calculation of denormal floating point values (flush-to-zero)
 	Denormal::Disable();
 #ifdef __APPLE__
-	// engine threads at the QoS of the main thread's work: the default (QOS_CLASS_DEFAULT) lets macOS park
+	// engine threads at QOS_CLASS_USER_INITIATED: new threads start at QOS_CLASS_DEFAULT, which lets macOS park
 	// them on E-cores or deprioritise them against foreground apps. OPENEMS_QOS=0 off, 2 = user-interactive.
 	{
 		const char* q = getenv("OPENEMS_QOS");
-		const int mode = q ? atoi(q) : 1;
+		const int mode = (q && *q) ? atoi(q) : 1;   // an empty value is the same as unset
 		if (mode==1)
 			pthread_set_qos_class_self_np(QOS_CLASS_USER_INITIATED, 0);
 		else if (mode==2)

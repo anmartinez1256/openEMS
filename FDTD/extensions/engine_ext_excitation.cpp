@@ -20,7 +20,8 @@
 #include "FDTD/engine_sse.h"
 #include <algorithm>
 
-// APPLY_CURR only when there are current excitations (a soft/hard voltage excitation has none): saves a barrier per timestep
+// APPLY_CURR only when there are current excitations (a soft/hard voltage excitation has none): saves a barrier per
+// timestep in the unfused plan (the fused sweep only skips the empty line-hook calls)
 unsigned int Engine_Ext_Excitation::GetUsedHooks() const
 {
 	OPENEMS_HOOKS_DECLARED_BY(Engine_Ext_Excitation);

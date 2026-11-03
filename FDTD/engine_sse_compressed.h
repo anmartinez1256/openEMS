@@ -41,13 +41,16 @@ protected:
 	//! loop invariants in local restrict pointers (union stores otherwise make the compiler reload them).
 	void UpdateVoltages_IJKN(unsigned int startX, unsigned int numX);
 	void UpdateCurrents_IJKN(unsigned int startX, unsigned int numX);
-	//! true if both field arrays use the I-J-K-N layout (component stride 1, z stride 3)
+	//! true if both field arrays use the I-J-K-N layout (component stride 1, z stride 3) and the packed
+	//! coefficient tables below exist (not with OPENEMS_NO_PACKED_COEFF or after a failed allocation);
+	//! otherwise the generic loops run and Engine_Multithread does not fuse its sweep
 	bool UseIJKN() const;
 
 	//! The six coefficient vectors one operator needs for a voltage (or current) update, packed in
 	//! access order (vv0 vi0 vv1 vi1 vv2 vi2 / ii0 iv0 ii1 iv1 ii2 iv2): the operator's six separate
 	//! tables cost six cache lines per operator, one packed entry sits in 1-2. Plain copies of the
-	//! operator's values, so the arithmetic is unchanged. OPENEMS_NO_PACKED_COEFF=1 keeps the tables.
+	//! operator's values, so the arithmetic is unchanged. OPENEMS_NO_PACKED_COEFF=1 keeps the tables,
+	//! and with them the generic loops and the unfused sweep.
 	struct PackedCoeff { f4vector c[6]; };
 	std::vector<PackedCoeff, aligned_allocator<PackedCoeff> > m_PackedV, m_PackedI;
 	virtual void Init();

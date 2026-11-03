@@ -39,7 +39,7 @@ class Engine;
 //! Abstract base-class for all engine extensions
 //! Put this first in every GetUsedHooks() override: a subclass that does not override GetUsedHooks() itself then
 //! gets LEGACY_HOOKS (every hook called), so it can never inherit a declaration that misses the hooks it adds
-//! (found 2026-11-02: Engine_Ext_DebyeMaterial inherited Engine_Ext_Dispersive's and lost its Pre/Post voltage hooks).
+//! (Engine_Ext_DebyeMaterial once inherited Engine_Ext_Dispersive's and lost its Pre/Post voltage hooks).
 #define OPENEMS_HOOKS_DECLARED_BY(CLASS) do { if (typeid(*this) != typeid(CLASS)) return Engine_Extension::LEGACY_HOOKS; } while (0)
 
 class Engine_Extension
@@ -93,8 +93,8 @@ public:
 	  The fused sweep runs the voltage update, its hooks and the current update x-line by x-line
 	  and calls these instead of the hooks above: the same work, for the x-lines [x0, x1) only, with
 	  the same order of hooks and extensions for every cell. A line hook may touch the fields of its
-	  own lines only (and of the line next to a line from GetCoupledLines()). Different threads call
-	  them for disjoint line ranges at the same time.
+	  own lines only (and of the other line of a pair (x, x+1) from GetCoupledLines()). Different threads
+	  call them for disjoint line ranges at the same time.
 	  Invariant: the engine never updates the currents of the last x-line (NX-1, they stay 0) and no
 	  excitation entry can sit on it, so the fused sweep never calls the *CurrentLines() hooks for it;
 	  a current hook of an extension must therefore be a no-op on NX-1 (true for every extension in tree).
@@ -105,7 +105,8 @@ public:
 	virtual void DoPreCurrentUpdatesLines(unsigned int /*x0*/, unsigned int /*x1*/) {}
 	virtual void DoPostCurrentUpdatesLines(unsigned int /*x0*/, unsigned int /*x1*/) {}
 	virtual void Apply2CurrentLines(unsigned int /*x0*/, unsigned int /*x1*/) {}
-	//! x-lines x whose voltage hooks also touch line x+1 (e.g. a Mur ABC on an x-face): x and x+1 are swept as one block
+	//! The lower line x of every pair (x, x+1) that one of the voltage line hooks couples: a hook on x that reads x+1,
+	//! or a hook on x+1 that reads x (e.g. a Mur ABC on an x-face). Both lines are then swept in one block by one thread.
 	virtual void GetCoupledLines(std::vector<unsigned int>& /*lines*/) const {}
 
 	//! Set the Engine to this extension. This will usually done automatically by Engine::AddExtension

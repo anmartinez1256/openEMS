@@ -52,6 +52,7 @@ void Operator_Ext_TFSF::Init()
 
 	m_Frequency = 0.0;
 	m_PhVel = C0;
+	m_maxDelay = 0;
 	Operator_Extension::Init();
 }
 

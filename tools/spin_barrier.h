@@ -83,14 +83,16 @@ protected:
 	static long ReadSpinTime()
 	{
 		const char* env = getenv("OPENEMS_BARRIER_SPIN_US");
-		if (env)
+		if (env && *env)   // an empty value is the same as unset
 			return atol(env);
 		return 50;
 	}
 
 	static inline void CpuRelax()
 	{
-#if defined(__aarch64__) || defined(__arm__)
+		// the yield hint exists from ARMv6K (both spellings of the ARMv6KZ macro: clang, GCC) and on ARMv6-M
+#if defined(__aarch64__) || (defined(__ARM_ARCH) && __ARM_ARCH >= 7) || defined(__ARM_ARCH_6K__) || \
+	defined(__ARM_ARCH_6KZ__) || defined(__ARM_ARCH_6ZK__) || defined(__ARM_ARCH_6M__)
 		__asm__ __volatile__("yield" ::: "memory");
 #elif defined(__x86_64__) || defined(__i386__)
 		__builtin_ia32_pause();

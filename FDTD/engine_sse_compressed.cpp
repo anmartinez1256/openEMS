@@ -16,6 +16,7 @@
 */
 
 #include "engine_sse_compressed.h"
+#include "tools/useful.h"
 #include <cstdlib>
 
 // enable AltiVec mode on ppc64le in GCC's emmintrin.h
@@ -66,20 +67,15 @@ void Engine_SSE_Compressed::BuildPackedCoeffs()
 {
 	m_PackedV.clear();
 	m_PackedI.clear();
-	if (std::getenv("OPENEMS_NO_PACKED_COEFF") != NULL)
+	if (EnvFlag("OPENEMS_NO_PACKED_COEFF"))
 		return;
 	const size_t numOps = Op->f4_vv_Compressed[0].size();
 	for (int n=0; n<3; ++n)
 		if ((Op->f4_vv_Compressed[n].size()!=numOps) || (Op->f4_vi_Compressed[n].size()!=numOps) ||
 		    (Op->f4_ii_Compressed[n].size()!=numOps) || (Op->f4_iv_Compressed[n].size()!=numOps))
 			return;
-	// 192 B per operator: a model with nearly one operator per z-vector would need more table memory than its fields;
-	// keep the SoA tables then (generic loops, stock speed) instead of failing (review 2026-11-02)
-	if ((double)numOps*192.0 > 2.0*24.0*Op->GetNumberCells())
-	{
-		std::cerr << "Engine_SSE_Compressed: " << numOps << " operators, packed coefficient tables would exceed the field memory, not packed" << std::endl;
-		return;
-	}
+	// 192 B per operator, at most one operator per z-vector: never more than twice the field memory.
+	// Only a failed allocation skips the tables (both are freed then).
 	try
 	{
 		m_PackedV.resize(numOps);
@@ -87,9 +83,10 @@ void Engine_SSE_Compressed::BuildPackedCoeffs()
 	}
 	catch (const std::bad_alloc&)
 	{
-		m_PackedV.clear();
-		m_PackedI.clear();
-		std::cerr << "Engine_SSE_Compressed: out of memory for the packed coefficient tables, not packed" << std::endl;
+		std::vector<PackedCoeff, aligned_allocator<PackedCoeff> >().swap(m_PackedV);
+		std::vector<PackedCoeff, aligned_allocator<PackedCoeff> >().swap(m_PackedI);
+		std::cerr << "Engine_SSE_Compressed: out of memory for the packed coefficient tables, not packed: "
+				  << "the generic update loops run (and the multithreaded engine does not fuse its sweep)" << std::endl;
 		return;
 	}
 	for (size_t i=0; i<numOps; ++i)

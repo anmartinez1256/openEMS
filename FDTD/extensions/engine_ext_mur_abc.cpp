@@ -264,7 +264,7 @@ void Engine_Ext_Mur_ABC::Apply2VoltagesFast(int threadID)
 // The line hooks: the vectors with the same arithmetic per lane as MurFast (bit-identical), then the single cells
 #define MUR_LINE_DATA \
 	f4vector* E4 = ((Engine_sse*)m_Eng)->f4_volt_ptr->data(); \
-	const ptrdiff_t oP = m_OffsetNyP/4, oPP = m_OffsetNyPP/4, oS = m_OffsetShift/4; \
+	const ptrdiff_t oP = m_OffsetNyP/4, oPP = m_OffsetNyPP/4; \
 	const MurFast d = {(FDTD_FLOAT*)E4, m_ScCoeffP.data(), m_ScCoeffPP.data(), m_ScP.data(), m_ScPP.data(), m_ScIndex.data(), \
 					   m_OffsetNyP, m_OffsetNyPP, m_OffsetShift};
 
@@ -272,6 +272,7 @@ void Engine_Ext_Mur_ABC::DoPreVoltageUpdatesLines(unsigned int x0, unsigned int 
 {
 	if (IsActive()==false) return;
 	MUR_LINE_DATA
+	const ptrdiff_t oS = m_OffsetShift/4;
 	for (unsigned int g=m_VecStart[x0]; g<m_VecStart[x1]; ++g)
 	{
 		const f4vector* e = E4 + m_VecIndex[g];
@@ -286,6 +287,7 @@ void Engine_Ext_Mur_ABC::DoPostVoltageUpdatesLines(unsigned int x0, unsigned int
 {
 	if (IsActive()==false) return;
 	MUR_LINE_DATA
+	const ptrdiff_t oS = m_OffsetShift/4;
 	for (unsigned int g=m_VecStart[x0]; g<m_VecStart[x1]; ++g)
 	{
 		const f4vector* e = E4 + m_VecIndex[g];

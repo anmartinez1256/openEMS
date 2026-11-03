@@ -427,7 +427,7 @@ void Engine_Ext_UPML::SetupCoefTable4()
 	m_CoefTable = false;
 	m_CoefTab4.clear();
 	m_CoefIdx4.clear();
-	if (getenv("OPENEMS_NO_PML_TABLE")!=NULL)
+	if (EnvFlag("OPENEMS_NO_PML_TABLE"))
 		return;
 	struct Key
 	{
@@ -465,7 +465,7 @@ void Engine_Ext_UPML::SetupCoefTable()
 	m_CoefTable = false;
 	m_CoefTab.clear();
 	m_CoefIdx.clear();
-	if (getenv("OPENEMS_NO_PML_TABLE")!=NULL)
+	if (EnvFlag("OPENEMS_NO_PML_TABLE"))
 		return;
 	const unsigned int NX = m_Op_UPML->m_numLines[0], NY = m_Op_UPML->m_numLines[1], NZ = m_Op_UPML->m_numLines[2];
 	struct Key

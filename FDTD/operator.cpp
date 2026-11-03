@@ -28,6 +28,7 @@
 #include "extensions/operator_ext_excitation.h"
 #include "Common/processfields.h"
 #include "tools/vtk_file_writer.h"
+#include "tools/useful.h"
 #include "fparser.hh"
 #include "extensions/operator_ext_excitation.h"
 
@@ -52,7 +53,7 @@ using std::flush;
 struct SetupTimer
 {
 	SetupTimer(const char* what) : m_what(what), m_t0(std::chrono::steady_clock::now()) {}
-	static bool Enabled() { static const bool on = getenv("OPENEMS_SETUP_TIMING")!=NULL; return on; }
+	static bool Enabled() { static const bool on = EnvFlag("OPENEMS_SETUP_TIMING"); return on; }
 	void Lap(const std::string& step)
 	{
 		if (!Enabled()) return;
@@ -64,7 +65,7 @@ struct SetupTimer
 	std::chrono::steady_clock::time_point m_t0;
 };
 // bumped by every CalcECOperator(): keys the per-thread GetMaterial() cache so a later setup (same mesh and
-// addresses, properties freed and reallocated) can never reuse a pointer of an earlier one (review 2026-11-02)
+// addresses, properties freed and reallocated) can never reuse a pointer of an earlier one
 static std::atomic<unsigned int> s_SetupGeneration(0);
 
 Operator* Operator::New()

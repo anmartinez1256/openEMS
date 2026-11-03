@@ -123,7 +123,7 @@ void Engine_Ext_DebyeMaterial::DoPostVoltageUpdates()
 	ENG_DISPATCH(DoPostVoltageUpdatesImpl);
 }
 
-// Fix 2026-11-02: this used to inherit Engine_Ext_Dispersive's declaration (APPLY_VOLT | LINE_HOOKS), so the
+// This used to inherit Engine_Ext_Dispersive's declaration (APPLY_VOLT | LINE_HOOKS), so the
 // multithreaded engine never called the Pre/Post voltage hooks above and Debye cells ran as their base material.
 // The Pre/Post hooks only read engine fields and write the extension's own state; the poles are applied by the
 // inherited Apply2Voltages(). There are no *Lines() versions, so the fused sweep stays off with this extension.

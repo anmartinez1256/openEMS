@@ -18,6 +18,7 @@
 #include "useful.h"
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <cmath>
 #include <climits>
 #include <iomanip>
@@ -155,6 +156,12 @@ unsigned int CgroupCPUQuota()
 	return (q>0) ? q : CgroupV1Quota();
 }
 #endif
+}
+
+bool EnvFlag(const char* name)
+{
+	const char* v = getenv(name);
+	return (v!=NULL) && (*v!='\0') && (strcmp(v, "0")!=0);
 }
 
 unsigned int AvailableThreads()

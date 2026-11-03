@@ -58,17 +58,23 @@ public:
 
 namespace ArrayLib
 {
-	// Large arrays come page-aligned from the system, so two arrays of the same size (the
-	// voltages and the currents) put matching cells into the same cache sets: on Apple M5 a
-	// 0.2-0.3 Mcell model then runs 3-4x slower than a bigger or smaller one. Offsetting each
-	// large allocation by a different sub-page amount removes the aliasing. The base pointer
-	// is kept in the word before the returned block. OPENEMS_NO_STAGGER=1 turns it off.
+	// Two large arrays of the same size, the voltages and the currents, can end up at a distance that
+	// slows the sweep down badly: on one thread of an Apple M5 under macOS 27, models whose field arrays
+	// are 2-4 MiB each (about 0.175-0.35 Mcells, 12 B per cell and array) ran 3.5-3.6x slower than bigger
+	// or smaller ones. libmalloc places two such blocks exactly 4 MiB + 16 KiB apart; moving one array
+	// by 512 B or more (16 or 32 KiB included) removes the slowdown. The hardware mechanism was not
+	// identified. Offsetting each large allocation by a different amount avoids such distances whatever
+	// the allocator does. The base pointer is kept in the word before the returned block.
+	// OPENEMS_NO_STAGGER=1 turns it off (an empty value or 0 is the same as unset).
 	static const size_t STAGGER_MIN_BYTES = 256*1024;
-	static const size_t STAGGER_SPAN = 16384;   // L1 way size on Apple cores (also covers 4 KB)
-	static const size_t STAGGER_STEP = 2560;    // 256 B granularity, cycles through the span
+	static const size_t STAGGER_SPAN = 16384;   // offsets from 256 B to just under 16 KiB
+	static const size_t STAGGER_STEP = 2560;    // consecutive large arrays move 2560 B against each other (mod the span)
 	inline bool StaggerApplies(size_t bytes, size_t alignment)
 	{
-		static const bool disabled = (std::getenv("OPENEMS_NO_STAGGER") != NULL);
+		static const bool disabled = []() {
+			const char* v = std::getenv("OPENEMS_NO_STAGGER");
+			return (v!=NULL) && (*v!='\0') && (std::strcmp(v, "0")!=0);
+		}();
 		return !disabled && (bytes >= STAGGER_MIN_BYTES) && (alignment <= 256);
 	}
 	inline size_t StaggerOffset(size_t bytes, size_t alignment)

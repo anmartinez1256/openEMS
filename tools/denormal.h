@@ -8,7 +8,7 @@
 #endif
 #if defined(__aarch64__)
 #include <cstdint>
-#include <cstdlib>
+#include "useful.h"
 #endif
 
 // Disable denormal (subnormal) floating point numbers. These exceedingly
@@ -21,13 +21,36 @@
 // only. Note the macro is the negative, so that a build system which does not
 // know about it at all still gets the fast default.
 //
-// TODO: Only implemented on x86. Do other CPUs like POWER, ARM have
-// denormal overheads? If so, implement them too.
+// TODO: Only implemented on x86 (arm64 flushes only on request, OPENEMS_FTZ
+// below). Do other CPUs like POWER, ARM have denormal overheads? If so,
+// implement them too.
 
 namespace Denormal
 {
 	inline void Disable();
+
+	//! The calling thread's flush-to-zero state before Disable(), and putting it back: Engine_sse saves it
+	//! on the thread that creates the engine and restores it when the engine is destroyed there. Only
+	//! arm64 with OPENEMS_FTZ saves and restores anything; elsewhere both do nothing, so on x86 the
+	//! creating thread keeps MXCSR FZ|DAZ after the run, as in stock.
+	inline unsigned long long Save();
+	inline void Restore(unsigned long long state);
 };
+
+#if defined(__aarch64__)
+namespace Denormal
+{
+	// Apple cores have no subnormal penalty, so the default keeps them (bit-identical to upstream).
+	// OPENEMS_FTZ=1 sets FPCR.FZ wherever Disable() runs: on the thread that creates an engine of the
+	// Engine_sse family (sse, sse-compressed, multithreaded, cylindrical) and in the multithreaded
+	// workers. These engines then match a GPU that flushes subnormals; the basic engine never flushes.
+	inline bool FlushRequested()
+	{
+		static const bool on = EnvFlag("OPENEMS_FTZ");
+		return on;
+	}
+}
+#endif
 
 inline void Denormal::Disable()
 {
@@ -41,16 +64,42 @@ inline void Denormal::Disable()
 	// write the new MXCSR setting to the MXCSR
 	_mm_setcsr( newMXCSR );
 #elif defined(__aarch64__)
-	// Apple cores have no subnormal penalty, so the default keeps them (bit-identical to upstream).
-	// OPENEMS_FTZ=1 sets FPCR.FZ, which makes the CPU engines match a GPU that flushes subnormals.
-	static const bool on = getenv("OPENEMS_FTZ")!=NULL;
-	if (on)
+	if (FlushRequested())
 	{
 		uint64_t fpcr;
 		__asm__ volatile("mrs %0, fpcr" : "=r"(fpcr));
 		fpcr |= (1ull<<24);
 		__asm__ volatile("msr fpcr, %0" : : "r"(fpcr));
 	}
+#endif
+}
+
+inline unsigned long long Denormal::Save()
+{
+#if defined(__aarch64__)
+	if (FlushRequested())
+	{
+		uint64_t fpcr;
+		__asm__ volatile("mrs %0, fpcr" : "=r"(fpcr));
+		return fpcr;
+	}
+#endif
+	return 0;
+}
+
+inline void Denormal::Restore(unsigned long long state)
+{
+#if defined(__aarch64__)
+	if (FlushRequested())
+	{
+		// only the FZ bit that Disable() sets; the other FPCR bits stay as they are now
+		uint64_t fpcr;
+		__asm__ volatile("mrs %0, fpcr" : "=r"(fpcr));
+		fpcr = (fpcr & ~(1ull<<24)) | (state & (1ull<<24));
+		__asm__ volatile("msr fpcr, %0" : : "r"(fpcr));
+	}
+#else
+	(void)state;
 #endif
 }
 

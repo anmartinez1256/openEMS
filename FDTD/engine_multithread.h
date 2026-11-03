@@ -128,19 +128,22 @@ protected:
 	//! Fused sweep: every thread runs the voltage update, the voltage hooks, and the current update with
 	//! its hooks x-line by x-line over its own slab, so a line is still in the cache when its currents are
 	//! updated (one pass over the fields per timestep instead of two) and a timestep needs two barriers.
-	//! It needs the IJKN field layout and extensions that all implement the line hooks (LINE_HOOKS).
+	//! It needs UseIJKN() (the IJKN field layout and the packed coefficient tables) and extensions that
+	//! all implement the line hooks (LINE_HOOKS).
 	bool m_Fused;
 	std::vector<unsigned int> m_Blocks;     //!< x-line blocks [m_Blocks[b], m_Blocks[b+1]) of the fused sweep
 	std::vector<unsigned int> m_SlabBlocks; //!< thread t sweeps the blocks [m_SlabBlocks[t], m_SlabBlocks[t+1])
 	std::vector<Engine_Extension*> m_LineHooks[6]; //!< per hook group: the extensions to call, in order
 	void SetupFused();
+	std::string m_FusedMsg; //!< the last fused-sweep line printed (verbose>0), see ReportFused()
+	void ReportFused(const std::string& msg);
 	void FusedTimestep(int threadID);
 	//! time and x-lines of each thread's sweep, to size the slabs (threads on efficiency cores are slower, PML lines cost more)
 	struct FusedStat
 	{
 		double busy;
 		double lines;
-		char pad[64-2*sizeof(double)]; // about one per cache line (C++11: new does not align to 64)
+		char pad[64-2*sizeof(double)]; // 64 B each (C++11: new does not align to 64; the Apple M5's cache line is 128 B)
 	};
 	FusedStat* m_FusedStat;
 	bool m_Balance;
@@ -156,7 +159,7 @@ protected:
 	{
 		std::atomic<int> next; //!< next x-line to update
 		int start, stop;       //!< first and last x-line of this range
-		char pad[64-sizeof(std::atomic<int>)-2*sizeof(int)]; // one range per cache line
+		char pad[64-sizeof(std::atomic<int>)-2*sizeof(int)]; // 64 B per range: one per cache line on 64-B-line CPUs, two per line on the Apple M5 (128 B)
 	};
 	WorkRange* m_VoltRange;
 	WorkRange* m_CurrRange;
@@ -185,11 +188,13 @@ protected:
 		double time;         //!< and their time (s)
 		double window;       //!< time to measure each thread count (s)
 		double ts_per_s;     //!< last speed, for the length of the pieces of IterateTS()
+		unsigned int maxUse; //!< most threads that get x-lines (CalcStartStopLines): every candidate is clamped to it
 	} m_Tuner;
 	//! Run \a n timesteps on the threads, returns the time (s)
 	double RunTimesteps(unsigned int n);
-	//! Times the performance core count P, then P+2, P+4, .. up to the maximum (until one is clearly
-	//! slower than the best) and P-2, then the two neighbours of the fastest; keeps the fastest count.
+	//! Times P (the performance-core count on Apple, half the hardware threads elsewhere; see StartThreads),
+	//! then P+2, P+4, .. up to the maximum (until one is clearly slower than the best) and P-2, then the two
+	//! neighbours of the fastest; keeps the fastest count. Every candidate is clamped to m_Tuner.maxUse.
 	//! (Coarse steps: the speed is not monotonic, e.g. P+1 threads can be slower than P and P+2.)
 	void TuneThreads(unsigned int iterTS, double seconds);
 

@@ -64,6 +64,8 @@ public:
 	const unsigned short* GetVoltDir() const {return Volt_dir;}
 	const FDTD_FLOAT* GetVoltAmp() const {return Volt_amp;}
 	const unsigned int* GetVoltDelay() const {return Volt_delay;}
+	//! the largest delay of the voltage and current entries, in timesteps (probe end criterion)
+	unsigned int GetMaxDelay() const;
 
 protected:
 	Operator_Ext_Excitation(Operator* op, Operator_Ext_Excitation* op_ext);

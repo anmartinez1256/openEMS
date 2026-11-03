@@ -101,6 +101,8 @@ public:
 
 	//! Set flags to store material data for post-processing
 	virtual void SetMaterialStoreFlags(int type, bool val);
+	//! The flag set by SetMaterialStoreFlags() (type 0-3)
+	bool GetMaterialStoreFlag(int type) const {return (type>=0) && (type<4) && m_StoreMaterial[type];}
 
 	//! Check storage flags and cleanup
 	virtual void CleanupMaterialStorage() = 0;

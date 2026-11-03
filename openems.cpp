@@ -48,8 +48,12 @@
 #include "FDTD/operator_sse_compressed.h"
 #include "FDTD/engine_sse.h"
 #include <cstdlib>
+#include <cstdint>
+#include <cctype>
+#include <climits>
 #include <cmath>
 #include <map>
+#include <sstream>
 #include "Common/processfields_sar.h"
 #include <hdf5.h>            // only for H5get_libversion()
 #include <boost/version.hpp> // only for BOOST_LIB_VERSION
@@ -1202,21 +1206,34 @@ ContinuousStructure* openEMS::GetCSX() const
 
 
 /***********************************************************************************************************
- Raw export for external engines (the Swift/Metal prototype in openems-metal/swift_engine):
-   OPENEMS_EXPORT_OPERATOR=dir  after the operator is built: compressed operator tables, index, excitation, signal
+ Raw export for external engines (e.g. the Swift/Metal prototype, swift_engine/ in emsKit):
+   OPENEMS_EXPORT_OPERATOR=dir  after the operator is built: compressed operator tables, index, the voltage
+                                excitation entries (current entries are not exported, a warning gives their
+                                count), the signal, and header.json
    OPENEMS_EXPORT_FIELDS=dir    after the run: the engine's voltage and current arrays (scalar n,x,y,z order)
- Plain little-endian binary files plus header.json; no HDF5 so that any language can read them.
+                                and fields.json
+ Plain little-endian binary files plus a JSON description; no HDF5 so that any language can read them. One grid
+ only (not the inner grids of a cylindrical multigrid). The directory must exist (an empty value exports nothing);
+ every failed write is reported, and the last line then says that the export is incomplete.
 ***********************************************************************************************************/
 static bool RawWrite(const std::string& fn, const void* data, size_t bytes)
 {
 	std::ofstream f(fn.c_str(), std::ios::binary);
+	if (f)
+		f.write((const char*)data, bytes);
+	if (f)
+		f.close();   // flushes: a full disk shows up here
 	if (!f)
 	{
 		cerr << "openEMS: raw export: cannot write " << fn << endl;
 		return false;
 	}
-	f.write((const char*)data, bytes);
 	return true;
+}
+
+static bool RawWriteText(const std::string& fn, const std::string& text)
+{
+	return RawWrite(fn, text.data(), text.size());
 }
 
 static void ExportOperatorRaw(Operator* op, const std::string& dir)
@@ -1227,6 +1244,7 @@ static void ExportOperatorRaw(Operator* op, const std::string& dir)
 		cerr << "openEMS: OPENEMS_EXPORT_OPERATOR needs the compressed SSE operator, nothing exported" << endl;
 		return;
 	}
+	bool ok = true;
 	unsigned int nl[3] = {op->GetNumberOfLines(0,true), op->GetNumberOfLines(1,true), op->GetNumberOfLines(2,true)};
 	const unsigned int nv = cop->GetNumVectors();
 	const size_t numOps = cop->f4_vv_Compressed[0].size();
@@ -1236,7 +1254,7 @@ static void ExportOperatorRaw(Operator* op, const std::string& dir)
 		for (unsigned int y=0; y<nl[1]; ++y)
 			for (unsigned int zv=0; zv<nv; ++zv)
 				idx[((size_t)x*nl[1]+y)*nv+zv] = cop->m_Op_index(x,y,zv);
-	RawWrite(dir+"/op_index.u32", idx.data(), idx.size()*sizeof(unsigned int));
+	ok = RawWrite(dir+"/op_index.u32", idx.data(), idx.size()*sizeof(unsigned int)) && ok;
 	// tables: [3][numOps][4] floats
 	const std::vector<f4vector,aligned_allocator<f4vector> >* tabs[4] = {cop->f4_vv_Compressed, cop->f4_vi_Compressed, cop->f4_ii_Compressed, cop->f4_iv_Compressed};
 	const char* names[4] = {"vv", "vi", "ii", "iv"};
@@ -1247,7 +1265,7 @@ static void ExportOperatorRaw(Operator* op, const std::string& dir)
 			for (size_t k=0; k<numOps; ++k)
 				for (int l=0; l<4; ++l)
 					buf[((size_t)n*numOps+k)*4+l] = tabs[t][n][k].f[l];
-		RawWrite(dir+"/"+names[t]+".f32", buf.data(), buf.size()*sizeof(float));
+		ok = RawWrite(dir+"/"+names[t]+".f32", buf.data(), buf.size()*sizeof(float)) && ok;
 	}
 	// excitation (voltage entries) and the signal
 	Operator_Ext_Excitation* exc = NULL;
@@ -1271,21 +1289,27 @@ static void ExportOperatorRaw(Operator* op, const std::string& dir)
 			for (int c=0; c<3; ++c) vi[(size_t)c*voltCount+k] = exc->GetVoltIndex(c)[k];
 			vdir[k] = exc->GetVoltDir()[k]; vdel[k] = exc->GetVoltDelay()[k]; vamp[k] = exc->GetVoltAmp()[k];
 		}
-		RawWrite(dir+"/exc_index.u32", vi.data(), vi.size()*sizeof(unsigned int));
-		RawWrite(dir+"/exc_dir.u32", vdir.data(), vdir.size()*sizeof(unsigned int));
-		RawWrite(dir+"/exc_delay.u32", vdel.data(), vdel.size()*sizeof(unsigned int));
-		RawWrite(dir+"/exc_amp.f32", vamp.data(), vamp.size()*sizeof(float));
+		ok = RawWrite(dir+"/exc_index.u32", vi.data(), vi.size()*sizeof(unsigned int)) && ok;
+		ok = RawWrite(dir+"/exc_dir.u32", vdir.data(), vdir.size()*sizeof(unsigned int)) && ok;
+		ok = RawWrite(dir+"/exc_delay.u32", vdel.data(), vdel.size()*sizeof(unsigned int)) && ok;
+		ok = RawWrite(dir+"/exc_amp.f32", vamp.data(), vamp.size()*sizeof(float)) && ok;
+		if (currCount)
+			cerr << "openEMS: raw export: the " << currCount << " current excitation entries are not exported (voltage entries only)" << endl;
 	}
 	Excitation* sig = op->GetExcitationSignal();
 	unsigned int sigLen = sig ? sig->GetLength() : 0;
 	if (sig && sigLen)
-		RawWrite(dir+"/exc_signal.f32", sig->GetVoltageSignal(), sigLen*sizeof(float));
-	std::ofstream h((dir+"/header.json").c_str());
+		ok = RawWrite(dir+"/exc_signal.f32", sig->GetVoltageSignal(), sigLen*sizeof(float)) && ok;
+	std::ostringstream h;
 	h << std::setprecision(17) << "{\n \"numLines\": [" << nl[0] << ", " << nl[1] << ", " << nl[2] << "],\n \"numVectors\": " << nv
 	  << ",\n \"numOps\": " << numOps << ",\n \"dT\": " << op->GetTimestep() << ",\n \"voltCount\": " << voltCount
 	  << ",\n \"currCount\": " << currCount << ",\n \"signalLength\": " << sigLen << ",\n \"signalPeriod\": " << (sig ? sig->GetSignalPeriod() : 0.0)
 	  << ",\n \"extensions\": [\"" << extNames << "\"],\n \"layout\": \"op_index[x][y][zv]; tables [n][op][lane], cell z = lane*numVectors + zv; exc_index [3][count]\"\n}\n";
-	cout << "openEMS: raw operator exported to " << dir << " (" << numOps << " operators, " << voltCount << " voltage excitations)" << endl;
+	ok = RawWriteText(dir+"/header.json", h.str()) && ok;
+	if (ok)
+		cout << "openEMS: raw operator exported to " << dir << " (" << numOps << " operators, " << voltCount << " voltage excitations)" << endl;
+	else
+		cerr << "openEMS: raw operator export to " << dir << " is incomplete, see the errors above" << endl;
 }
 
 static void ExportFieldsRaw(Operator* op, Engine* eng, const std::string& dir)
@@ -1303,12 +1327,16 @@ static void ExportFieldsRaw(Operator* op, Engine* eng, const std::string& dir)
 					volt[k] = eng->GetVolt(n,pos);
 					curr[k] = eng->GetCurr(n,pos);
 				}
-	RawWrite(dir+"/volt.f32", volt.data(), N*sizeof(float));
-	RawWrite(dir+"/curr.f32", curr.data(), N*sizeof(float));
-	std::ofstream h((dir+"/fields.json").c_str());
+	bool ok = RawWrite(dir+"/volt.f32", volt.data(), N*sizeof(float));
+	ok = RawWrite(dir+"/curr.f32", curr.data(), N*sizeof(float)) && ok;
+	std::ostringstream h;
 	h << "{\n \"numLines\": [" << nl[0] << ", " << nl[1] << ", " << nl[2] << "],\n \"numTS\": " << eng->GetNumberOfTimesteps()
 	  << ",\n \"layout\": \"volt.f32 / curr.f32 [3][x][y][z] float32\"\n}\n";
-	cout << "openEMS: raw fields after " << eng->GetNumberOfTimesteps() << " timesteps exported to " << dir << endl;
+	ok = RawWriteText(dir+"/fields.json", h.str()) && ok;
+	if (ok)
+		cout << "openEMS: raw fields after " << eng->GetNumberOfTimesteps() << " timesteps exported to " << dir << endl;
+	else
+		cerr << "openEMS: raw field export to " << dir << " is incomplete, see the errors above" << endl;
 }
 
 int openEMS::SetupFDTD()
@@ -1439,6 +1467,29 @@ int openEMS::SetupFDTD()
 	//check all properties to request material storage during operator creation...
 	SetupMaterialStorages();
 
+	// The array sizes and linear indices (ArrayLib, AdrOp) are 32-bit: refuse a mesh they cannot address instead
+	// of writing past the end of a wrapped array. Arrays over the whole mesh with three components (the stored
+	// material of field dumps and nf2ff boxes, conducting sheets, the basic operator and fields of the basic and
+	// GPU engines, the debug dumps) need 3*N < 2^32 nodes, the others N < 2^32.
+	{
+		const uint64_t nl[3] = {FDTD_Op->GetNumberOfLines(0,true), FDTD_Op->GetNumberOfLines(1,true), FDTD_Op->GetNumberOfLines(2,true)};
+		const uint64_t nodes = nl[0]*nl[1]*nl[2];
+		const uint64_t f4Fields = 3*nl[0]*nl[1]*((nl[2]+3)/4);   // f4vectors of the SSE operator and fields
+		bool full3 = DebugMat || DebugOp || (m_CSX->GetQtyPropertyType(CSProperties::CONDUCTINGSHEET)>0) ||
+					 (m_engine==EngineType_Basic) || (m_engine==EngineType_GPU) || (m_engine==EngineType_GPU_Reference);
+		for (int n=0; n<4; ++n)
+			full3 = full3 || FDTD_Op->GetMaterialStoreFlag(n);
+		const uint64_t maxSize = 0xFFFFFFFFull;
+		if ((nodes>maxSize) || (f4Fields>maxSize) || (full3 && (3*nodes>maxSize)))
+		{
+			cerr << "openEMS::SetupFDTD: Error, the mesh of " << nl[0] << "x" << nl[1] << "x" << nl[2] << " = " << nodes
+				 << " nodes is too large for the 32-bit array sizes: at most " << maxSize/3 << " nodes with field dumps,"
+				 << " nf2ff boxes, conducting sheets or the basic/GPU engine, " << maxSize << " otherwise. Abort!" << endl;
+			Signal::SetupHandlerForSIGINT(SIGNAL_ORIGINAL);
+			return 2;
+		}
+	}
+
 	/*******************   create the EC-FDTD operator *****************************/
 	Operator::DebugFlags debugFlags = Operator::None;
 	if (DebugMat)
@@ -1506,8 +1557,9 @@ int openEMS::SetupFDTD()
 	}
 
 	//create FDTD engine
-	if (getenv("OPENEMS_EXPORT_OPERATOR")) // operator, extensions and the excitation signal are complete here
-		ExportOperatorRaw(FDTD_Op, getenv("OPENEMS_EXPORT_OPERATOR"));
+	const char* exportOp = getenv("OPENEMS_EXPORT_OPERATOR");
+	if (exportOp && *exportOp) // operator, extensions and the excitation signal are complete here
+		ExportOperatorRaw(FDTD_Op, exportOp);
 	FDTD_Eng = FDTD_Op->CreateEngine();
 
 	if (Op_Ext_SSD)
@@ -1583,6 +1635,35 @@ bool openEMS::CheckAbortCond()
 //! Wall-clock time of a run (s) during which the end criteria is evaluated every Nyquist period, see RunFDTD()
 static const double EXACT_ENDCRIT_TIME = 60;
 
+// A whole environment value as a finite number (spaces around it allowed); false if it is not one.
+static bool ParseEnvNumber(const char* str, double& value)
+{
+	char* end = NULL;
+	value = strtod(str, &end);
+	if (end==str)
+		return false;
+	while (isspace((unsigned char)*end))
+		++end;
+	return (*end=='\0') && std::isfinite(value);
+}
+
+// The largest excitation delay in timesteps, for the probe end criterion: the voltage and current entries of every
+// grid (the cylindrical multigrid clones the excitation into its inner grids) and the TFSF propagation delay.
+static unsigned int MaxExcitationDelay(const Operator* op)
+{
+	unsigned int maxDelay = 0;
+	for (size_t n=0; n<op->GetNumberOfExtentions(); ++n)
+	{
+		if (const Operator_Ext_Excitation* exc = dynamic_cast<const Operator_Ext_Excitation*>(op->GetExtension(n)))
+			maxDelay = max(maxDelay, exc->GetMaxDelay());
+		else if (const Operator_Ext_TFSF* tfsf = dynamic_cast<const Operator_Ext_TFSF*>(op->GetExtension(n)))
+			maxDelay = max(maxDelay, tfsf->GetMaxDelay());
+	}
+	if (const Operator_CylinderMultiGrid* mg = dynamic_cast<const Operator_CylinderMultiGrid*>(op))
+		maxDelay = max(maxDelay, MaxExcitationDelay(mg->GetInnerOperator()));
+	return maxDelay;
+}
+
 void openEMS::RunFDTD()
 {
 	if ((FDTD_Op==NULL) || (FDTD_Eng==NULL) || (PA==NULL))
@@ -1625,25 +1706,43 @@ void openEMS::RunFDTD()
 		ProcField->SetProcessInterval(endCritInterval);
 	}
 
-	// Probe end criterion, OPENEMS_PROBE_END_DB=-60 (off unless set; Gaussian excitation only): stop once every
-	// enabled integral probe (port voltages and currents, field probes) has stayed below that fraction of its own
-	// peak for OPENEMS_PROBE_END_HOLD excitation lengths (default 1). The energy criterion above stalls on static
-	// charge (the pulse's DC part on open structures) while the port signals have long decayed; this is the port
-	// signal test the post-processing applies anyway, done inside the run. A probe whose peak is below 1e-6 of
-	// the largest peak among probes of its kind (noise far from the excitation) is measured against that peak.
+	// Probe end criterion, OPENEMS_PROBE_END_DB=-60 (off unless set to a negative number; Gaussian excitation only):
+	// stop once every enabled integral probe (port voltages and currents, field probes, the amplitude of mode-match
+	// probes but not their purity) has stayed below that fraction of its own peak for OPENEMS_PROBE_END_HOLD
+	// excitation lengths (default 1, 0 = no hold). The test runs whenever the processings run (PA->Process), and the
+	// hold restarts at every test at which the excitation is still running (its length plus the largest excitation
+	// delay), a probe is above the threshold, or a probe is still exactly zero; such a probe holds the run, and a
+	// notice names it once all the others have settled. Numerical precursors make a far probe non-zero shortly
+	// before the pulse arrives, so the hold must be longer than the longest one-way delay. A probe whose peak is
+	// below 1e-6 of the largest peak among probes of its kind (noise far from the excitation) is measured against
+	// that floor instead of its own peak. The energy criterion above stalls on static charge (the pulse's DC part on
+	// open structures) while the port signals have long decayed.
 	double probeEndThr = 0;
-	unsigned int probeHoldTS = 0, probeHoldStart = 0;
-	bool probeEnd = false;
+	unsigned int probeHoldTS = 0, probeHoldStart = 0, probeExciteEnd = 0, probeQuietStart = 0;
+	bool probeEnd = false, probeSilentNoticed = false;
 	std::vector<ProcessIntegral*> endProbes;
-	if (const char* pe = getenv("OPENEMS_PROBE_END_DB"))
+	const char* pe = getenv("OPENEMS_PROBE_END_DB");
+	if (pe && *pe)   // unset, empty or 0: off
 	{
-		double db = atof(pe);
-		if (db<0 && FDTD_Op->GetExcitationSignal()->GetExciteType()==0)
+		double db = 0;
+		if (!ParseEnvNumber(pe, db) || (db>0))
+			cerr << "openEMS::RunFDTD: OPENEMS_PROBE_END_DB=\"" << pe << "\" is not a negative number (dB), the probe end criterion is off" << endl;
+		else if (db<0 && FDTD_Op->GetExcitationSignal()->GetExciteType()==0)
 		{
 			double hold = 1.0;
-			if (const char* ph = getenv("OPENEMS_PROBE_END_HOLD"))
-				hold = atof(ph);
-			probeHoldTS = (unsigned int)(hold * FDTD_Op->GetExcitationSignal()->GetLength());
+			const char* ph = getenv("OPENEMS_PROBE_END_HOLD");
+			if (ph && *ph)
+			{
+				double h = 0;
+				if (ParseEnvNumber(ph, h) && (h>=0))
+					hold = h;
+				else
+					cerr << "openEMS::RunFDTD: OPENEMS_PROBE_END_HOLD=\"" << ph << "\" is not a number >= 0, using 1 excitation length" << endl;
+			}
+			const unsigned int len = FDTD_Op->GetExcitationSignal()->GetLength();
+			const double holdTS = hold * len;
+			probeHoldTS = (holdTS >= (double)UINT_MAX) ? UINT_MAX : (unsigned int)holdTS;
+			probeExciteEnd = (unsigned int)std::min<uint64_t>(UINT_MAX, (uint64_t)len + MaxExcitationDelay(FDTD_Op));
 			for (size_t n=0; n<PA->GetNumberOfProcessings(); ++n)
 				if (ProcessIntegral* pi = dynamic_cast<ProcessIntegral*>(PA->GetProcessing(n)))
 					if (pi->GetEnable())
@@ -1654,7 +1753,7 @@ void openEMS::RunFDTD()
 				if (g_settings.GetVerboseLevel()>0)
 				{
 					cout << "Probe end criterion: stop once all " << endProbes.size() << " probes stay below " << db
-						 << " dB of their peak for " << probeHoldTS << " timesteps" << endl;
+						 << " dB of their peak for " << probeHoldTS << " timesteps after timestep " << probeExciteEnd << endl;
 					if (g_settings.GetVerboseLevel()>1)
 						for (ProcessIntegral* pi : endProbes)
 							cout << "  probe " << pi->GetName() << " (" << pi->GetProcessingName() << ")" << endl;
@@ -1698,7 +1797,7 @@ void openEMS::RunFDTD()
 			for (ProcessIntegral* pi : endProbes)
 				kindPeak[pi->GetProcessingName()] = max(kindPeak[pi->GetProcessingName()], pi->GetPeakAbs());
 			double worst = 0;
-			bool allSeen = true;   // a probe the wavefront has not reached yet (peak still 0) must not count as settled
+			bool allSeen = true;   // a probe whose values are all still exactly zero (no signal yet) must not count as settled
 			for (ProcessIntegral* pi : endProbes)
 			{
 				double ref = max(pi->GetPeakAbs(), 1e-6*kindPeak[pi->GetProcessingName()]);
@@ -1708,13 +1807,26 @@ void openEMS::RunFDTD()
 					worst = max(worst, pi->GetLastAbs()/ref);
 			}
 			unsigned int ts = FDTD_Eng->GetNumberOfTimesteps();
-			if (!allSeen || worst>probeEndThr || ts<FDTD_Op->GetExcitationSignal()->GetLength())
+			const bool quiet = (worst<=probeEndThr) && (ts>=probeExciteEnd);   // the probes with a signal have settled
+			if (!allSeen || !quiet)
 				probeHoldStart = ts;
 			else if (ts-probeHoldStart >= probeHoldTS)
 				probeEnd = true;
+			// the others have settled for the hold time and only a silent probe holds the run: say so once
+			if (!quiet)
+				probeQuietStart = ts;
+			else if (!allSeen && !probeSilentNoticed && (ts-probeQuietStart >= probeHoldTS))
+			{
+				probeSilentNoticed = true;
+				cerr << "openEMS::RunFDTD: probe end criterion: the other probes have settled, but these are still exactly zero (no signal yet) and hold the run:";
+				for (ProcessIntegral* pi : endProbes)
+					if (pi->GetPeakAbs()<=0)
+						cerr << " " << pi->GetName();
+				cerr << ". A probe that never sees a signal (e.g. on a conductor) keeps the run going to its end; remove or disable it." << endl;
+			}
 			if (g_settings.GetVerboseLevel()>2)
 				cout << "  probe end check @" << ts << ": worst " << std::scientific << setprecision(2) << worst
-					 << " hold since " << probeHoldStart << (allSeen ? "" : " (a probe has seen no signal yet)") << (probeEnd ? "  -> stop" : "") << endl;
+					 << " hold since " << probeHoldStart << (allSeen ? "" : " (a probe is still exactly zero)") << (probeEnd ? "  -> stop" : "") << endl;
 		}
 
 		if (Eng_Ext_SSD)
@@ -1800,8 +1912,9 @@ void openEMS::RunFDTD()
 
 	if (m_DumpStats)
 		DumpStatistics(OPENEMS_STAT_FILE, t_diff);
-	if (getenv("OPENEMS_EXPORT_FIELDS"))
-		ExportFieldsRaw(FDTD_Op, FDTD_Eng, getenv("OPENEMS_EXPORT_FIELDS"));
+	const char* exportFields = getenv("OPENEMS_EXPORT_FIELDS");
+	if (exportFields && *exportFields)
+		ExportFieldsRaw(FDTD_Op, FDTD_Eng, exportFields);
 
 	//*************** postproc ************//
 	PA->PostProcess();

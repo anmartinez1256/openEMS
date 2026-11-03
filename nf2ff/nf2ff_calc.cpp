@@ -24,9 +24,13 @@
 #include <complex>
 #include <cstdlib>
 #include <iostream>
+#include <algorithm>
 
 #ifdef __APPLE__
-#include <Accelerate/Accelerate.h>
+// Only the CBLAS header of Accelerate: GCC cannot parse the Accelerate umbrella header. It is the older CBLAS interface,
+// as with the umbrella header (deprecated since macOS 13.3; the call below silences that warning): the newer one
+// (ACCELERATE_NEW_LAPACK) rounds differently and changes the far field in the last bits.
+#include <vecLib/cblas.h>
 #define NF2FF_HAVE_CBLAS
 #endif
 
@@ -364,9 +368,11 @@ void nf2ff_calc::CalcPlaneSeparable(int ny, float **lines, unsigned int* numLine
 {
 	// On a Cartesian plane exp(jk r.cos(psi)) = exp(jk a (x_i-cx)) * exp(jk b (y_j-cy)) * exp(jk c (z0-cz)), so for every
 	// direction the surface integral of a current component is  sum_i Q_i  sum_j P_j F(i,j)  with per-line phasors P and Q
-	// (the cell areas folded in). The inner sum over all directions at once is one matrix product per plane:
-	//   G[d][c,i] = sum_j P[d][j] F[c,i][j]   (cgemm on Apple's Accelerate, a plain loop elsewhere), then S_c[d] = sum_i Q[d][i] G[d][c,i].
-	// The legacy loop (one complex exp per cell and direction) stays for cylindrical meshes and OPENEMS_NF2FF_LEGACY=1.
+	// (the cell areas folded in). The inner sum over all directions at once is one matrix product per plane, done in blocks
+	// of directions:
+	//   G[d][c,i] = sum_j P[d][j] F[c,i][j]   (one cblas_cgemm per block), then S_c[d] = sum_i Q[d][i] G[d][c,i].
+	// Builds without a CBLAS (NF2FF_HAVE_CBLAS: Apple's Accelerate only) never call this function, see CalcPlane. The legacy
+	// loop (one complex exp per cell and direction) stays for them, for cylindrical meshes and for OPENEMS_NF2FF_LEGACY=1.
 	const int nP  = (ny+1)%3;
 	const int nPP = (ny+2)%3;
 	const unsigned int NP = numLines[nP], NPP = numLines[nPP];
@@ -415,8 +421,11 @@ void nf2ff_calc::CalcPlaneSeparable(int ny, float **lines, unsigned int* numLine
 	for (unsigned int i=0; i<NP; ++i)  xP[i]  = lines[nP][i]  - m_centerCoord[nP];
 	for (unsigned int j=0; j<NPP; ++j) xPP[j] = lines[nPP][j] - m_centerCoord[nPP];
 
-	// directions in blocks so that G (block x 6*NP) stays cache friendly
-	unsigned int block = (unsigned int)max<size_t>(16, min<size_t>(numDir, (1u<<21)/(6*NP)));
+	// directions in blocks: the work buffers G (block x 6*NP) and P (block x NPP) stay within 2^21 complex floats
+	// (16 MB) each, also on a thin face with few lines along nP and many along nPP; a block has at least 16 directions,
+	// so they grow past that only when NP > 21845 or NPP > 131072
+	const size_t maxEntries = (size_t)1<<21;
+	unsigned int block = (unsigned int)max<size_t>(16, min<size_t>(numDir, min<size_t>(maxEntries/(6*(size_t)NP), maxEntries/NPP)));
 	vector<complex<float>> P((size_t)block*NPP), Q((size_t)block*NP), G((size_t)block*6*NP);
 	const complex<float> _I_(0,1);
 	for (unsigned int d0=0; d0<numDir; d0+=block)
@@ -433,8 +442,12 @@ void nf2ff_calc::CalcPlaneSeparable(int ny, float **lines, unsigned int* numLine
 		}
 #ifdef NF2FF_HAVE_CBLAS
 		const complex<float> one(1,0), zero(0,0);
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wdeprecated-declarations"   // the older CBLAS interface on purpose, see the include
 		cblas_cgemm(CblasRowMajor, CblasNoTrans, CblasTrans, nd, 6*NP, NPP, &one, P.data(), NPP, F.data(), NPP, &zero, G.data(), 6*NP);
+#pragma GCC diagnostic pop
 #else
+		// not reached: without NF2FF_HAVE_CBLAS, CalcPlane always takes the threaded legacy loop
 		for (unsigned int b=0; b<nd; ++b)
 			for (unsigned int ci=0; ci<6*NP; ++ci)
 			{
@@ -536,7 +549,7 @@ bool nf2ff_calc::AddSinglePlane(float **lines, unsigned int* numLines, ArrayLib:
 	ArrayLib::ArrayIJ<complex<float>> Lp("l_Lp", numAngles);
 
 #ifdef NF2FF_HAVE_CBLAS
-	static const bool legacy = getenv("OPENEMS_NF2FF_LEGACY")!=NULL;
+	static const bool legacy = EnvFlag("OPENEMS_NF2FF_LEGACY");
 #else
 	static const bool legacy = true;   // the separable path needs a BLAS cgemm; the threaded legacy loop is faster than its scalar fallback
 #endif

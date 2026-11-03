@@ -53,6 +53,9 @@ public:
 	virtual void Init();
 	virtual void Reset();
 
+	//! the largest propagation delay of the incident wave over the TFSF box, in timesteps (probe end criterion)
+	unsigned int GetMaxDelay() const {return m_maxDelay;}
+
 protected:
 	Excitation* m_Exc;
 
