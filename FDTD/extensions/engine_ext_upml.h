@@ -35,7 +35,7 @@ public:
 	virtual ~Engine_Ext_UPML();
 
 	virtual void SetNumberOfThreads(int nrThread);
-	virtual unsigned int GetUsedHooks() const {return PRE_VOLT | POST_VOLT | PRE_CURR | POST_CURR | PREPOST_WRITES_FIELDS | ((m_Vec || m_Sse) ? LINE_HOOKS : 0);}
+	virtual unsigned int GetUsedHooks() const {OPENEMS_HOOKS_DECLARED_BY(Engine_Ext_UPML); return PRE_VOLT | POST_VOLT | PRE_CURR | POST_CURR | PREPOST_WRITES_FIELDS | ((m_Vec || m_Sse) ? LINE_HOOKS : 0);}
 
 	virtual void DoPreVoltageUpdatesLines(unsigned int x0, unsigned int x1);
 	virtual void DoPostVoltageUpdatesLines(unsigned int x0, unsigned int x1);

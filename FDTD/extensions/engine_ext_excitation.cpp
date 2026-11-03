@@ -20,6 +20,13 @@
 #include "FDTD/engine_sse.h"
 #include <algorithm>
 
+// APPLY_CURR only when there are current excitations (a soft/hard voltage excitation has none): saves a barrier per timestep
+unsigned int Engine_Ext_Excitation::GetUsedHooks() const
+{
+	OPENEMS_HOOKS_DECLARED_BY(Engine_Ext_Excitation);
+	return APPLY_VOLT | (m_Op_Exc->GetCurrCount() ? APPLY_CURR : 0) | LINE_HOOKS;
+}
+
 Engine_Ext_Excitation::Engine_Ext_Excitation(Operator_Ext_Excitation* op_ext) : Engine_Extension(op_ext)
 {
 	m_Op_Exc = op_ext;

@@ -40,7 +40,7 @@ public:
 	Engine_Ext_LumpedRLC(Operator_Ext_LumpedRLC *op_ext_RLC);
 	virtual ~Engine_Ext_LumpedRLC();
 
-	virtual unsigned int GetUsedHooks() const {return PRE_VOLT | APPLY_VOLT | LINE_HOOKS;}
+	virtual unsigned int GetUsedHooks() const {OPENEMS_HOOKS_DECLARED_BY(Engine_Ext_LumpedRLC); return PRE_VOLT | APPLY_VOLT | LINE_HOOKS;}
 
 	virtual void DoPreVoltageUpdates();
 	virtual void Apply2Voltages();

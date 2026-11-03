@@ -59,6 +59,7 @@ public:
 
 	virtual void DoPreVoltageUpdates();
 	virtual void DoPostVoltageUpdates();
+	virtual unsigned int GetUsedHooks() const;
 
 protected:
 	template <typename EngType>

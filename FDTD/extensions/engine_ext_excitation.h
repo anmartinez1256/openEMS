@@ -31,7 +31,7 @@ public:
 	Engine_Ext_Excitation(Operator_Ext_Excitation* op_ext);
 	virtual ~Engine_Ext_Excitation();
 
-	virtual unsigned int GetUsedHooks() const {return APPLY_VOLT | APPLY_CURR | LINE_HOOKS;}
+	virtual unsigned int GetUsedHooks() const;
 
 	virtual void Apply2Voltages();
 	virtual void Apply2Current();

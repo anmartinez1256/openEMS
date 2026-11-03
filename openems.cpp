@@ -1663,6 +1663,8 @@ void openEMS::RunFDTD()
 			else
 				cerr << "openEMS::RunFDTD: OPENEMS_PROBE_END_DB set but the model has no probe, ignored" << endl;
 		}
+		else if (db<0)
+			cerr << "openEMS::RunFDTD: OPENEMS_PROBE_END_DB needs a Gaussian excitation, ignored" << endl;
 	}
 
 	double change=1;
@@ -1696,20 +1698,23 @@ void openEMS::RunFDTD()
 			for (ProcessIntegral* pi : endProbes)
 				kindPeak[pi->GetProcessingName()] = max(kindPeak[pi->GetProcessingName()], pi->GetPeakAbs());
 			double worst = 0;
+			bool allSeen = true;   // a probe the wavefront has not reached yet (peak still 0) must not count as settled
 			for (ProcessIntegral* pi : endProbes)
 			{
 				double ref = max(pi->GetPeakAbs(), 1e-6*kindPeak[pi->GetProcessingName()]);
+				if (pi->GetPeakAbs()<=0)
+					allSeen = false;
 				if (ref>0)
 					worst = max(worst, pi->GetLastAbs()/ref);
 			}
 			unsigned int ts = FDTD_Eng->GetNumberOfTimesteps();
-			if (worst>probeEndThr || ts<FDTD_Op->GetExcitationSignal()->GetLength())
+			if (!allSeen || worst>probeEndThr || ts<FDTD_Op->GetExcitationSignal()->GetLength())
 				probeHoldStart = ts;
 			else if (ts-probeHoldStart >= probeHoldTS)
 				probeEnd = true;
 			if (g_settings.GetVerboseLevel()>2)
 				cout << "  probe end check @" << ts << ": worst " << std::scientific << setprecision(2) << worst
-					 << " hold since " << probeHoldStart << (probeEnd ? "  -> stop" : "") << endl;
+					 << " hold since " << probeHoldStart << (allSeen ? "" : " (a probe has seen no signal yet)") << (probeEnd ? "  -> stop" : "") << endl;
 		}
 
 		if (Eng_Ext_SSD)

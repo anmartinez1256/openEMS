@@ -73,8 +73,25 @@ void Engine_SSE_Compressed::BuildPackedCoeffs()
 		if ((Op->f4_vv_Compressed[n].size()!=numOps) || (Op->f4_vi_Compressed[n].size()!=numOps) ||
 		    (Op->f4_ii_Compressed[n].size()!=numOps) || (Op->f4_iv_Compressed[n].size()!=numOps))
 			return;
-	m_PackedV.resize(numOps);
-	m_PackedI.resize(numOps);
+	// 192 B per operator: a model with nearly one operator per z-vector would need more table memory than its fields;
+	// keep the SoA tables then (generic loops, stock speed) instead of failing (review 2026-11-02)
+	if ((double)numOps*192.0 > 2.0*24.0*Op->GetNumberCells())
+	{
+		std::cerr << "Engine_SSE_Compressed: " << numOps << " operators, packed coefficient tables would exceed the field memory, not packed" << std::endl;
+		return;
+	}
+	try
+	{
+		m_PackedV.resize(numOps);
+		m_PackedI.resize(numOps);
+	}
+	catch (const std::bad_alloc&)
+	{
+		m_PackedV.clear();
+		m_PackedI.clear();
+		std::cerr << "Engine_SSE_Compressed: out of memory for the packed coefficient tables, not packed" << std::endl;
+		return;
+	}
 	for (size_t i=0; i<numOps; ++i)
 		for (int n=0; n<3; ++n)
 		{

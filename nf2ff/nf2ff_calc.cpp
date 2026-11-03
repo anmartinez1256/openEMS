@@ -535,7 +535,11 @@ bool nf2ff_calc::AddSinglePlane(float **lines, unsigned int* numLines, ArrayLib:
 	ArrayLib::ArrayIJ<complex<float>> Lt("l_Lt", numAngles);
 	ArrayLib::ArrayIJ<complex<float>> Lp("l_Lp", numAngles);
 
+#ifdef NF2FF_HAVE_CBLAS
 	static const bool legacy = getenv("OPENEMS_NF2FF_LEGACY")!=NULL;
+#else
+	static const bool legacy = true;   // the separable path needs a BLAS cgemm; the threaded legacy loop is faster than its scalar fallback
+#endif
 	if (MeshType==0 && !legacy)
 	{
 		CalcPlaneSeparable(ny, lines, numLines, normDir, edge_length_P, edge_length_PP, E_field, H_field, Nt, Np, Lt, Lp);

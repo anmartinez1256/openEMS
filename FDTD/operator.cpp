@@ -22,21 +22,6 @@
 #include <chrono>
 #include <iostream>
 
-// OPENEMS_SETUP_TIMING=1 prints the time of every phase of the operator setup to stderr
-struct SetupTimer
-{
-	SetupTimer(const char* what) : m_what(what), m_t0(std::chrono::steady_clock::now()) {}
-	static bool Enabled() { static const bool on = getenv("OPENEMS_SETUP_TIMING")!=NULL; return on; }
-	void Lap(const std::string& step)
-	{
-		if (!Enabled()) return;
-		std::chrono::steady_clock::time_point t = std::chrono::steady_clock::now();
-		std::cerr << "setup timing: " << m_what << " " << step << ": " << std::chrono::duration<double>(t-m_t0).count() << " s" << std::endl;
-		m_t0 = t;
-	}
-	const char* m_what;
-	std::chrono::steady_clock::time_point m_t0;
-};
 #include "operator.h"
 #include "engine.h"
 #include "extensions/operator_extension.h"
@@ -60,6 +45,27 @@ using std::cout;
 using std::cerr;
 using std::endl;
 using std::flush;
+
+#include <atomic>
+
+// OPENEMS_SETUP_TIMING=1 prints the time of every phase of the operator setup to stderr
+struct SetupTimer
+{
+	SetupTimer(const char* what) : m_what(what), m_t0(std::chrono::steady_clock::now()) {}
+	static bool Enabled() { static const bool on = getenv("OPENEMS_SETUP_TIMING")!=NULL; return on; }
+	void Lap(const std::string& step)
+	{
+		if (!Enabled()) return;
+		std::chrono::steady_clock::time_point t = std::chrono::steady_clock::now();
+		std::cerr << "setup timing: " << m_what << " " << step << ": " << std::chrono::duration<double>(t-m_t0).count() << " s" << std::endl;
+		m_t0 = t;
+	}
+	const char* m_what;
+	std::chrono::steady_clock::time_point m_t0;
+};
+// bumped by every CalcECOperator(): keys the per-thread GetMaterial() cache so a later setup (same mesh and
+// addresses, properties freed and reallocated) can never reuse a pointer of an earlier one (review 2026-11-02)
+static std::atomic<unsigned int> s_SetupGeneration(0);
 
 Operator* Operator::New()
 {
@@ -1024,6 +1030,7 @@ void Operator::Calc_ECOperatorPos(int n, unsigned int* pos)
 
 int Operator::CalcECOperator( DebugFlags debugFlags )
 {
+	++s_SetupGeneration;
 	SetupTimer timer("Operator::CalcECOperator");
 	Init_EC();
 	InitDataStorage();
@@ -1343,12 +1350,13 @@ double Operator::GetMaterial(
 	// The material averaging asks for two types at the same coordinate in a row (epsilon+kappa, mue+sigma):
 	// remember the last lookup per thread, the primitives do not change during the setup.
 	// (keyed by the vector's address, size and first/last entry: a later vector may reuse a freed address)
-	struct LastLookup { double coords[3]; const CSPrimitives* const* prims; size_t num; const CSPrimitives* first; const CSPrimitives* back; CSPropMaterial* mat; bool valid; };
-	static thread_local LastLookup last = {{0,0,0}, NULL, 0, NULL, NULL, NULL, false};
+	struct LastLookup { double coords[3]; const CSPrimitives* const* prims; size_t num; const CSPrimitives* first; const CSPrimitives* back; CSPropMaterial* mat; bool valid; unsigned int gen; };
+	static thread_local LastLookup last = {{0,0,0}, NULL, 0, NULL, NULL, NULL, false, 0};
+	const unsigned int gen = s_SetupGeneration.load();
 	const CSPrimitives* first = vPrims.empty() ? NULL : vPrims.front();
 	const CSPrimitives* back = vPrims.empty() ? NULL : vPrims.back();
 	CSPropMaterial* mat;
-	if (last.valid && last.coords[0]==coords[0] && last.coords[1]==coords[1] && last.coords[2]==coords[2]
+	if (last.valid && last.gen==gen && last.coords[0]==coords[0] && last.coords[1]==coords[1] && last.coords[2]==coords[2]
 		&& last.prims==vPrims.data() && last.num==vPrims.size() && last.first==first && last.back==back)
 		mat = last.mat;
 	else
@@ -1356,7 +1364,7 @@ double Operator::GetMaterial(
 		CSProperties* prop = CSX->FindPropertyByCoordPriority(coords,vPrims,markAsUsed);
 		mat = dynamic_cast<CSPropMaterial*>(prop);
 		last.coords[0]=coords[0]; last.coords[1]=coords[1]; last.coords[2]=coords[2];
-		last.prims = vPrims.data(); last.num = vPrims.size(); last.first = first; last.back = back; last.mat = mat; last.valid = markAsUsed;
+		last.prims = vPrims.data(); last.num = vPrims.size(); last.first = first; last.back = back; last.mat = mat; last.valid = markAsUsed; last.gen = gen;
 	}
 	if (mat)
 	{

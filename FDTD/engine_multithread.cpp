@@ -138,9 +138,10 @@ void Engine_Multithread::Init()
 		m_numThreads = StartThreads(m_max_numThreads);
 		m_Tuner.start = m_Tuner.best = m_numThreads;
 		m_Tuner.best_speed = 0;
+		const unsigned int maxUse = std::min(m_max_numThreads, numLines[0]);   // more threads than x-lines cannot be used
 		m_Tuner.todo.clear();
 		for (unsigned int n=m_numThreads+2; n<m_max_numThreads+2; n+=2)
-			m_Tuner.todo.push_back(std::min(n, m_max_numThreads));
+			m_Tuner.todo.push_back(std::min(n, maxUse));
 		if (m_numThreads>2)
 			m_Tuner.todo.push_back(m_numThreads-2);
 		m_Tuner.speed.assign(m_max_numThreads+1, 0);
@@ -377,7 +378,7 @@ void Engine_Multithread::TuneThreads(unsigned int iterTS, double seconds)
 		t.refined = true;
 		if (t.best>1)
 			t.todo.push_back(t.best-1);
-		if (t.best<m_max_numThreads)
+		if (t.best<std::min(m_max_numThreads, numLines[0]))
 			t.todo.push_back(t.best+1);
 	}
 	if (t.todo.empty())

@@ -37,6 +37,8 @@ public:
 
 	virtual void SetNumberOfThreads(int nrThread);
 	virtual unsigned int GetUsedHooks() const;
+	//! the hooks of the dispersive base (for subclasses that add their own)
+	unsigned int DispersiveHooks() const;
 	virtual void Apply2VoltagesLines(unsigned int x0, unsigned int x1);
 	virtual void Apply2CurrentLines(unsigned int x0, unsigned int x1);
 

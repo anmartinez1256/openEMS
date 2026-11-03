@@ -78,7 +78,8 @@ Engine_Ext_LorentzMaterial::~Engine_Ext_LorentzMaterial()
 
 unsigned int Engine_Ext_LorentzMaterial::GetUsedHooks() const
 {
-	return Engine_Ext_Dispersive::GetUsedHooks() | (AnyVoltADE() ? PRE_VOLT : 0) | (AnyCurrADE() ? PRE_CURR : 0);
+	OPENEMS_HOOKS_DECLARED_BY(Engine_Ext_LorentzMaterial);
+	return DispersiveHooks() | (AnyVoltADE() ? PRE_VOLT : 0) | (AnyCurrADE() ? PRE_CURR : 0);
 }
 
 // the same per-position operations as DoPreVoltageUpdatesImpl, for the positions on x-lines [x0,x1)

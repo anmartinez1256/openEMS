@@ -94,6 +94,12 @@ bool Engine_Ext_Dispersive::AnyCurrADE() const
 
 unsigned int Engine_Ext_Dispersive::GetUsedHooks() const
 {
+	OPENEMS_HOOKS_DECLARED_BY(Engine_Ext_Dispersive);
+	return DispersiveHooks();
+}
+
+unsigned int Engine_Ext_Dispersive::DispersiveHooks() const
+{
 	return (AnyVoltADE() ? APPLY_VOLT : 0) | (AnyCurrADE() ? APPLY_CURR : 0) | (m_LinesReady ? LINE_HOOKS : 0);
 }
 

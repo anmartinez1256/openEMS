@@ -18,6 +18,8 @@
 #ifndef ENGINE_EXTENSION_H
 #define ENGINE_EXTENSION_H
 
+#include <typeinfo>
+
 #define ENG_EXT_PRIO_DEFAULT 0 //default engine extension priority
 
 // priority definitions for some important extensions
@@ -35,6 +37,11 @@ class Operator_Extension;
 class Engine;
 
 //! Abstract base-class for all engine extensions
+//! Put this first in every GetUsedHooks() override: a subclass that does not override GetUsedHooks() itself then
+//! gets LEGACY_HOOKS (every hook called), so it can never inherit a declaration that misses the hooks it adds
+//! (found 2026-11-02: Engine_Ext_DebyeMaterial inherited Engine_Ext_Dispersive's and lost its Pre/Post voltage hooks).
+#define OPENEMS_HOOKS_DECLARED_BY(CLASS) do { if (typeid(*this) != typeid(CLASS)) return Engine_Extension::LEGACY_HOOKS; } while (0)
+
 class Engine_Extension
 {
 public:
@@ -56,6 +63,8 @@ public:
 	  hooks. Apply2* hooks keep one barrier per extension, because they write engine fields in
 	  priority order.
 	  The default LEGACY_HOOKS keeps the old behaviour: every hook is called, followed by a barrier.
+	  Every override must start with OPENEMS_HOOKS_DECLARED_BY(ThisClass) and every subclass that adds a hook
+	  must declare its own set: a declaration is never inherited.
 	  */
 	virtual unsigned int GetUsedHooks() const {return LEGACY_HOOKS;}
 
@@ -86,9 +95,9 @@ public:
 	  the same order of hooks and extensions for every cell. A line hook may touch the fields of its
 	  own lines only (and of the line next to a line from GetCoupledLines()). Different threads call
 	  them for disjoint line ranges at the same time.
-	  Note: the fused sweep never calls the *CurrentLines() hooks for the last x-line (NX-1): the
-	  engine does not update the currents there either (they stay 0) and no excitation entry can sit
-	  on it, so this matches the unfused path today; a current hook with real work on NX-1 would not.
+	  Invariant: the engine never updates the currents of the last x-line (NX-1, they stay 0) and no
+	  excitation entry can sit on it, so the fused sweep never calls the *CurrentLines() hooks for it;
+	  a current hook of an extension must therefore be a no-op on NX-1 (true for every extension in tree).
 	  */
 	virtual void DoPreVoltageUpdatesLines(unsigned int /*x0*/, unsigned int /*x1*/) {}
 	virtual void DoPostVoltageUpdatesLines(unsigned int /*x0*/, unsigned int /*x1*/) {}
