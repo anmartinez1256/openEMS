@@ -34,6 +34,7 @@ class Engine_Ext_LumpedRLC : public Engine_Extension
 	friend class Operator_Ext_LumpedRLC;
 	friend class Operator;
 	friend class ContinuousStructure;
+	friend class Engine_Metal_Diamond;
 
 public:
 

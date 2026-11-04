@@ -27,11 +27,15 @@
 #include "FDTD/extensions/operator_ext_excitation.h"
 #include "FDTD/extensions/engine_ext_mur_abc.h"
 #include "FDTD/extensions/operator_ext_mur_abc.h"
+#include "FDTD/extensions/engine_ext_lumpedRLC.h"
+#include "FDTD/extensions/operator_ext_lumpedRLC.h"
 #include "FDTD/excitation.h"
 #include "tools/useful.h"
 #include "tools/global.h"
 
 #include <algorithm>
+#include <array>
+#include <set>
 #include <chrono>
 #include <cstdlib>
 #include <iostream>
@@ -53,7 +57,7 @@ using namespace metal;
 
 struct Dims { uint nx, ny, nz, nv; };
 struct Phase { uint depth, ts0, xtype, ytype, lbase, nty; }; // type 0 = mountain, 1 = valley; lbase, nty: entry lists
-struct Ext { uint vcount, ccount, length, period0, numMur; }; // period0: 0 = no signal period
+struct Ext { uint vcount, ccount, length, period0, numMur, numApply, rlcSerial; }; // period0: 0 = no signal period
 struct MurFace { uint ny, nyP, nyPP, line, shift, n1, startTS, coef, size; };
 
 // the f4vector of component n at (x, y, zv) in the N-I-J-K layout, and the float of cell z (z = lane*nv + zv)
@@ -164,6 +168,41 @@ inline void murStage(uint stage, device const MurFace& m, device float* E, devic
     }
 }
 
+// Engine_Ext_LumpedRLC for the elements of extension ext in this tile (the tile's list: the elements its ranges
+// reach). Stage 0: the inductor current (DoPreVoltageUpdates, independent of the fields), the node voltage from the
+// updated field and J, the state moves on one timestep; stage 1: the voltage back into the field (all reads before
+// all writes, as on the CPU; one thread in element order when two elements share a cell). Clang's contraction of the
+// CPU expressions: Il += (i2v*ilv)*Vd1 one fmadd; vvd*((Vd0 - Il) + vv2*Vd2 + vj1*J1 + vj2*J2) three fmadds then a
+// multiply; ib0*(Vd0 - Vd2) - (b1*ib0)*J1 - (b2*ib0)*J2 the first product fused with -(b1*ib0)*J1, then one fmsub.
+// Element: x, y, z, direction, extension; coefficients: i2v*ilv, vvd, vv2, vj1, vj2, ib0, b1*ib0, b2*ib0;
+// state: Il, Vd[n-1], Vd[n-2], J[n-1], J[n-2].
+inline void rlcStage(uint stage, uint ext, device float* E, device const uint* ri, device const float* rc,
+                     device float* rs, device const uint* off, device const uint* list, uint li, int2 sx, int2 sy,
+                     constant Dims& d, uint tid, uint tgs, bool serial)
+{
+    if (stage == 1 && serial)
+    {
+        if (tid != 0) return;
+        tgs = 1;
+    }
+    for (uint l = off[li] + tid; l < off[li+1]; l += tgs)
+    {
+        const uint k = list[l];
+        device const uint* q = ri + 5*k;
+        if (q[4] != ext) continue;
+        const int x = int(q[0]), y = int(q[1]);
+        if (x < sx.x || x >= sx.y || y < sy.x || y >= sy.y) continue;
+        const uint fi = F(q[3], uint(x), uint(y), q[2], d);
+        device float* st = rs + 5*k;
+        if (stage == 1) { E[fi] = st[1]; continue; }
+        device const float* c = rc + 8*k;
+        const float il = fma(c[0], st[1], st[0]);
+        const float vd = c[1] * fma(c[4], st[4], fma(c[3], st[3], fma(c[2], st[2], E[fi] - il)));
+        const float j = fma(-c[7], st[4], fma(c[5], vd - st[2], -(c[6] * st[3])));
+        st[0] = il; st[2] = st[1]; st[1] = vd; st[4] = st[3]; st[3] = j;
+    }
+}
+
 // One threadgroup advances one tile over p.depth timesteps in place, z complete, with a threadgroup barrier between
 // the stages; the extensions run per tile in the CPU engine's order (Pre, update, Post, Apply in extension order).
 kernel void diamond(device float4* volt [[buffer(0)]], device float4* curr [[buffer(1)]],
@@ -178,6 +217,9 @@ kernel void diamond(device float4* volt [[buffer(0)]], device float4* curr [[buf
                     device float* mscr [[buffer(18)]],
                     device const uint* voff [[buffer(19)]], device const uint* vlist [[buffer(20)]],
                     device const uint* coff [[buffer(21)]], device const uint* clist [[buffer(22)]],
+                    device const uint* apply [[buffer(23)]], device const uint* rlcI [[buffer(24)]],
+                    device const float* rlcC [[buffer(25)]], device float* rlcS [[buffer(26)]],
+                    device const uint* roff [[buffer(27)]], device const uint* rlist [[buffer(28)]],
                     uint3 tg [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]],
                     uint3 tptg [[threads_per_threadgroup]])
 {
@@ -193,6 +235,11 @@ kernel void diamond(device float4* volt [[buffer(0)]], device float4* curr [[buf
             continue;   // the same for the whole threadgroup
         const uint ts = p.ts0 + s / 2;
         const bool eStep = (s & 1) == 0;
+        const uint li = p.lbase + tg.x*p.nty + tg.y;   // this tile's entry lists
+        bool rlc = false;   // lumped elements in this tile
+#if DIAMOND_RLC
+        rlc = eStep && roff[li+1] > roff[li];
+#endif
         uint mur = 0;   // the active Mur faces with cells in this tile
 #if DIAMOND_MUR
         if (eStep)
@@ -226,15 +273,34 @@ kernel void diamond(device float4* volt [[buffer(0)]], device float4* curr [[buf
             for (uint f = 0; f < e.numMur; ++f)
                 if (mur & (1u << f)) murStage(1, mf[f], E, mcoef, mscr, sx, sy, d, tid, tgs);
             threadgroup_barrier(mem_flags::mem_device);
-            for (uint f = 0; f < e.numMur; ++f)
-                if (mur & (1u << f))
-                {
-                    // one face after the other: faces share their edge cells
-                    murStage(2, mf[f], E, mcoef, mscr, sx, sy, d, tid, tgs);
-                    threadgroup_barrier(mem_flags::mem_device);
-                }
         }
 #endif
+        if (mur || rlc)
+            // Apply in the engine's extension order (kind << 16 | index; 0 = Mur face, 1 = lumped RLC), one after
+            // the other: Mur faces share their edge cells, an element may sit on a face
+            for (uint a = 0; a < e.numApply; ++a)
+            {
+                const uint idx = apply[a] & 0xffffu;
+                if ((apply[a] >> 16) == 0)
+                {
+#if DIAMOND_MUR
+                    if (mur & (1u << idx))
+                    {
+                        murStage(2, mf[idx], E, mcoef, mscr, sx, sy, d, tid, tgs);
+                        threadgroup_barrier(mem_flags::mem_device);
+                    }
+#endif
+                }
+                else if (rlc)
+                {
+#if DIAMOND_RLC
+                    rlcStage(0, idx, E, rlcI, rlcC, rlcS, roff, rlist, li, sx, sy, d, tid, tgs, e.rlcSerial != 0);
+                    threadgroup_barrier(mem_flags::mem_device);
+                    rlcStage(1, idx, E, rlcI, rlcC, rlcS, roff, rlist, li, sx, sy, d, tid, tgs, e.rlcSerial != 0);
+                    threadgroup_barrier(mem_flags::mem_device);
+#endif
+                }
+            }
 #if DIAMOND_EXC
         const uint ecount = eStep ? e.vcount : e.ccount;
         if (ecount > 0)
@@ -249,7 +315,6 @@ kernel void diamond(device float4* volt [[buffer(0)]], device float4* curr [[buf
                 device const uint* off = eStep ? voff : coff;
                 device const uint* list = eStep ? vlist : clist;
                 device float* f = eStep ? E : H;
-                const uint li = p.lbase + tg.x*p.nty + tg.y;
                 for (uint l = off[li]; l < off[li+1]; ++l)
                 {
                     const uint k = list[l];
@@ -268,7 +333,7 @@ kernel void diamond(device float4* volt [[buffer(0)]], device float4* curr [[buf
 
 struct Dims { uint32_t nx, ny, nz, nv; };
 struct Phase { uint32_t depth, ts0, xtype, ytype, lbase, nty; };
-struct Ext { uint32_t vcount, ccount, length, period0, numMur; };
+struct Ext { uint32_t vcount, ccount, length, period0, numMur, numApply, rlcSerial; };
 struct MurFace { uint32_t ny, nyP, nyPP, line, shift, n1, startTS, coef, size; };
 
 unsigned int EnvUInt(const char* name, unsigned int def)
@@ -332,6 +397,8 @@ struct Engine_Metal_Diamond::State
 	id<MTLBuffer> vexc = nil, vamp = nil, cexc = nil, camp = nil, vsig = nil, csig = nil;
 	id<MTLBuffer> mf = nil, mcoef = nil, mscr = nil;
 	id<MTLBuffer> voff = nil, vlist = nil, coff = nil, clist = nil;   // excitation entries per tile, [phase][tx][ty]
+	id<MTLBuffer> apply = nil, rlcI = nil, rlcC = nil, rlcS = nil, roff = nil, rlist = nil;   // Apply order, lumped RLC
+	unsigned int numRLC = 0;
 	unsigned int lbase[4] = {0, 0, 0, 0};
 	Dims dims = {0, 0, 0, 0};
 	Ext ext = {0, 0, 0, 0, 0};
@@ -443,8 +510,11 @@ bool Engine_Metal_Diamond::SetupGPU()
 		return false;
 	}
 
-	// the extensions: excitation and Mur on the GPU, in the engine's Apply order (Mur faces, then the excitation)
+	// the extensions: excitation, Mur and lumped RLC on the GPU; Apply order = the engine's extension order (Mur and
+	// RLC have the same priority, the excitation comes last)
 	std::vector<Engine_Ext_Mur_ABC*> murs;
+	std::vector<Engine_Ext_LumpedRLC*> rlcs;
+	std::vector<uint32_t> applyOrder;
 	bool excSeen = false;
 	for (size_t n=0; n<m_Eng_exts.size(); ++n)
 	{
@@ -457,13 +527,24 @@ bool Engine_Metal_Diamond::SetupGPU()
 		Engine_Ext_Mur_ABC* mur = dynamic_cast<Engine_Ext_Mur_ABC*>(ext);
 		if (mur && !excSeen)
 		{
+			applyOrder.push_back(murs.size());
 			murs.push_back(mur);
+			continue;
+		}
+		Engine_Ext_LumpedRLC* rlc = dynamic_cast<Engine_Ext_LumpedRLC*>(ext);
+		if (rlc && !excSeen)
+		{
+			if (rlc->m_Op_Ext_RLC->RLC_count)
+			{
+				applyOrder.push_back((1u<<16) | rlcs.size());
+				rlcs.push_back(rlc);
+			}
 			continue;
 		}
 		cerr << "Engine_Metal_Diamond: the extension \"" << ext->GetExtensionName() << "\" has no GPU version here, running the CPU loops" << endl;
 		return false;
 	}
-	if (murs.size()>32)
+	if ((murs.size()>32) || (rlcs.size()>0xffff))
 		return false;
 
 	@autoreleasepool
@@ -484,7 +565,8 @@ bool Engine_Metal_Diamond::SetupGPU()
 		}
 		// the kernel without the parts this model does not use (fewer registers, more tiles in flight)
 		options.preprocessorMacros = @{@"DIAMOND_MUR": @(murs.empty() ? 0 : 1),
-									   @"DIAMOND_EXC": @((excSeen && Op->GetExcitationExtension()) ? 1 : 0)};
+									   @"DIAMOND_EXC": @((excSeen && Op->GetExcitationExtension()) ? 1 : 0),
+									   @"DIAMOND_RLC": @(rlcs.empty() ? 0 : 1)};
 		id<MTLLibrary> lib = [md.dev newLibraryWithSource:[NSString stringWithUTF8String:DIAMOND_SOURCE] options:options error:&error];
 		if (lib==nil)
 		{
@@ -559,7 +641,7 @@ bool Engine_Metal_Diamond::SetupGPU()
 		Operator_Ext_Excitation* exc = Op->GetExcitationExtension();
 		std::vector<uint32_t> ve, ce;
 		std::vector<float> va, ca;
-		md.ext = {0, 0, 0, 0, (uint32_t)murs.size()};
+		md.ext = {0, 0, 0, 0, (uint32_t)murs.size(), (uint32_t)applyOrder.size(), 0};
 		if (excSeen && exc)
 		{
 			for (unsigned int k=0; k<exc->Volt_Count; ++k)
@@ -640,10 +722,39 @@ bool Engine_Metal_Diamond::SetupGPU()
 		md.mcoef = buffer(coef.data(), coef.size()*sizeof(float));
 		md.mscr = [md.dev newBufferWithLength:std::max<size_t>(16, coef.size()*sizeof(float)) options:MTLResourceStorageModePrivate];
 
+		// lumped RLC elements of all extensions in Apply order, their per-tile lists and a zero state (as the CPU's)
+		std::vector<uint32_t> ri;
+		std::vector<float> rc;
+		std::set<std::array<uint32_t,5> > cells;
+		for (size_t r=0; r<rlcs.size(); ++r)
+		{
+			const Operator_Ext_LumpedRLC* o = rlcs[r]->m_Op_Ext_RLC;
+			for (unsigned int k=0; k<o->RLC_count; ++k)
+			{
+				const uint32_t q[5] = {o->v_RLC_pos[0][k], o->v_RLC_pos[1][k], o->v_RLC_pos[2][k], (uint32_t)o->v_RLC_dir[k], (uint32_t)r};
+				ri.insert(ri.end(), q, q+5);
+				const FDTD_FLOAT c[8] = {o->v_RLC_i2v[k]*o->v_RLC_ilv[k], o->v_RLC_vvd[k], o->v_RLC_vv2[k], o->v_RLC_vj1[k], o->v_RLC_vj2[k],
+										 o->v_RLC_ib0[k], o->v_RLC_b1[k]*o->v_RLC_ib0[k], o->v_RLC_b2[k]*o->v_RLC_ib0[k]};
+				rc.insert(rc.end(), c, c+8);
+				if (!cells.insert({q[0], q[1], q[2], q[3], q[4]}).second)
+					md.ext.rlcSerial = 1;   // two elements on one cell: the last one's voltage stays, as on the CPU
+			}
+		}
+		md.numRLC = ri.size()/5;
+		std::vector<uint32_t> ro, rl;
+		lists(ri, ro, rl);
+		md.rlcI = buffer(ri.data(), ri.size()*4);
+		md.rlcC = buffer(rc.data(), rc.size()*4);
+		md.rlcS = [md.dev newBufferWithLength:std::max<size_t>(16, (size_t)md.numRLC*5*sizeof(float)) options:MTLResourceStorageModeShared];
+		memset([md.rlcS contents], 0, std::max<size_t>(16, (size_t)md.numRLC*5*sizeof(float)));
+		md.roff = buffer(ro.data(), ro.size()*4);
+		md.rlist = buffer(rl.data(), rl.size()*4);
+		md.apply = buffer(applyOrder.data(), applyOrder.size()*4);
+
 		if (g_settings.GetVerboseLevel()>0)
 			cout << "Engine_Metal_Diamond: K=" << md.K << ", tiles " << M << "," << Vw << " (x " << md.numTiles[0] << "+" << md.numTiles[1]
 				 << ", y " << md.numTiles[2] << "+" << md.numTiles[3] << "), " << md.tg << " threads per tile, " << murs.size()
-				 << " Mur faces, " << md.ext.vcount << "+" << md.ext.ccount << " excitation entries" << endl;
+				 << " Mur faces, " << md.numRLC << " lumped RLC elements, " << md.ext.vcount << "+" << md.ext.ccount << " excitation entries" << endl;
 	}
 	md.gpu = true;
 	return true;
@@ -676,8 +787,8 @@ bool Engine_Metal_Diamond::IterateTS(unsigned int iterTS)
 			[enc setBytes:&md.dims length:sizeof(Dims) atIndex:5];
 			[enc setBytes:&md.ext length:sizeof(Ext) atIndex:9];
 			id<MTLBuffer> ebufs[] = {md.vexc, md.vamp, md.cexc, md.camp, md.vsig, md.csig, md.mf, md.mcoef, md.mscr,
-									 md.voff, md.vlist, md.coff, md.clist};
-			for (int n=0; n<13; ++n)
+									 md.voff, md.vlist, md.coff, md.clist, md.apply, md.rlcI, md.rlcC, md.rlcS, md.roff, md.rlist};
+			for (int n=0; n<19; ++n)
 				[enc setBuffer:ebufs[n] offset:0 atIndex:10+n];
 			unsigned int inCB = 0;
 			while ((done<iterTS) && (inCB<md.batch))
