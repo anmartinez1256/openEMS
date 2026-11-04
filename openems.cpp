@@ -297,7 +297,7 @@ void openEMS::collectCommandLineArguments()
 			"  gpu: \tGPU engine on the best available backend\n"
 			"  gpu-reference: \tGPU engine with the reference backend on the CPU\n"
 #ifdef OPENEMS_WITH_METAL
-			"  metal-diamond: \tdiamond-blocked Metal engine (excitation and Mur on the GPU)\n"
+			"  metal-diamond: \tdiamond-blocked Metal engine (excitation, Mur, lumped RLC, UPML, Lorentz/Drude/Debye on the GPU)\n"
 #endif
 		)
 		(

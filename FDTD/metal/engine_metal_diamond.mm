@@ -614,14 +614,19 @@ struct Engine_Metal_Diamond::State
 	Dims dims = {0, 0, 0, 0};
 	Ext ext = {};
 	unsigned int K = 4, tg = 0, batch = 64;
-	double setupSec = 0, runSec = 0;   // OPENEMS_DIAMOND_TIMING=1 prints them at the end
-	unsigned long long steps = 0;
+	// OPENEMS_DIAMOND_TIMING=1 prints these at the end: setup and IterateTS wall times, the calls, the GPU time of the
+	// command buffers (busy) and from the first start to the last end of each call (span); =2 also commits every phase
+	// dispatch in a command buffer of its own and adds the GPU time per phase (MM, MV, VM, VV; slower, for the split)
+	unsigned int timing = 0;
+	double setupSec = 0, runSec = 0, gpuBusy = 0, gpuSpan = 0, phaseSec[4] = {0, 0, 0, 0};
+	unsigned long long steps = 0, calls = 0, cbs = 0;
 };
 
 Operator_Metal_Diamond* Operator_Metal_Diamond::New()
 {
-	cout << "Create FDTD operator (compressed SSE, for the Metal diamond engine)" << endl;
+	cout << "Create FDTD operator (compressed SSE, multithreaded setup, for the Metal diamond engine)" << endl;
 	Operator_Metal_Diamond* op = new Operator_Metal_Diamond();
+	op->setNumThreads(0);   // CalcECOperator sizes the setup pool itself (every core); the engine has no CPU threads
 	op->Init();
 	return op;
 }
@@ -653,9 +658,17 @@ Engine_Metal_Diamond::Engine_Metal_Diamond(const Operator_SSE_Compressed* op) : 
 
 Engine_Metal_Diamond::~Engine_Metal_Diamond()
 {
-	if (m_md && m_md->gpu && EnvFlag("OPENEMS_DIAMOND_TIMING"))
-		cout << "Engine_Metal_Diamond: setup " << m_md->setupSec << " s, " << m_md->steps << " timesteps in " << m_md->runSec << " s = "
-			 << (m_md->runSec>0 ? 1e-6*m_md->steps*numLines[0]*numLines[1]*numLines[2]/m_md->runSec : 0) << " MC/s on the GPU" << endl;
+	if (m_md && m_md->gpu && m_md->timing)
+	{
+		const State& md = *m_md;
+		cout << "Engine_Metal_Diamond: setup " << md.setupSec << " s, " << md.steps << " timesteps in " << md.runSec << " s = "
+			 << (md.runSec>0 ? 1e-6*md.steps*numLines[0]*numLines[1]*numLines[2]/md.runSec : 0) << " MC/s on the GPU; "
+			 << md.calls << " IterateTS calls (" << (md.calls ? (double)md.steps/md.calls : 0) << " steps each), " << md.cbs
+			 << " command buffers, GPU busy " << md.gpuBusy << " s, span " << md.gpuSpan << " s";
+		if (md.timing>1)
+			cout << "; per phase MM " << md.phaseSec[0] << " MV " << md.phaseSec[1] << " VM " << md.phaseSec[2] << " VV " << md.phaseSec[3] << " s";
+		cout << endl;
+	}
 	Reset();
 	delete m_md;
 	m_md = NULL;
@@ -893,6 +906,7 @@ bool Engine_Metal_Diamond::SetupGPU()
 		md.tg = std::min<unsigned int>(EnvUInt("OPENEMS_DIAMOND_TG", 0) ? EnvUInt("OPENEMS_DIAMOND_TG", 0) : tgDef,
 									   (unsigned int)md.pso.maxTotalThreadsPerThreadgroup);
 		md.batch = std::max(1u, EnvUInt("OPENEMS_DIAMOND_BATCH", 64));
+		md.timing = EnvUInt("OPENEMS_DIAMOND_TIMING", 0);
 
 		// the extension data in three blobs: read-only words (Ub), read-only floats (Fb) and the state (Sn floats, zero)
 		std::vector<uint32_t> Ub;
@@ -1149,7 +1163,7 @@ bool Engine_Metal_Diamond::SetupGPU()
 
 		if (g_settings.GetVerboseLevel()>0)
 			cout << "Engine_Metal_Diamond: " << numLines[0] << "x" << numLines[1] << "x" << numLines[2] << " cells (" << numVectors
-				 << " z-vectors), K=" << md.K << ", tiles " << M << "," << Vw << " (x " << md.numTiles[0] << "+" << md.numTiles[1]
+				 << " z-vectors, " << numOps << " operators), K=" << md.K << ", tiles " << M << "," << Vw << " (x " << md.numTiles[0] << "+" << md.numTiles[1]
 				 << ", y " << md.numTiles[2] << "+" << md.numTiles[3] << "), " << md.tg << " threads per tile, " << murs.size()
 				 << " Mur faces, " << md.numRLC << " lumped RLC elements, " << upmls.size() << " UPML boxes (" << upmlCells << " cells, "
 				 << utab.size()/6 << " coefficient sets), " << numADE << " dispersive positions, " << md.ext.vcount << "+" << md.ext.ccount << " excitation entries" << endl;
@@ -1171,23 +1185,41 @@ bool Engine_Metal_Diamond::IterateTS(unsigned int iterTS)
 
 	State& md = *m_md;
 	const auto t0 = std::chrono::steady_clock::now();
+	NSMutableArray* timed = md.timing ? [NSMutableArray array] : nil;   // OPENEMS_DIAMOND_TIMING: the command buffers
+	std::vector<int> timedPhase;                                         // and their phase (-1 = several)
 	unsigned int done = 0;
 	while (done<iterTS)
 	{
 		@autoreleasepool
 		{
-			id<MTLCommandBuffer> cb = [md.queue commandBuffer];
-			id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
-			[enc setComputePipelineState:md.pso];
-			id<MTLBuffer> bufs[] = {md.volt, md.curr, md.pv, md.pi, md.opi};
-			for (int n=0; n<5; ++n)
-				[enc setBuffer:bufs[n] offset:0 atIndex:n];
-			[enc setBytes:&md.dims length:sizeof(Dims) atIndex:5];
-			[enc setBytes:&md.ext length:sizeof(Ext) atIndex:9];
-			[enc setBuffer:md.U offset:0 atIndex:10];
-			[enc setBuffer:md.Fc offset:0 atIndex:11];
-			[enc setBuffer:md.St offset:0 atIndex:12];
-			[enc setBytes:&md.ofs length:sizeof(Ofs) atIndex:13];
+			id<MTLCommandBuffer> cb = nil;
+			id<MTLComputeCommandEncoder> enc = nil;
+			auto begin = [&]()
+			{
+				cb = [md.queue commandBuffer];
+				enc = [cb computeCommandEncoder];
+				[enc setComputePipelineState:md.pso];
+				id<MTLBuffer> bufs[] = {md.volt, md.curr, md.pv, md.pi, md.opi};
+				for (int n=0; n<5; ++n)
+					[enc setBuffer:bufs[n] offset:0 atIndex:n];
+				[enc setBytes:&md.dims length:sizeof(Dims) atIndex:5];
+				[enc setBytes:&md.ext length:sizeof(Ext) atIndex:9];
+				[enc setBuffer:md.U offset:0 atIndex:10];
+				[enc setBuffer:md.Fc offset:0 atIndex:11];
+				[enc setBuffer:md.St offset:0 atIndex:12];
+				[enc setBytes:&md.ofs length:sizeof(Ofs) atIndex:13];
+			};
+			auto end = [&](int ph)
+			{
+				[enc endEncoding];
+				[cb commit];
+				if (timed)
+				{
+					[timed addObject:cb];
+					timedPhase.push_back(ph);
+				}
+			};
+			begin();
 			unsigned int inCB = 0;
 			while ((done<iterTS) && (inCB<md.batch))
 			{
@@ -1203,12 +1235,16 @@ bool Engine_Metal_Diamond::IterateTS(unsigned int iterTS)
 					[enc setBytes:&p length:sizeof(Phase) atIndex:8];
 					[enc dispatchThreadgroups:MTLSizeMake(md.numTiles[xt], md.numTiles[2+yt], 1)
 						threadsPerThreadgroup:MTLSizeMake(md.tg, 1, 1)];
+					if (md.timing>1)
+					{
+						end(ph);
+						begin();
+					}
 				}
 				done += depth;
 				inCB += depth;
 			}
-			[enc endEncoding];
-			[cb commit];
+			end(-1);
 			if (done>=iterTS)
 			{
 				[cb waitUntilCompleted];
@@ -1220,5 +1256,23 @@ bool Engine_Metal_Diamond::IterateTS(unsigned int iterTS)
 	numTS += iterTS;
 	md.runSec += std::chrono::duration<double>(std::chrono::steady_clock::now()-t0).count();
 	md.steps += iterTS;
+	if (timed && (timed.count>0))
+	{
+		double first = 0, last = 0;
+		for (NSUInteger n=0; n<timed.count; ++n)
+		{
+			id<MTLCommandBuffer> b = timed[n];
+			[b waitUntilCompleted];   // done already (one queue, in order)
+			const double g = b.GPUEndTime - b.GPUStartTime;
+			md.gpuBusy += g;
+			if (timedPhase[n]>=0)
+				md.phaseSec[timedPhase[n]] += g;
+			first = (n==0) ? b.GPUStartTime : std::min(first, b.GPUStartTime);
+			last = std::max(last, b.GPUEndTime);
+		}
+		md.gpuSpan += last - first;
+		md.cbs += timed.count;
+	}
+	++md.calls;
 	return true;
 }
