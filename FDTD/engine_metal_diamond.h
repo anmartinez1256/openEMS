@@ -31,8 +31,9 @@
   fma() where clang fuses on arm64 and Metal fast math off, so the fields are bit-identical to the CPU engines when
   those flush subnormals as the GPU does (OPENEMS_FTZ=1).
   The arrays use the N-I-J-K order (components apart), not the I-J-K-N order of the CPU engines.
-  Extensions done on the GPU: excitation (voltage and current), Mur ABC, lumped RLC, UPML. With any other extension each
-  timestep runs the (generic) CPU loops of Engine_SSE_Compressed on the same memory.
+  Extensions done on the GPU: excitation (voltage and current), Mur ABC, lumped RLC, UPML, Drude/Lorentz materials
+  (conducting sheets). With any other extension each timestep runs the (generic) CPU loops of Engine_SSE_Compressed
+  on the same memory.
   Knobs: OPENEMS_DIAMOND_K (timesteps per tile, default 4), OPENEMS_DIAMOND_TILE=M,V or M:V (mountain and valley widths in
   cells, default 2K,2K), OPENEMS_DIAMOND_TG (threads per threadgroup, default from the tile size, 256-1024),
   OPENEMS_DIAMOND_BATCH (timesteps per command buffer, default 64).

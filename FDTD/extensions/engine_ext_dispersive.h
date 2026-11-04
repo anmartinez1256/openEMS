@@ -28,6 +28,7 @@ class Operator_Ext_Dispersive;
 
 class Engine_Ext_Dispersive : public Engine_Extension
 {
+	friend class Engine_Metal_Diamond;
 public:
 	Engine_Ext_Dispersive(Operator_Ext_Dispersive* op_ext_disp);
 	virtual ~Engine_Ext_Dispersive();

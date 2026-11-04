@@ -31,6 +31,8 @@
 #include "FDTD/extensions/operator_ext_lumpedRLC.h"
 #include "FDTD/extensions/engine_ext_upml.h"
 #include "FDTD/extensions/operator_ext_upml.h"
+#include "FDTD/extensions/engine_ext_lorentzmaterial.h"
+#include "FDTD/extensions/operator_ext_lorentzmaterial.h"
 #include "FDTD/excitation.h"
 #include "tools/useful.h"
 #include "tools/global.h"
@@ -43,6 +45,7 @@
 #include <cstdlib>
 #include <iostream>
 #include <stdexcept>
+#include <typeinfo>
 #include <vector>
 
 using std::cout;
@@ -60,13 +63,13 @@ using namespace metal;
 
 struct Dims { uint nx, ny, nz, nv; };
 struct Phase { uint depth, ts0, xtype, ytype, lbase, nty; }; // type 0 = mountain, 1 = valley; lbase, nty: entry lists
-struct Ext { uint vcount, ccount, length, period0, numMur, numApply, rlcSerial, numUpml; }; // period0: 0 = no signal period
+struct Ext { uint vcount, ccount, length, period0, numMur, numApply, rlcSerial, numUpml, adeSerial; }; // period0: 0 = no signal period
 struct MurFace { uint ny, nyP, nyPP, line, shift, n1, startTS, coef, size; };
 struct Upml { uint x0, y0, z0, nx, ny, nz, cidx, flux; };   // box start and lines, coefficient index (U), flux (St)
 // where the extension data sit in the read-only words (U), the read-only floats (Fc) and the state (St)
-struct Ofs { uint vexc, voff, vlist, cexc, coff, clist, mf, apply, rlcI, roff, rlist, upml;   // U
-             uint vamp, camp, vsig, csig, mcoef, rlcC, ucoef;                                // Fc
-             uint mscr, rlcS; };                                                             // St
+struct Ofs { uint vexc, voff, vlist, cexc, coff, clist, mf, apply, rlcI, roff, rlist, upml, adeE, adeG, adeX, aoff, alist;  // U
+             uint vamp, camp, vsig, csig, mcoef, rlcC, ucoef, adeC;                                           // Fc
+             uint mscr, rlcS, adeS; };                                                                        // St
 
 // the f4vector of component n at (x, y, zv) in the N-I-J-K layout, and the float of cell z (z = lane*nv + zv)
 inline uint I(uint n, uint x, uint y, uint zv, constant Dims& d) { return ((n*d.nx + x)*d.ny + y)*d.nv + zv; }
@@ -240,6 +243,65 @@ inline void upmlStage(uint stage, bool eStep, device const Upml& u, device float
     }
 }
 
+// Engine_Ext_LorentzMaterial (Drude/Lorentz materials, conducting sheets) for the positions in this tile. Groups = (extension,
+// order), flags: 1 voltage ADE, 2 current ADE, 4 voltage Lorentz term, 8 current Lorentz term. Element: x, y, z, group;
+// coefficients v_int, v_ext, v_Lor, i_int, i_ext, i_Lor [3] each; state: volt ADE, volt Lorentz, curr ADE, curr Lorentz [3].
+// Pre (DoPre*UpdatesLines, before the update; reads the field only): Lor += v_Lor*ADE one fmadd, ADE *= v_int, then
+// ADE += v_ext*(f - Lor) one fmadd (two statements: not contracted across them).
+inline void adePre(bool eStep, device const float* Fd, device const uint* el, device const uint* grp, device const float* ac,
+                   device float* as, device const uint* off, device const uint* list, uint li, int2 sx, int2 sy,
+                   constant Dims& d, uint tid, uint tgs)
+{
+    const uint l0 = off[li], cnt = 3*(off[li+1] - l0);
+    for (uint i = tid; i < cnt; i += tgs)
+    {
+        const uint k = list[l0 + i/3], n = i % 3;
+        device const uint* q = el + 4*k;
+        const int x = int(q[0]), y = int(q[1]);
+        if (x < sx.x || x >= sx.y || y < sy.x || y >= sy.y) continue;
+        const uint g = grp[q[3]];
+        if ((g & (eStep ? 1u : 2u)) == 0) continue;
+        device const float* c = ac + 18*k + (eStep ? 0 : 9);
+        device float* st = as + 12*k + (eStep ? 0 : 6);
+        const float f = Fd[F(n, uint(x), uint(y), q[2], d)];
+        if (g & (eStep ? 4u : 8u))
+        {
+            st[3+n] = fma(c[6+n], st[n], st[3+n]);
+            st[n] = st[n] * c[n];
+            st[n] = fma(c[3+n], f - st[3+n], st[n]);
+        }
+        else
+        {
+            st[n] = st[n] * c[n];
+            st[n] = fma(c[3+n], f, st[n]);
+        }
+    }
+}
+
+// Engine_Ext_Dispersive::Apply2*Lines: field -= ADE, the orders of extension x one after the other (a position may have
+// several); one thread in list order when a position repeats within an order
+inline void adeApply(bool eStep, uint x, device float* Fd, device const uint* el, device const uint* grp,
+                     device const uint* gx, device const float* as, device const uint* off, device const uint* list,
+                     uint li, int2 sx, int2 sy, constant Dims& d, uint tid, uint tgs, bool serial)
+{
+    const uint l0 = off[li], cnt = 3*(off[li+1] - l0);
+    for (uint g = gx[2*x]; g < gx[2*x+1]; ++g)
+    {
+        if (grp[g] & (eStep ? 1u : 2u))
+            for (uint i = serial ? (tid == 0 ? 0 : cnt) : tid; i < cnt; i += serial ? 1 : tgs)
+            {
+                const uint k = list[l0 + i/3], n = i % 3;
+                device const uint* q = el + 4*k;
+                if (q[3] != g) continue;
+                const int px = int(q[0]), py = int(q[1]);
+                if (px < sx.x || px >= sx.y || py < sy.x || py >= sy.y) continue;
+                const uint fi = F(n, uint(px), uint(py), q[2], d);
+                Fd[fi] = Fd[fi] - as[12*k + (eStep ? 0 : 6) + n];
+            }
+        threadgroup_barrier(mem_flags::mem_device);
+    }
+}
+
 // One threadgroup advances one tile over p.depth timesteps in place, z complete, with a threadgroup barrier between
 // the stages; the extensions run per tile in the CPU engine's order (Pre in reverse extension order, update, Post,
 // Apply in extension order). Metal has 31 buffer slots, so the extension data come in three blobs (U, Fc, St).
@@ -272,8 +334,15 @@ kernel void diamond(device float4* volt [[buffer(0)]], device float4* curr [[buf
     device const float* mcoef = Fc + o.mcoef;
     device const float* rlcC = Fc + o.rlcC;
     device const float* utab = Fc + o.ucoef;
+    device const uint* adeE = U + o.adeE;
+    device const uint* adeG = U + o.adeG;
+    device const uint* adeX = U + o.adeX;
+    device const uint* aoff = U + o.aoff;
+    device const uint* alist = U + o.alist;
+    device const float* adeC = Fc + o.adeC;
     device float* mscr = St + o.mscr;
     device float* rlcS = St + o.rlcS;
+    device float* adeS = St + o.adeS;
     const uint tgs = tptg.x;
     const int2 rx = xr[tg.x], ry = yr[tg.y];
     device float* E = (device float*)volt;
@@ -291,6 +360,10 @@ kernel void diamond(device float4* volt [[buffer(0)]], device float4* curr [[buf
 #if DIAMOND_RLC
         rlc = eStep && roff[li+1] > roff[li];
 #endif
+        bool ade = false;   // Drude/Lorentz positions (conducting sheets) in this tile
+#if DIAMOND_ADE
+        ade = aoff[li+1] > aoff[li];
+#endif
         uint mur = 0;   // the active Mur faces with cells in this tile
 #if DIAMOND_MUR
         if (eStep)
@@ -302,13 +375,19 @@ kernel void diamond(device float4* volt [[buffer(0)]], device float4* curr [[buf
                 if (mf[f].ny == 1 && (L < sy.x || L >= sy.y)) continue;
                 mur |= 1u << f;
             }
-        if (mur)
+#endif
+        if (mur || ade)
         {
+            // the Pre stages that only read the field (Mur, Drude/Lorentz) run before the UPML's, which writes it
+#if DIAMOND_MUR
             for (uint f = 0; f < e.numMur; ++f)
                 if (mur & (1u << f)) murStage(0, mf[f], E, mcoef, mscr, sx, sy, d, tid, tgs);
+#endif
+#if DIAMOND_ADE
+            if (ade) adePre(eStep, eStep ? E : H, adeE, adeG, adeC, adeS, aoff, alist, li, sx, sy, d, tid, tgs);
+#endif
             threadgroup_barrier(mem_flags::mem_device);
         }
-#endif
         uint upml = 0;   // the UPML boxes with cells in this tile (the boxes do not overlap: one barrier per stage)
 #if DIAMOND_UPML
         for (uint u = 0; u < e.numUpml; ++u)
@@ -346,9 +425,10 @@ kernel void diamond(device float4* volt [[buffer(0)]], device float4* curr [[buf
             threadgroup_barrier(mem_flags::mem_device);
         }
 #endif
-        if (mur || rlc)
-            // Apply in the engine's extension order (kind << 16 | index; 0 = Mur face, 1 = lumped RLC), one after
-            // the other: Mur faces share their edge cells, an element may sit on a face
+        if (mur || rlc || ade)
+            // Apply in the engine's extension order (kind << 16 | index; 0 = Mur face, 1 = lumped RLC, 2 = Drude/Lorentz),
+            // one after the other: Mur faces share their edge cells, an element may sit on a face; in the H step only the
+            // Drude/Lorentz currents
             for (uint a = 0; a < e.numApply; ++a)
             {
                 const uint idx = apply[a] & 0xffffu;
@@ -360,6 +440,12 @@ kernel void diamond(device float4* volt [[buffer(0)]], device float4* curr [[buf
                         murStage(2, mf[idx], E, mcoef, mscr, sx, sy, d, tid, tgs);
                         threadgroup_barrier(mem_flags::mem_device);
                     }
+#endif
+                }
+                else if ((apply[a] >> 16) == 2)
+                {
+#if DIAMOND_ADE
+                    if (ade) adeApply(eStep, idx, eStep ? E : H, adeE, adeG, adeX, adeS, aoff, alist, li, sx, sy, d, tid, tgs, e.adeSerial != 0);
 #endif
                 }
                 else if (rlc)
@@ -404,12 +490,12 @@ kernel void diamond(device float4* volt [[buffer(0)]], device float4* curr [[buf
 
 struct Dims { uint32_t nx, ny, nz, nv; };
 struct Phase { uint32_t depth, ts0, xtype, ytype, lbase, nty; };
-struct Ext { uint32_t vcount, ccount, length, period0, numMur, numApply, rlcSerial, numUpml; };
+struct Ext { uint32_t vcount, ccount, length, period0, numMur, numApply, rlcSerial, numUpml, adeSerial; };
 struct MurFace { uint32_t ny, nyP, nyPP, line, shift, n1, startTS, coef, size; };
 struct Upml { uint32_t x0, y0, z0, nx, ny, nz, cidx, flux; };
-struct Ofs { uint32_t vexc, voff, vlist, cexc, coff, clist, mf, apply, rlcI, roff, rlist, upml;
-			 uint32_t vamp, camp, vsig, csig, mcoef, rlcC, ucoef;
-			 uint32_t mscr, rlcS; };
+struct Ofs { uint32_t vexc, voff, vlist, cexc, coff, clist, mf, apply, rlcI, roff, rlist, upml, adeE, adeG, adeX, aoff, alist;
+			 uint32_t vamp, camp, vsig, csig, mcoef, rlcC, ucoef, adeC;
+			 uint32_t mscr, rlcS, adeS; };
 
 unsigned int EnvUInt(const char* name, unsigned int def)
 {
@@ -583,11 +669,13 @@ bool Engine_Metal_Diamond::SetupGPU()
 		return false;
 	}
 
-	// the extensions: UPML, excitation, Mur and lumped RLC on the GPU, in the engine's extension order (by priority:
-	// UPML first, Mur and RLC with the same priority, the excitation last); Apply order = that order
+	// the extensions: UPML, excitation, Mur, lumped RLC and Drude/Lorentz materials (conducting sheets) on the GPU, in the
+	// engine's extension order (by priority: UPML first, Mur, RLC and Drude/Lorentz with the same priority, the excitation
+	// last); Apply order = that order. Drude/Lorentz only as Engine_Ext_LorentzMaterial itself (not a subclass).
 	std::vector<Engine_Ext_UPML*> upmls;
 	std::vector<Engine_Ext_Mur_ABC*> murs;
 	std::vector<Engine_Ext_LumpedRLC*> rlcs;
+	std::vector<Engine_Ext_LorentzMaterial*> lors;
 	std::vector<uint32_t> applyOrder;
 	bool excSeen = false;
 	for (size_t n=0; n<m_Eng_exts.size(); ++n)
@@ -599,7 +687,7 @@ bool Engine_Metal_Diamond::SetupGPU()
 			continue;
 		}
 		Engine_Ext_UPML* upml = dynamic_cast<Engine_Ext_UPML*>(ext);
-		if (upml && !excSeen && murs.empty() && rlcs.empty())
+		if (upml && !excSeen && murs.empty() && rlcs.empty() && lors.empty())
 		{
 			const Operator_Ext_UPML* o = upml->m_Op_UPML;
 			if (o->m_numLines[0] && o->m_numLines[1] && o->m_numLines[2])
@@ -611,6 +699,12 @@ bool Engine_Metal_Diamond::SetupGPU()
 		{
 			applyOrder.push_back(murs.size());
 			murs.push_back(mur);
+			continue;
+		}
+		if ((typeid(*ext)==typeid(Engine_Ext_LorentzMaterial)) && !excSeen)
+		{
+			applyOrder.push_back((2u<<16) | lors.size());
+			lors.push_back(static_cast<Engine_Ext_LorentzMaterial*>(ext));
 			continue;
 		}
 		Engine_Ext_LumpedRLC* rlc = dynamic_cast<Engine_Ext_LumpedRLC*>(ext);
@@ -626,7 +720,7 @@ bool Engine_Metal_Diamond::SetupGPU()
 		cerr << "Engine_Metal_Diamond: the extension \"" << ext->GetExtensionName() << "\" has no GPU version here, running the CPU loops" << endl;
 		return false;
 	}
-	if ((murs.size()>32) || (rlcs.size()>0xffff) || (upmls.size()>32))
+	if ((murs.size()>32) || (rlcs.size()>0xffff) || (upmls.size()>32) || (lors.size()>0xffff))
 		return false;
 	// the kernel runs each UPML stage of all boxes of a tile without a barrier between them: the boxes must not overlap
 	// (Create_UPML leaves out the edges and corners another box has)
@@ -665,7 +759,8 @@ bool Engine_Metal_Diamond::SetupGPU()
 		options.preprocessorMacros = @{@"DIAMOND_MUR": @(murs.empty() ? 0 : 1),
 									   @"DIAMOND_EXC": @((excSeen && Op->GetExcitationExtension()) ? 1 : 0),
 									   @"DIAMOND_RLC": @(rlcs.empty() ? 0 : 1),
-									   @"DIAMOND_UPML": @(upmls.empty() ? 0 : 1)};
+									   @"DIAMOND_UPML": @(upmls.empty() ? 0 : 1),
+									   @"DIAMOND_ADE": @(lors.empty() ? 0 : 1)};
 		id<MTLLibrary> lib = [md.dev newLibraryWithSource:[NSString stringWithUTF8String:DIAMOND_SOURCE] options:options error:&error];
 		if (lib==nil)
 		{
@@ -782,9 +877,9 @@ bool Engine_Metal_Diamond::SetupGPU()
 		}
 		// per tile of each phase, the entries inside the union of its ranges (a mountain stays in [lo, hi), a valley in
 		// [lo-K, hi+K)), in entry order
-		auto lists = [&](const std::vector<uint32_t>& ent, std::vector<uint32_t>& off, std::vector<uint32_t>& list)
+		auto lists = [&](const std::vector<uint32_t>& ent, size_t stride, std::vector<uint32_t>& off, std::vector<uint32_t>& list)
 		{
-			const size_t count = ent.size()/5;
+			const size_t count = ent.size()/stride;
 			off.assign(1, 0);
 			list.clear();
 			for (int ph=0; ph<4; ++ph)
@@ -799,7 +894,7 @@ bool Engine_Metal_Diamond::SetupGPU()
 						const int y0 = t[2+yt][2*ty] - (yt ? (int)md.K : 0), y1 = t[2+yt][2*ty+1] + (yt ? (int)md.K : 0);
 						for (size_t k=0; k<count; ++k)
 						{
-							const int x = ent[5*k], y = ent[5*k+1];
+							const int x = ent[stride*k], y = ent[stride*k+1];
 							if ((x>=x0) && (x<x1) && (y>=y0) && (y<y1))
 								list.push_back(k);
 						}
@@ -809,8 +904,8 @@ bool Engine_Metal_Diamond::SetupGPU()
 			}
 		};
 		std::vector<uint32_t> vo, vl, co, cl;
-		lists(ve, vo, vl);
-		lists(ce, co, cl);
+		lists(ve, 5, vo, vl);
+		lists(ce, 5, co, cl);
 		md.ofs.voff = addU(vo.data(), vo.size());
 		md.ofs.vlist = addU(vl.data(), vl.size());
 		md.ofs.coff = addU(co.data(), co.size());
@@ -855,7 +950,7 @@ bool Engine_Metal_Diamond::SetupGPU()
 		}
 		md.numRLC = ri.size()/5;
 		std::vector<uint32_t> ro, rl;
-		lists(ri, ro, rl);
+		lists(ri, 5, ro, rl);
 		md.ofs.rlcI = addU(ri.data(), ri.size());
 		md.ofs.rlcC = addF(rc.data(), rc.size());
 		md.ofs.rlcS = addS((size_t)md.numRLC*5);
@@ -896,6 +991,62 @@ bool Engine_Metal_Diamond::SetupGPU()
 		md.ofs.upml = addU((const uint32_t*)boxes.data(), boxes.size()*sizeof(Upml)/4);
 		md.ofs.ucoef = addF(utab.data(), utab.size());
 
+		// Drude/Lorentz positions: groups = (extension, order) with their flags, the group range per extension, elements
+		// (x, y, z, group) with 18 coefficients each and a zero state of 12 floats (as the CPU's), per-tile lists
+		std::vector<uint32_t> ae, ag, ax;
+		std::vector<float> acf;
+		for (Engine_Ext_LorentzMaterial* l : lors)
+		{
+			const Operator_Ext_LorentzMaterial* o = l->m_Op_Ext_Lor;
+			ax.push_back(ag.size());
+			for (int ord=0; ord<o->m_Order; ++ord)
+			{
+				const uint32_t g = ag.size();
+				const bool vOn = o->m_volt_ADE_On[ord], cOn = o->m_curr_ADE_On[ord];
+				ag.push_back((vOn ? 1 : 0) | (cOn ? 2 : 0) | ((vOn && o->m_volt_Lor_ADE_On[ord]) ? 4 : 0) | ((cOn && o->m_curr_Lor_ADE_On[ord]) ? 8 : 0));
+				if (!vOn && !cOn)
+					continue;
+				std::set<std::array<uint32_t,3> > cells;
+				for (unsigned int i=0; i<o->m_LM_Count.at(ord); ++i)
+				{
+					const uint32_t q[4] = {o->m_LM_pos[ord][0][i], o->m_LM_pos[ord][1][i], o->m_LM_pos[ord][2][i], g};
+					ae.insert(ae.end(), q, q+4);
+					float c[18] = {};
+					for (int n=0; n<3; ++n)
+					{
+						if (vOn)
+						{
+							c[n] = o->v_int_ADE[ord][n][i];
+							c[3+n] = o->v_ext_ADE[ord][n][i];
+							if (o->m_volt_Lor_ADE_On[ord])
+								c[6+n] = o->v_Lor_ADE[ord][n][i];
+						}
+						if (cOn)
+						{
+							c[9+n] = o->i_int_ADE[ord][n][i];
+							c[12+n] = o->i_ext_ADE[ord][n][i];
+							if (o->m_curr_Lor_ADE_On[ord])
+								c[15+n] = o->i_Lor_ADE[ord][n][i];
+						}
+					}
+					acf.insert(acf.end(), c, c+18);
+					if (!cells.insert({q[0], q[1], q[2]}).second)
+						md.ext.adeSerial = 1;   // a position twice in one order: the CPU's sequence, one thread
+				}
+			}
+			ax.push_back(ag.size());
+		}
+		const size_t numADE = ae.size()/4;
+		std::vector<uint32_t> ao, al;
+		lists(ae, 4, ao, al);
+		md.ofs.adeE = addU(ae.data(), ae.size());
+		md.ofs.adeG = addU(ag.data(), ag.size());
+		md.ofs.adeX = addU(ax.data(), ax.size());
+		md.ofs.aoff = addU(ao.data(), ao.size());
+		md.ofs.alist = addU(al.data(), al.size());
+		md.ofs.adeC = addF(acf.data(), acf.size());
+		md.ofs.adeS = addS(12*numADE);
+
 		if ((Ub.size()>=(1ull<<32)) || (Fb.size()>=(1ull<<32)) || (Sn>=(1ull<<32)))
 		{
 			cerr << "Engine_Metal_Diamond: the extension data exceed 2^32 words, running the CPU loops" << endl;
@@ -916,7 +1067,7 @@ bool Engine_Metal_Diamond::SetupGPU()
 				 << " z-vectors), K=" << md.K << ", tiles " << M << "," << Vw << " (x " << md.numTiles[0] << "+" << md.numTiles[1]
 				 << ", y " << md.numTiles[2] << "+" << md.numTiles[3] << "), " << md.tg << " threads per tile, " << murs.size()
 				 << " Mur faces, " << md.numRLC << " lumped RLC elements, " << upmls.size() << " UPML boxes (" << upmlCells << " cells, "
-				 << utab.size()/6 << " coefficient sets), " << md.ext.vcount << "+" << md.ext.ccount << " excitation entries" << endl;
+				 << utab.size()/6 << " coefficient sets), " << numADE << " Drude/Lorentz positions, " << md.ext.vcount << "+" << md.ext.ccount << " excitation entries" << endl;
 	}
 	md.gpu = true;
 	return true;
