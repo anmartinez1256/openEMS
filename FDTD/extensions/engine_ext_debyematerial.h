@@ -53,6 +53,7 @@ class Operator_Ext_DebyeMaterial;
   */
 class Engine_Ext_DebyeMaterial : public Engine_Ext_Dispersive
 {
+	friend class Engine_Metal_Diamond;
 public:
 	Engine_Ext_DebyeMaterial(Operator_Ext_DebyeMaterial* op_ext_debye);
 	virtual ~Engine_Ext_DebyeMaterial();

@@ -33,6 +33,8 @@
 #include "FDTD/extensions/operator_ext_upml.h"
 #include "FDTD/extensions/engine_ext_lorentzmaterial.h"
 #include "FDTD/extensions/operator_ext_lorentzmaterial.h"
+#include "FDTD/extensions/engine_ext_debyematerial.h"
+#include "FDTD/extensions/operator_ext_debyematerial.h"
 #include "FDTD/excitation.h"
 #include "tools/useful.h"
 #include "tools/global.h"
@@ -243,11 +245,15 @@ inline void upmlStage(uint stage, bool eStep, device const Upml& u, device float
     }
 }
 
-// Engine_Ext_LorentzMaterial (Drude/Lorentz materials, conducting sheets) for the positions in this tile. Groups = (extension,
-// order), flags: 1 voltage ADE, 2 current ADE, 4 voltage Lorentz term, 8 current Lorentz term. Element: x, y, z, group;
-// coefficients v_int, v_ext, v_Lor, i_int, i_ext, i_Lor [3] each; state: volt ADE, volt Lorentz, curr ADE, curr Lorentz [3].
-// Pre (DoPre*UpdatesLines, before the update; reads the field only): Lor += v_Lor*ADE one fmadd, ADE *= v_int, then
-// ADE += v_ext*(f - Lor) one fmadd (two statements: not contracted across them).
+// The dispersive materials for the positions in this tile: Engine_Ext_LorentzMaterial (Drude/Lorentz, conducting sheets)
+// and Engine_Ext_DebyeMaterial. Groups = (extension, order), flags: 1 voltage ADE, 2 current ADE, 4 voltage Lorentz term,
+// 8 current Lorentz term, 16 Debye (poles << 8). Element: x, y, z, group, coefficient offset, state offset.
+// Lorentz coefficients v_int, v_ext, v_Lor, i_int, i_ext, i_Lor [3] each; state: volt ADE, volt Lorentz, curr ADE,
+// curr Lorentz [3]. Pre (DoPre*UpdatesLines, before the update; reads the field only): Lor += v_Lor*ADE one fmadd,
+// ADE *= v_int, then ADE += v_ext*(f - Lor) one fmadd (two statements: not contracted across them).
+// Debye coefficients (v_relax, v_drive)[3] per pole, then v_solve[3]; state: the correction (volt ADE)[3], pre[3], W[pole][3].
+// Pre: W = v_relax*W_old + v_drive*V^n (clang: fma(v_relax, W_old, v_drive*V)), pre += W - W_old; Post (after the update):
+// V = (V_raw - pre)*v_solve, correction = V_raw - V, W += v_drive*V one fmadd.
 inline void adePre(bool eStep, device const float* Fd, device const uint* el, device const uint* grp, device const float* ac,
                    device float* as, device const uint* off, device const uint* list, uint li, int2 sx, int2 sy,
                    constant Dims& d, uint tid, uint tgs)
@@ -256,14 +262,29 @@ inline void adePre(bool eStep, device const float* Fd, device const uint* el, de
     for (uint i = tid; i < cnt; i += tgs)
     {
         const uint k = list[l0 + i/3], n = i % 3;
-        device const uint* q = el + 4*k;
+        device const uint* q = el + 6*k;
         const int x = int(q[0]), y = int(q[1]);
         if (x < sx.x || x >= sx.y || y < sy.x || y >= sy.y) continue;
         const uint g = grp[q[3]];
         if ((g & (eStep ? 1u : 2u)) == 0) continue;
-        device const float* c = ac + 18*k + (eStep ? 0 : 9);
-        device float* st = as + 12*k + (eStep ? 0 : 6);
         const float f = Fd[F(n, uint(x), uint(y), q[2], d)];
+        if (g & 16u)
+        {
+            device const float* c = ac + q[4];
+            device float* st = as + q[5];
+            float pre = 0.0f;
+            for (uint pl = 0; pl < (g >> 8); ++pl)
+            {
+                const float w0 = st[6 + 3*pl + n];
+                const float w = fma(c[6*pl + n], w0, c[6*pl + 3 + n] * f);
+                pre = pre + (w - w0);
+                st[6 + 3*pl + n] = w;
+            }
+            st[3+n] = pre;
+            continue;
+        }
+        device const float* c = ac + q[4] + (eStep ? 0 : 9);
+        device float* st = as + q[5] + (eStep ? 0 : 6);
         if (g & (eStep ? 4u : 8u))
         {
             st[3+n] = fma(c[6+n], st[n], st[3+n]);
@@ -275,6 +296,30 @@ inline void adePre(bool eStep, device const float* Fd, device const uint* el, de
             st[n] = st[n] * c[n];
             st[n] = fma(c[3+n], f, st[n]);
         }
+    }
+}
+
+inline void adePost(device const float* Fd, device const uint* el, device const uint* grp, device const float* ac,
+                    device float* as, device const uint* off, device const uint* list, uint li, int2 sx, int2 sy,
+                    constant Dims& d, uint tid, uint tgs)
+{
+    const uint l0 = off[li], cnt = 3*(off[li+1] - l0);
+    for (uint i = tid; i < cnt; i += tgs)
+    {
+        const uint k = list[l0 + i/3], n = i % 3;
+        device const uint* q = el + 6*k;
+        const uint g = grp[q[3]];
+        if ((g & 16u) == 0) continue;
+        const int x = int(q[0]), y = int(q[1]);
+        if (x < sx.x || x >= sx.y || y < sy.x || y >= sy.y) continue;
+        device const float* c = ac + q[4];
+        device float* st = as + q[5];
+        const uint P = g >> 8;
+        const float vr = Fd[F(n, uint(x), uint(y), q[2], d)];
+        const float v = (vr - st[3+n]) * c[6*P + n];
+        st[n] = vr - v;
+        for (uint pl = 0; pl < P; ++pl)
+            st[6 + 3*pl + n] = fma(c[6*pl + 3 + n], v, st[6 + 3*pl + n]);
     }
 }
 
@@ -291,12 +336,12 @@ inline void adeApply(bool eStep, uint x, device float* Fd, device const uint* el
             for (uint i = serial ? (tid == 0 ? 0 : cnt) : tid; i < cnt; i += serial ? 1 : tgs)
             {
                 const uint k = list[l0 + i/3], n = i % 3;
-                device const uint* q = el + 4*k;
+                device const uint* q = el + 6*k;
                 if (q[3] != g) continue;
                 const int px = int(q[0]), py = int(q[1]);
                 if (px < sx.x || px >= sx.y || py < sy.x || py >= sy.y) continue;
                 const uint fi = F(n, uint(px), uint(py), q[2], d);
-                Fd[fi] = Fd[fi] - as[12*k + (eStep ? 0 : 6) + n];
+                Fd[fi] = Fd[fi] - as[q[5] + (eStep ? 0 : 6) + n];
             }
         threadgroup_barrier(mem_flags::mem_device);
     }
@@ -417,14 +462,21 @@ kernel void diamond(device float4* volt [[buffer(0)]], device float4* curr [[buf
             threadgroup_barrier(mem_flags::mem_device);
         }
 #endif
-#if DIAMOND_MUR
-        if (mur)
+        bool deb = false;   // Debye positions (their Post stage reads the field only, as Mur's)
+#if DIAMOND_DEBYE
+        deb = eStep && ade;
+#endif
+        if (mur || deb)
         {
+#if DIAMOND_MUR
             for (uint f = 0; f < e.numMur; ++f)
                 if (mur & (1u << f)) murStage(1, mf[f], E, mcoef, mscr, sx, sy, d, tid, tgs);
+#endif
+#if DIAMOND_DEBYE
+            if (deb) adePost(E, adeE, adeG, adeC, adeS, aoff, alist, li, sx, sy, d, tid, tgs);
+#endif
             threadgroup_barrier(mem_flags::mem_device);
         }
-#endif
         if (mur || rlc || ade)
             // Apply in the engine's extension order (kind << 16 | index; 0 = Mur face, 1 = lumped RLC, 2 = Drude/Lorentz),
             // one after the other: Mur faces share their edge cells, an element may sit on a face; in the H step only the
@@ -669,13 +721,15 @@ bool Engine_Metal_Diamond::SetupGPU()
 		return false;
 	}
 
-	// the extensions: UPML, excitation, Mur, lumped RLC and Drude/Lorentz materials (conducting sheets) on the GPU, in the
-	// engine's extension order (by priority: UPML first, Mur, RLC and Drude/Lorentz with the same priority, the excitation
-	// last); Apply order = that order. Drude/Lorentz only as Engine_Ext_LorentzMaterial itself (not a subclass).
+	// the extensions: UPML, excitation, Mur, lumped RLC and the dispersive materials (Drude/Lorentz, conducting sheets,
+	// Debye) on the GPU, in the engine's extension order (by priority: UPML first, Mur, RLC and the dispersive ones with the
+	// same priority, the excitation last); Apply order = that order. The dispersive ones only as Engine_Ext_LorentzMaterial
+	// or Engine_Ext_DebyeMaterial themselves (not a subclass).
 	std::vector<Engine_Ext_UPML*> upmls;
 	std::vector<Engine_Ext_Mur_ABC*> murs;
 	std::vector<Engine_Ext_LumpedRLC*> rlcs;
-	std::vector<Engine_Ext_LorentzMaterial*> lors;
+	std::vector<Engine_Extension*> lors;   // Engine_Ext_LorentzMaterial or Engine_Ext_DebyeMaterial
+	bool hasDebye = false;
 	std::vector<uint32_t> applyOrder;
 	bool excSeen = false;
 	for (size_t n=0; n<m_Eng_exts.size(); ++n)
@@ -701,10 +755,11 @@ bool Engine_Metal_Diamond::SetupGPU()
 			murs.push_back(mur);
 			continue;
 		}
-		if ((typeid(*ext)==typeid(Engine_Ext_LorentzMaterial)) && !excSeen)
+		if (((typeid(*ext)==typeid(Engine_Ext_LorentzMaterial)) || (typeid(*ext)==typeid(Engine_Ext_DebyeMaterial))) && !excSeen)
 		{
 			applyOrder.push_back((2u<<16) | lors.size());
-			lors.push_back(static_cast<Engine_Ext_LorentzMaterial*>(ext));
+			lors.push_back(ext);
+			hasDebye |= typeid(*ext)==typeid(Engine_Ext_DebyeMaterial);
 			continue;
 		}
 		Engine_Ext_LumpedRLC* rlc = dynamic_cast<Engine_Ext_LumpedRLC*>(ext);
@@ -760,7 +815,8 @@ bool Engine_Metal_Diamond::SetupGPU()
 									   @"DIAMOND_EXC": @((excSeen && Op->GetExcitationExtension()) ? 1 : 0),
 									   @"DIAMOND_RLC": @(rlcs.empty() ? 0 : 1),
 									   @"DIAMOND_UPML": @(upmls.empty() ? 0 : 1),
-									   @"DIAMOND_ADE": @(lors.empty() ? 0 : 1)};
+									   @"DIAMOND_ADE": @(lors.empty() ? 0 : 1),
+									   @"DIAMOND_DEBYE": @(hasDebye ? 1 : 0)};
 		id<MTLLibrary> lib = [md.dev newLibraryWithSource:[NSString stringWithUTF8String:DIAMOND_SOURCE] options:options error:&error];
 		if (lib==nil)
 		{
@@ -991,14 +1047,42 @@ bool Engine_Metal_Diamond::SetupGPU()
 		md.ofs.upml = addU((const uint32_t*)boxes.data(), boxes.size()*sizeof(Upml)/4);
 		md.ofs.ucoef = addF(utab.data(), utab.size());
 
-		// Drude/Lorentz positions: groups = (extension, order) with their flags, the group range per extension, elements
-		// (x, y, z, group) with 18 coefficients each and a zero state of 12 floats (as the CPU's), per-tile lists
+		// dispersive positions: groups = (extension, order) with their flags, the group range per extension, elements
+		// (x, y, z, group, coefficient offset, state offset); Lorentz: 18 coefficients, 12 state floats; Debye with P poles:
+		// 6P+3 coefficients, 6+3P state floats; the state is zero (as the CPU's); per-tile lists
 		std::vector<uint32_t> ae, ag, ax;
 		std::vector<float> acf;
-		for (Engine_Ext_LorentzMaterial* l : lors)
+		size_t adeState = 0;
+		for (Engine_Extension* l : lors)
 		{
-			const Operator_Ext_LorentzMaterial* o = l->m_Op_Ext_Lor;
 			ax.push_back(ag.size());
+			if (typeid(*l)==typeid(Engine_Ext_DebyeMaterial))
+			{
+				const Operator_Ext_DebyeMaterial* o = static_cast<Engine_Ext_DebyeMaterial*>(l)->m_Op_Ext_Deb;
+				const uint32_t g = ag.size(), P = o->m_PoleCount;
+				ag.push_back(1 | 16 | (P<<8));
+				std::set<std::array<uint32_t,3> > cells;
+				for (unsigned int i=0; i<o->m_LM_Count.at(0); ++i)
+				{
+					const uint32_t q[6] = {o->m_LM_pos[0][0][i], o->m_LM_pos[0][1][i], o->m_LM_pos[0][2][i], g, (uint32_t)acf.size(), (uint32_t)adeState};
+					ae.insert(ae.end(), q, q+6);
+					for (uint32_t pl=0; pl<P; ++pl)
+					{
+						for (int n=0; n<3; ++n)
+							acf.push_back(o->v_relax_ADE[pl][n][i]);
+						for (int n=0; n<3; ++n)
+							acf.push_back(o->v_drive_ADE[pl][n][i]);
+					}
+					for (int n=0; n<3; ++n)
+						acf.push_back(o->v_solve_ADE[n][i]);
+					adeState += 6 + 3*P;
+					if (!cells.insert({q[0], q[1], q[2]}).second)
+						md.ext.adeSerial = 1;
+				}
+				ax.push_back(ag.size());
+				continue;
+			}
+			const Operator_Ext_LorentzMaterial* o = static_cast<Engine_Ext_LorentzMaterial*>(l)->m_Op_Ext_Lor;
 			for (int ord=0; ord<o->m_Order; ++ord)
 			{
 				const uint32_t g = ag.size();
@@ -1009,8 +1093,8 @@ bool Engine_Metal_Diamond::SetupGPU()
 				std::set<std::array<uint32_t,3> > cells;
 				for (unsigned int i=0; i<o->m_LM_Count.at(ord); ++i)
 				{
-					const uint32_t q[4] = {o->m_LM_pos[ord][0][i], o->m_LM_pos[ord][1][i], o->m_LM_pos[ord][2][i], g};
-					ae.insert(ae.end(), q, q+4);
+					const uint32_t q[6] = {o->m_LM_pos[ord][0][i], o->m_LM_pos[ord][1][i], o->m_LM_pos[ord][2][i], g, (uint32_t)acf.size(), (uint32_t)adeState};
+					ae.insert(ae.end(), q, q+6);
 					float c[18] = {};
 					for (int n=0; n<3; ++n)
 					{
@@ -1030,22 +1114,23 @@ bool Engine_Metal_Diamond::SetupGPU()
 						}
 					}
 					acf.insert(acf.end(), c, c+18);
+					adeState += 12;
 					if (!cells.insert({q[0], q[1], q[2]}).second)
 						md.ext.adeSerial = 1;   // a position twice in one order: the CPU's sequence, one thread
 				}
 			}
 			ax.push_back(ag.size());
 		}
-		const size_t numADE = ae.size()/4;
+		const size_t numADE = ae.size()/6;
 		std::vector<uint32_t> ao, al;
-		lists(ae, 4, ao, al);
+		lists(ae, 6, ao, al);
 		md.ofs.adeE = addU(ae.data(), ae.size());
 		md.ofs.adeG = addU(ag.data(), ag.size());
 		md.ofs.adeX = addU(ax.data(), ax.size());
 		md.ofs.aoff = addU(ao.data(), ao.size());
 		md.ofs.alist = addU(al.data(), al.size());
 		md.ofs.adeC = addF(acf.data(), acf.size());
-		md.ofs.adeS = addS(12*numADE);
+		md.ofs.adeS = addS(adeState);
 
 		if ((Ub.size()>=(1ull<<32)) || (Fb.size()>=(1ull<<32)) || (Sn>=(1ull<<32)))
 		{
@@ -1067,7 +1152,7 @@ bool Engine_Metal_Diamond::SetupGPU()
 				 << " z-vectors), K=" << md.K << ", tiles " << M << "," << Vw << " (x " << md.numTiles[0] << "+" << md.numTiles[1]
 				 << ", y " << md.numTiles[2] << "+" << md.numTiles[3] << "), " << md.tg << " threads per tile, " << murs.size()
 				 << " Mur faces, " << md.numRLC << " lumped RLC elements, " << upmls.size() << " UPML boxes (" << upmlCells << " cells, "
-				 << utab.size()/6 << " coefficient sets), " << numADE << " Drude/Lorentz positions, " << md.ext.vcount << "+" << md.ext.ccount << " excitation entries" << endl;
+				 << utab.size()/6 << " coefficient sets), " << numADE << " dispersive positions, " << md.ext.vcount << "+" << md.ext.ccount << " excitation entries" << endl;
 	}
 	md.gpu = true;
 	return true;
