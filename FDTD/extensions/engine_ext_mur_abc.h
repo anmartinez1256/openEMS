@@ -28,6 +28,7 @@ class Operator_Ext_Mur_ABC;
 
 class Engine_Ext_Mur_ABC : public Engine_Extension
 {
+	friend class Engine_Metal_Diamond;
 public:
 	Engine_Ext_Mur_ABC(Operator_Ext_Mur_ABC* op_ext);
 	virtual ~Engine_Ext_Mur_ABC();

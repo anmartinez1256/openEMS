@@ -34,6 +34,7 @@ if(APPLE AND ENABLE_METAL)
     ${CMAKE_CURRENT_SOURCE_DIR}/metal/metal_ext_steadystate.mm
     ${CMAKE_CURRENT_SOURCE_DIR}/metal/metal_ext_cylinder.mm
     ${CMAKE_CURRENT_SOURCE_DIR}/metal/metal_multigrid.mm
+    ${CMAKE_CURRENT_SOURCE_DIR}/metal/engine_metal_diamond.mm
   )
 endif()
 

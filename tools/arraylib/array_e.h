@@ -53,6 +53,22 @@ public:
 	virtual void Init(std::string name, std::array<uint32_t, 3> extent)
 	{
 		Base::Init(name, extent);
+		SetEngineStrides();
+	}
+
+	// Use the external memory at ptr (at least 3*i*j*k elements, e.g. a buffer shared with a GPU) in the engine
+	// ordering, or in N-I-J-K ordering with nijk; the array does not free it. With ptr==NULL, allocate and own the
+	// memory like Init().
+	void InitView(std::string name, std::array<uint32_t, 3> extent, T* ptr, bool nijk=false)
+	{
+		Base::InitView(name, extent, ptr);
+		if (!nijk)
+			SetEngineStrides();
+	}
+
+private:
+	void SetEngineStrides()
+	{
 		// I-J-K-N ordering
 		this->m_stride[0] = 1;
 		this->m_stride[1] = this->m_extent[2] * this->m_extent[3] * this->m_extent[0];

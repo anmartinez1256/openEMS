@@ -26,6 +26,9 @@
 #include "FDTD/engine_multithread.h"
 #include "FDTD/operator_multithread.h"
 #include "FDTD/operator_gpu.h"
+#ifdef OPENEMS_WITH_METAL
+#include "FDTD/engine_metal_diamond.h"
+#endif
 #include "FDTD/extensions/operator_ext_excitation.h"
 #include "FDTD/extensions/operator_ext_tfsf.h"
 #include "FDTD/extensions/operator_ext_mur_abc.h"
@@ -274,6 +277,13 @@ void openEMS::collectCommandLineArguments()
 						cout << "openEMS - enabled GPU engine with the reference backend" << endl;
 						m_engine = EngineType_GPU_Reference;
 					}
+#ifdef OPENEMS_WITH_METAL
+					else if (val == "metal-diamond")
+					{
+						cout << "openEMS - enabled the diamond-blocked Metal engine" << endl;
+						m_engine = EngineType_Metal_Diamond;
+					}
+#endif
 				}
 			),
 		    "Choose engine type \n\n"
@@ -286,6 +296,9 @@ void openEMS::collectCommandLineArguments()
 			"operator + sse vector extensions + multithreading\n"
 			"  gpu: \tGPU engine on the best available backend\n"
 			"  gpu-reference: \tGPU engine with the reference backend on the CPU\n"
+#ifdef OPENEMS_WITH_METAL
+			"  metal-diamond: \tdiamond-blocked Metal engine (excitation and Mur on the GPU)\n"
+#endif
 		)
 		(
 			"numThreads",
@@ -830,6 +843,12 @@ bool openEMS::SetupOperator()
 	{
 		FDTD_Op = Operator_GPU::New(m_engine == EngineType_GPU_Reference ? "reference" : "auto");
 	}
+#ifdef OPENEMS_WITH_METAL
+	else if (m_engine == EngineType_Metal_Diamond)
+	{
+		FDTD_Op = Operator_Metal_Diamond::New();
+	}
+#endif
 	else
 	{
 		FDTD_Op = Operator::New();
