@@ -17,7 +17,7 @@
 
 // Diamond-blocked Metal engine, see engine_metal_diamond.h. The tile schedule follows luikore's Metal engine (openEMS
 // pull request #228, macos/doc/metal-engine.rst, GPL); the kernels are this fork's own (emsKit swift_engine/fdtd.swift
-// moved to the engine's I-J-K-N layout, plus the Mur ABC and the current excitation).
+// moved to the engine's f4vector arrays in N-I-J-K order, plus the current excitation, Mur ABC, lumped RLC and UPML).
 
 #import <Metal/Metal.h>
 #import <Foundation/Foundation.h>
@@ -29,12 +29,15 @@
 #include "FDTD/extensions/operator_ext_mur_abc.h"
 #include "FDTD/extensions/engine_ext_lumpedRLC.h"
 #include "FDTD/extensions/operator_ext_lumpedRLC.h"
+#include "FDTD/extensions/engine_ext_upml.h"
+#include "FDTD/extensions/operator_ext_upml.h"
 #include "FDTD/excitation.h"
 #include "tools/useful.h"
 #include "tools/global.h"
 
 #include <algorithm>
 #include <array>
+#include <map>
 #include <set>
 #include <chrono>
 #include <cstdlib>
@@ -57,8 +60,13 @@ using namespace metal;
 
 struct Dims { uint nx, ny, nz, nv; };
 struct Phase { uint depth, ts0, xtype, ytype, lbase, nty; }; // type 0 = mountain, 1 = valley; lbase, nty: entry lists
-struct Ext { uint vcount, ccount, length, period0, numMur, numApply, rlcSerial; }; // period0: 0 = no signal period
+struct Ext { uint vcount, ccount, length, period0, numMur, numApply, rlcSerial, numUpml; }; // period0: 0 = no signal period
 struct MurFace { uint ny, nyP, nyPP, line, shift, n1, startTS, coef, size; };
+struct Upml { uint x0, y0, z0, nx, ny, nz, cidx, flux; };   // box start and lines, coefficient index (U), flux (St)
+// where the extension data sit in the read-only words (U), the read-only floats (Fc) and the state (St)
+struct Ofs { uint vexc, voff, vlist, cexc, coff, clist, mf, apply, rlcI, roff, rlist, upml;   // U
+             uint vamp, camp, vsig, csig, mcoef, rlcC, ucoef;                                // Fc
+             uint mscr, rlcS; };                                                             // St
 
 // the f4vector of component n at (x, y, zv) in the N-I-J-K layout, and the float of cell z (z = lane*nv + zv)
 inline uint I(uint n, uint x, uint y, uint zv, constant Dims& d) { return ((n*d.nx + x)*d.ny + y)*d.nv + zv; }
@@ -203,26 +211,69 @@ inline void rlcStage(uint stage, uint ext, device float* E, device const uint* r
     }
 }
 
+// Engine_Ext_UPML for the cells of box u inside the tile (the three components, z complete in the box); stage 0
+// before the update, 1 after it; the voltages in the E step, the currents in the H step. Clang's contraction of the
+// CPU expressions: vv*E - vvfo*flux is fma(vv, E, -(vvfo*flux)), flux_old + vvfn*E one fmadd. Coefficient sets:
+// vv vvfo vvfn ii iifo iifn, one index per component and box cell; the flux: voltages, then currents.
+inline void upmlStage(uint stage, bool eStep, device const Upml& u, device float* Fd, device const uint* U,
+                      device const float* tab, device float* St, int2 sx, int2 sy, constant Dims& d, uint tid, uint tgs)
+{
+    const int x0 = max(sx.x, int(u.x0)), x1 = min(sx.y, int(u.x0 + u.nx));
+    const int y0 = max(sy.x, int(u.y0)), y1 = min(sy.y, int(u.y0 + u.ny));
+    if (x1 <= x0 || y1 <= y0) return;
+    const uint wy = uint(y1 - y0), N = u.nx*u.ny*u.nz;
+    const uint count = uint(x1 - x0) * wy * 3 * u.nz;
+    device float* flux = St + u.flux + (eStep ? 0 : 3*N);
+    const uint co = eStep ? 0 : 3;
+    for (uint i = tid; i < count; i += tgs)
+    {
+        const uint lz = i % u.nz;
+        uint r = i / u.nz;
+        const uint n = r % 3;
+        r /= 3;
+        const uint y = uint(y0) + r % wy, x = uint(x0) + r / wy;
+        const uint c = ((n*u.nx + (x - u.x0))*u.ny + (y - u.y0))*u.nz + lz;
+        device const float* t = tab + 6*U[u.cidx + c] + co;
+        const uint fi = F(n, x, y, u.z0 + lz, d);
+        if (stage == 0) { const float h = fma(t[0], Fd[fi], -(t[1]*flux[c])); Fd[fi] = flux[c]; flux[c] = h; }
+        else            { const float h = flux[c]; flux[c] = Fd[fi]; Fd[fi] = fma(t[2], flux[c], h); }
+    }
+}
+
 // One threadgroup advances one tile over p.depth timesteps in place, z complete, with a threadgroup barrier between
-// the stages; the extensions run per tile in the CPU engine's order (Pre, update, Post, Apply in extension order).
+// the stages; the extensions run per tile in the CPU engine's order (Pre in reverse extension order, update, Post,
+// Apply in extension order). Metal has 31 buffer slots, so the extension data come in three blobs (U, Fc, St).
 kernel void diamond(device float4* volt [[buffer(0)]], device float4* curr [[buffer(1)]],
                     device const float4* pv [[buffer(2)]], device const float4* pi [[buffer(3)]],
                     device const uint* opi [[buffer(4)]], constant Dims& d [[buffer(5)]],
                     device const int2* xr [[buffer(6)]], device const int2* yr [[buffer(7)]],
                     constant Phase& p [[buffer(8)]], constant Ext& e [[buffer(9)]],
-                    device const uint* vexc [[buffer(10)]], device const float* vamp [[buffer(11)]],
-                    device const uint* cexc [[buffer(12)]], device const float* camp [[buffer(13)]],
-                    device const float* vsig [[buffer(14)]], device const float* csig [[buffer(15)]],
-                    device const MurFace* mf [[buffer(16)]], device const float* mcoef [[buffer(17)]],
-                    device float* mscr [[buffer(18)]],
-                    device const uint* voff [[buffer(19)]], device const uint* vlist [[buffer(20)]],
-                    device const uint* coff [[buffer(21)]], device const uint* clist [[buffer(22)]],
-                    device const uint* apply [[buffer(23)]], device const uint* rlcI [[buffer(24)]],
-                    device const float* rlcC [[buffer(25)]], device float* rlcS [[buffer(26)]],
-                    device const uint* roff [[buffer(27)]], device const uint* rlist [[buffer(28)]],
+                    device const uint* U [[buffer(10)]], device const float* Fc [[buffer(11)]],
+                    device float* St [[buffer(12)]], constant Ofs& o [[buffer(13)]],
                     uint3 tg [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]],
                     uint3 tptg [[threads_per_threadgroup]])
 {
+    device const uint* vexc = U + o.vexc;
+    device const uint* voff = U + o.voff;
+    device const uint* vlist = U + o.vlist;
+    device const uint* cexc = U + o.cexc;
+    device const uint* coff = U + o.coff;
+    device const uint* clist = U + o.clist;
+    device const MurFace* mf = (device const MurFace*)(U + o.mf);
+    device const uint* apply = U + o.apply;
+    device const uint* rlcI = U + o.rlcI;
+    device const uint* roff = U + o.roff;
+    device const uint* rlist = U + o.rlist;
+    device const Upml* up = (device const Upml*)(U + o.upml);
+    device const float* vamp = Fc + o.vamp;
+    device const float* camp = Fc + o.camp;
+    device const float* vsig = Fc + o.vsig;
+    device const float* csig = Fc + o.csig;
+    device const float* mcoef = Fc + o.mcoef;
+    device const float* rlcC = Fc + o.rlcC;
+    device const float* utab = Fc + o.ucoef;
+    device float* mscr = St + o.mscr;
+    device float* rlcS = St + o.rlcS;
     const uint tgs = tptg.x;
     const int2 rx = xr[tg.x], ry = yr[tg.y];
     device float* E = (device float*)volt;
@@ -258,6 +309,18 @@ kernel void diamond(device float4* volt [[buffer(0)]], device float4* curr [[buf
             threadgroup_barrier(mem_flags::mem_device);
         }
 #endif
+        uint upml = 0;   // the UPML boxes with cells in this tile (the boxes do not overlap: one barrier per stage)
+#if DIAMOND_UPML
+        for (uint u = 0; u < e.numUpml; ++u)
+            if (int(up[u].x0) < sx.y && int(up[u].x0 + up[u].nx) > sx.x && int(up[u].y0) < sy.y && int(up[u].y0 + up[u].ny) > sy.x)
+                upml |= 1u << u;
+        if (upml)
+        {
+            for (uint u = e.numUpml; u-- > 0; )
+                if (upml & (1u << u)) upmlStage(0, eStep, up[u], eStep ? E : H, U, utab, St, sx, sy, d, tid, tgs);
+            threadgroup_barrier(mem_flags::mem_device);
+        }
+#endif
         const uint count = uint(wx) * uint(wy) * d.nv;
         for (uint i = tid; i < count; i += tgs)
         {
@@ -267,6 +330,14 @@ kernel void diamond(device float4* volt [[buffer(0)]], device float4* curr [[buf
             else if (x + 1 < d.nx && y + 1 < d.ny) cellI(curr, volt, pi, opi, d, x, y, zv);
         }
         threadgroup_barrier(mem_flags::mem_device);
+#if DIAMOND_UPML
+        if (upml)
+        {
+            for (uint u = 0; u < e.numUpml; ++u)
+                if (upml & (1u << u)) upmlStage(1, eStep, up[u], eStep ? E : H, U, utab, St, sx, sy, d, tid, tgs);
+            threadgroup_barrier(mem_flags::mem_device);
+        }
+#endif
 #if DIAMOND_MUR
         if (mur)
         {
@@ -333,8 +404,12 @@ kernel void diamond(device float4* volt [[buffer(0)]], device float4* curr [[buf
 
 struct Dims { uint32_t nx, ny, nz, nv; };
 struct Phase { uint32_t depth, ts0, xtype, ytype, lbase, nty; };
-struct Ext { uint32_t vcount, ccount, length, period0, numMur, numApply, rlcSerial; };
+struct Ext { uint32_t vcount, ccount, length, period0, numMur, numApply, rlcSerial, numUpml; };
 struct MurFace { uint32_t ny, nyP, nyPP, line, shift, n1, startTS, coef, size; };
+struct Upml { uint32_t x0, y0, z0, nx, ny, nz, cidx, flux; };
+struct Ofs { uint32_t vexc, voff, vlist, cexc, coff, clist, mf, apply, rlcI, roff, rlist, upml;
+			 uint32_t vamp, camp, vsig, csig, mcoef, rlcC, ucoef;
+			 uint32_t mscr, rlcS; };
 
 unsigned int EnvUInt(const char* name, unsigned int def)
 {
@@ -394,14 +469,12 @@ struct Engine_Metal_Diamond::State
 	id<MTLBuffer> pv = nil, pi = nil, opi = nil;
 	id<MTLBuffer> tiles[4] = {nil, nil, nil, nil};   // x mountains, x valleys, y mountains, y valleys
 	unsigned int numTiles[4] = {0, 0, 0, 0};
-	id<MTLBuffer> vexc = nil, vamp = nil, cexc = nil, camp = nil, vsig = nil, csig = nil;
-	id<MTLBuffer> mf = nil, mcoef = nil, mscr = nil;
-	id<MTLBuffer> voff = nil, vlist = nil, coff = nil, clist = nil;   // excitation entries per tile, [phase][tx][ty]
-	id<MTLBuffer> apply = nil, rlcI = nil, rlcC = nil, rlcS = nil, roff = nil, rlist = nil;   // Apply order, lumped RLC
+	id<MTLBuffer> U = nil, Fc = nil, St = nil;   // the extension data: read-only words, read-only floats, state
+	Ofs ofs = {};
 	unsigned int numRLC = 0;
 	unsigned int lbase[4] = {0, 0, 0, 0};
 	Dims dims = {0, 0, 0, 0};
-	Ext ext = {0, 0, 0, 0, 0};
+	Ext ext = {};
 	unsigned int K = 4, tg = 0, batch = 64;
 	double setupSec = 0, runSec = 0;   // OPENEMS_DIAMOND_TIMING=1 prints them at the end
 	unsigned long long steps = 0;
@@ -510,8 +583,9 @@ bool Engine_Metal_Diamond::SetupGPU()
 		return false;
 	}
 
-	// the extensions: excitation, Mur and lumped RLC on the GPU; Apply order = the engine's extension order (Mur and
-	// RLC have the same priority, the excitation comes last)
+	// the extensions: UPML, excitation, Mur and lumped RLC on the GPU, in the engine's extension order (by priority:
+	// UPML first, Mur and RLC with the same priority, the excitation last); Apply order = that order
+	std::vector<Engine_Ext_UPML*> upmls;
 	std::vector<Engine_Ext_Mur_ABC*> murs;
 	std::vector<Engine_Ext_LumpedRLC*> rlcs;
 	std::vector<uint32_t> applyOrder;
@@ -522,6 +596,14 @@ bool Engine_Metal_Diamond::SetupGPU()
 		if (dynamic_cast<Engine_Ext_Excitation*>(ext))
 		{
 			excSeen = true;
+			continue;
+		}
+		Engine_Ext_UPML* upml = dynamic_cast<Engine_Ext_UPML*>(ext);
+		if (upml && !excSeen && murs.empty() && rlcs.empty())
+		{
+			const Operator_Ext_UPML* o = upml->m_Op_UPML;
+			if (o->m_numLines[0] && o->m_numLines[1] && o->m_numLines[2])
+				upmls.push_back(upml);
 			continue;
 		}
 		Engine_Ext_Mur_ABC* mur = dynamic_cast<Engine_Ext_Mur_ABC*>(ext);
@@ -544,8 +626,24 @@ bool Engine_Metal_Diamond::SetupGPU()
 		cerr << "Engine_Metal_Diamond: the extension \"" << ext->GetExtensionName() << "\" has no GPU version here, running the CPU loops" << endl;
 		return false;
 	}
-	if ((murs.size()>32) || (rlcs.size()>0xffff))
+	if ((murs.size()>32) || (rlcs.size()>0xffff) || (upmls.size()>32))
 		return false;
+	// the kernel runs each UPML stage of all boxes of a tile without a barrier between them: the boxes must not overlap
+	// (Create_UPML leaves out the edges and corners another box has)
+	for (size_t a=0; a<upmls.size(); ++a)
+		for (size_t b=a+1; b<upmls.size(); ++b)
+		{
+			const Operator_Ext_UPML* p = upmls[a]->m_Op_UPML;
+			const Operator_Ext_UPML* q = upmls[b]->m_Op_UPML;
+			bool overlap = true;
+			for (int n=0; n<3; ++n)
+				overlap &= (p->m_StartPos[n] < q->m_StartPos[n]+q->m_numLines[n]) && (q->m_StartPos[n] < p->m_StartPos[n]+p->m_numLines[n]);
+			if (overlap)
+			{
+				cerr << "Engine_Metal_Diamond: two UPML boxes overlap, running the CPU loops" << endl;
+				return false;
+			}
+		}
 
 	@autoreleasepool
 	{
@@ -566,7 +664,8 @@ bool Engine_Metal_Diamond::SetupGPU()
 		// the kernel without the parts this model does not use (fewer registers, more tiles in flight)
 		options.preprocessorMacros = @{@"DIAMOND_MUR": @(murs.empty() ? 0 : 1),
 									   @"DIAMOND_EXC": @((excSeen && Op->GetExcitationExtension()) ? 1 : 0),
-									   @"DIAMOND_RLC": @(rlcs.empty() ? 0 : 1)};
+									   @"DIAMOND_RLC": @(rlcs.empty() ? 0 : 1),
+									   @"DIAMOND_UPML": @(upmls.empty() ? 0 : 1)};
 		id<MTLLibrary> lib = [md.dev newLibraryWithSource:[NSString stringWithUTF8String:DIAMOND_SOURCE] options:options error:&error];
 		if (lib==nil)
 		{
@@ -617,13 +716,13 @@ bool Engine_Metal_Diamond::SetupGPU()
 			if (*t)
 			{
 				unsigned int m=0, v=0;
-				if ((sscanf(t, "%u,%u", &m, &v)==2) && (m>=2*md.K-1))
+				if ((sscanf(t, "%u%*[,:]%u", &m, &v)==2) && (m>=2*md.K-1))
 				{
 					M = m;
 					Vw = v;
 				}
 				else
-					cerr << "Engine_Metal_Diamond: OPENEMS_DIAMOND_TILE=" << t << " ignored (M,V with M >= 2K-1 = " << 2*md.K-1 << ")" << endl;
+					cerr << "Engine_Metal_Diamond: OPENEMS_DIAMOND_TILE=" << t << " ignored (M,V or M:V with M >= 2K-1 = " << 2*md.K-1 << ")" << endl;
 			}
 		std::vector<int32_t> t[4];
 		DiamondTiles(numLines[0], M, Vw, md.K, t[0], t[1]);
@@ -633,15 +732,31 @@ bool Engine_Metal_Diamond::SetupGPU()
 			md.numTiles[n] = t[n].size()/2;
 			md.tiles[n] = buffer(t[n].data(), t[n].size()*sizeof(int32_t));
 		}
-		md.tg = std::min<unsigned int>(EnvUInt("OPENEMS_DIAMOND_TG", 0) ? EnvUInt("OPENEMS_DIAMOND_TG", 0) : 1u<<30,
+		// threads per tile: by default the power of two at or below 3/5 of a mountain's f4vectors per half-step (M*M*nv),
+		// 256 to 1024 (OPENEMS_DIAMOND_TG; a K, threads sweep on the five models that run on the GPU: idle threads in a
+		// small tile cost barrier time; at K=4 the patch tutorial (768 f4vectors) ran best with 256, the SMA launch (960)
+		// with 512, patch x5 (2880) with 512-1024)
+		unsigned int tgDef = 256;
+		while ((tgDef < 1024) && (5*2*tgDef <= 3*(size_t)M*M*numVectors))
+			tgDef *= 2;
+		md.tg = std::min<unsigned int>(EnvUInt("OPENEMS_DIAMOND_TG", 0) ? EnvUInt("OPENEMS_DIAMOND_TG", 0) : tgDef,
 									   (unsigned int)md.pso.maxTotalThreadsPerThreadgroup);
 		md.batch = std::max(1u, EnvUInt("OPENEMS_DIAMOND_BATCH", 64));
+
+		// the extension data in three blobs: read-only words (Ub), read-only floats (Fb) and the state (Sn floats, zero)
+		std::vector<uint32_t> Ub;
+		std::vector<float> Fb;
+		size_t Sn = 0;
+		auto addU = [&](const uint32_t* p, size_t n) -> uint32_t { const size_t o = Ub.size(); Ub.insert(Ub.end(), p, p+n); return (uint32_t)o; };
+		auto addF = [&](const float* p, size_t n) -> uint32_t { const size_t o = Fb.size(); Fb.insert(Fb.end(), p, p+n); return (uint32_t)o; };
+		auto addS = [&](size_t n) -> uint32_t { const size_t o = Sn; Sn += n; return (uint32_t)o; };
 
 		// excitation entries (x, y, z, direction, delay) and the signals
 		Operator_Ext_Excitation* exc = Op->GetExcitationExtension();
 		std::vector<uint32_t> ve, ce;
 		std::vector<float> va, ca;
-		md.ext = {0, 0, 0, 0, (uint32_t)murs.size(), (uint32_t)applyOrder.size(), 0};
+		md.ext = {0, 0, 0, 0, (uint32_t)murs.size(), (uint32_t)applyOrder.size(), 0, (uint32_t)upmls.size()};
+		md.ofs = {};
 		if (excSeen && exc)
 		{
 			for (unsigned int k=0; k<exc->Volt_Count; ++k)
@@ -662,11 +777,9 @@ bool Engine_Metal_Diamond::SetupGPU()
 			md.ext.ccount = exc->Curr_Count;
 			md.ext.length = len;
 			md.ext.period0 = sig->GetSignalPeriod()>0 ? (uint32_t)int(sig->GetSignalPeriod()/sig->GetTimestep()) : 0;
-			md.vsig = buffer(sig->GetVoltageSignal(), (exc->Volt_Count && len) ? len*sizeof(float) : 0);
-			md.csig = buffer(sig->GetCurrentSignal(), (exc->Curr_Count && len) ? len*sizeof(float) : 0);
+			md.ofs.vsig = addF(sig->GetVoltageSignal(), (exc->Volt_Count && len) ? len : 0);
+			md.ofs.csig = addF(sig->GetCurrentSignal(), (exc->Curr_Count && len) ? len : 0);
 		}
-		else
-			md.vsig = md.csig = buffer(NULL, 0);
 		// per tile of each phase, the entries inside the union of its ranges (a mountain stays in [lo, hi), a valley in
 		// [lo-K, hi+K)), in entry order
 		auto lists = [&](const std::vector<uint32_t>& ent, std::vector<uint32_t>& off, std::vector<uint32_t>& list)
@@ -698,14 +811,14 @@ bool Engine_Metal_Diamond::SetupGPU()
 		std::vector<uint32_t> vo, vl, co, cl;
 		lists(ve, vo, vl);
 		lists(ce, co, cl);
-		md.voff = buffer(vo.data(), vo.size()*4);
-		md.vlist = buffer(vl.data(), vl.size()*4);
-		md.coff = buffer(co.data(), co.size()*4);
-		md.clist = buffer(cl.data(), cl.size()*4);
-		md.vexc = buffer(ve.data(), ve.size()*4);
-		md.vamp = buffer(va.data(), va.size()*4);
-		md.cexc = buffer(ce.data(), ce.size()*4);
-		md.camp = buffer(ca.data(), ca.size()*4);
+		md.ofs.voff = addU(vo.data(), vo.size());
+		md.ofs.vlist = addU(vl.data(), vl.size());
+		md.ofs.coff = addU(co.data(), co.size());
+		md.ofs.clist = addU(cl.data(), cl.size());
+		md.ofs.vexc = addU(ve.data(), ve.size());
+		md.ofs.cexc = addU(ce.data(), ce.size());
+		md.ofs.vamp = addF(va.data(), va.size());
+		md.ofs.camp = addF(ca.data(), ca.size());
 
 		// Mur faces, in Apply order: coefficients nyP then nyPP per face, a scratch array of the same size
 		std::vector<MurFace> faces;
@@ -718,9 +831,9 @@ bool Engine_Metal_Diamond::SetupGPU()
 			coef.insert(coef.end(), m->m_Mur_Coeff_nyP.data(), m->m_Mur_Coeff_nyP.data()+size);
 			coef.insert(coef.end(), m->m_Mur_Coeff_nyPP.data(), m->m_Mur_Coeff_nyPP.data()+size);
 		}
-		md.mf = buffer(faces.data(), faces.size()*sizeof(MurFace));
-		md.mcoef = buffer(coef.data(), coef.size()*sizeof(float));
-		md.mscr = [md.dev newBufferWithLength:std::max<size_t>(16, coef.size()*sizeof(float)) options:MTLResourceStorageModePrivate];
+		md.ofs.mf = addU((const uint32_t*)faces.data(), faces.size()*sizeof(MurFace)/4);
+		md.ofs.mcoef = addF(coef.data(), coef.size());
+		md.ofs.mscr = addS(coef.size());
 
 		// lumped RLC elements of all extensions in Apply order, their per-tile lists and a zero state (as the CPU's)
 		std::vector<uint32_t> ri;
@@ -743,18 +856,67 @@ bool Engine_Metal_Diamond::SetupGPU()
 		md.numRLC = ri.size()/5;
 		std::vector<uint32_t> ro, rl;
 		lists(ri, ro, rl);
-		md.rlcI = buffer(ri.data(), ri.size()*4);
-		md.rlcC = buffer(rc.data(), rc.size()*4);
-		md.rlcS = [md.dev newBufferWithLength:std::max<size_t>(16, (size_t)md.numRLC*5*sizeof(float)) options:MTLResourceStorageModeShared];
-		memset([md.rlcS contents], 0, std::max<size_t>(16, (size_t)md.numRLC*5*sizeof(float)));
-		md.roff = buffer(ro.data(), ro.size()*4);
-		md.rlist = buffer(rl.data(), rl.size()*4);
-		md.apply = buffer(applyOrder.data(), applyOrder.size()*4);
+		md.ofs.rlcI = addU(ri.data(), ri.size());
+		md.ofs.rlcC = addF(rc.data(), rc.size());
+		md.ofs.rlcS = addS((size_t)md.numRLC*5);
+		md.ofs.roff = addU(ro.data(), ro.size());
+		md.ofs.rlist = addU(rl.data(), rl.size());
+		md.ofs.apply = addU(applyOrder.data(), applyOrder.size());
+
+		// UPML boxes: one table of the distinct coefficient sets (vv vvfo vvfn ii iifo iifn) of all boxes, an index per
+		// component and box cell [n][x][y][z], the flux (zero, as the CPU's): voltages [n][x][y][z], then the currents
+		std::vector<Upml> boxes;
+		std::vector<float> utab;
+		std::map<std::array<float,6>, uint32_t> lut;
+		size_t upmlCells = 0;
+		for (Engine_Ext_UPML* u : upmls)
+		{
+			const Operator_Ext_UPML* o = u->m_Op_UPML;
+			const unsigned int NX = o->m_numLines[0], NY = o->m_numLines[1], NZ = o->m_numLines[2];
+			const size_t N = (size_t)NX*NY*NZ;
+			std::vector<uint32_t> idx(3*N);
+			for (unsigned int n=0; n<3; ++n)
+				for (unsigned int lx=0; lx<NX; ++lx)
+					for (unsigned int ly=0; ly<NY; ++ly)
+						for (unsigned int lz=0; lz<NZ; ++lz)
+						{
+							const std::array<float,6> key = {o->vv(n,lx,ly,lz), o->vvfo(n,lx,ly,lz), o->vvfn(n,lx,ly,lz),
+															 o->ii(n,lx,ly,lz), o->iifo(n,lx,ly,lz), o->iifn(n,lx,ly,lz)};
+							auto it = lut.find(key);
+							if (it==lut.end())
+							{
+								it = lut.insert(std::make_pair(key, (uint32_t)(utab.size()/6))).first;
+								utab.insert(utab.end(), key.begin(), key.end());
+							}
+							idx[((n*(size_t)NX+lx)*NY+ly)*NZ+lz] = it->second;
+						}
+			boxes.push_back({o->m_StartPos[0], o->m_StartPos[1], o->m_StartPos[2], NX, NY, NZ, addU(idx.data(), idx.size()), addS(6*N)});
+			upmlCells += N;
+		}
+		md.ofs.upml = addU((const uint32_t*)boxes.data(), boxes.size()*sizeof(Upml)/4);
+		md.ofs.ucoef = addF(utab.data(), utab.size());
+
+		if ((Ub.size()>=(1ull<<32)) || (Fb.size()>=(1ull<<32)) || (Sn>=(1ull<<32)))
+		{
+			cerr << "Engine_Metal_Diamond: the extension data exceed 2^32 words, running the CPU loops" << endl;
+			return false;
+		}
+		md.U = buffer(Ub.data(), Ub.size()*4);
+		md.Fc = buffer(Fb.data(), Fb.size()*4);
+		md.St = [md.dev newBufferWithLength:std::max<size_t>(16, Sn*4) options:MTLResourceStorageModeShared];
+		if ((md.U==nil) || (md.Fc==nil) || (md.St==nil))
+		{
+			cerr << "Engine_Metal_Diamond: cannot allocate the extension buffers, running the CPU loops" << endl;
+			return false;
+		}
+		memset([md.St contents], 0, std::max<size_t>(16, Sn*4));
 
 		if (g_settings.GetVerboseLevel()>0)
-			cout << "Engine_Metal_Diamond: K=" << md.K << ", tiles " << M << "," << Vw << " (x " << md.numTiles[0] << "+" << md.numTiles[1]
+			cout << "Engine_Metal_Diamond: " << numLines[0] << "x" << numLines[1] << "x" << numLines[2] << " cells (" << numVectors
+				 << " z-vectors), K=" << md.K << ", tiles " << M << "," << Vw << " (x " << md.numTiles[0] << "+" << md.numTiles[1]
 				 << ", y " << md.numTiles[2] << "+" << md.numTiles[3] << "), " << md.tg << " threads per tile, " << murs.size()
-				 << " Mur faces, " << md.numRLC << " lumped RLC elements, " << md.ext.vcount << "+" << md.ext.ccount << " excitation entries" << endl;
+				 << " Mur faces, " << md.numRLC << " lumped RLC elements, " << upmls.size() << " UPML boxes (" << upmlCells << " cells, "
+				 << utab.size()/6 << " coefficient sets), " << md.ext.vcount << "+" << md.ext.ccount << " excitation entries" << endl;
 	}
 	md.gpu = true;
 	return true;
@@ -786,10 +948,10 @@ bool Engine_Metal_Diamond::IterateTS(unsigned int iterTS)
 				[enc setBuffer:bufs[n] offset:0 atIndex:n];
 			[enc setBytes:&md.dims length:sizeof(Dims) atIndex:5];
 			[enc setBytes:&md.ext length:sizeof(Ext) atIndex:9];
-			id<MTLBuffer> ebufs[] = {md.vexc, md.vamp, md.cexc, md.camp, md.vsig, md.csig, md.mf, md.mcoef, md.mscr,
-									 md.voff, md.vlist, md.coff, md.clist, md.apply, md.rlcI, md.rlcC, md.rlcS, md.roff, md.rlist};
-			for (int n=0; n<19; ++n)
-				[enc setBuffer:ebufs[n] offset:0 atIndex:10+n];
+			[enc setBuffer:md.U offset:0 atIndex:10];
+			[enc setBuffer:md.Fc offset:0 atIndex:11];
+			[enc setBuffer:md.St offset:0 atIndex:12];
+			[enc setBytes:&md.ofs length:sizeof(Ofs) atIndex:13];
 			unsigned int inCB = 0;
 			while ((done<iterTS) && (inCB<md.batch))
 			{

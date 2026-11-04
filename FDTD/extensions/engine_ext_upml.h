@@ -30,6 +30,7 @@ class Operator_Ext_UPML;
 
 class Engine_Ext_UPML : public Engine_Extension
 {
+	friend class Engine_Metal_Diamond;
 public:
 	Engine_Ext_UPML(Operator_Ext_UPML* op_ext);
 	virtual ~Engine_Ext_UPML();
