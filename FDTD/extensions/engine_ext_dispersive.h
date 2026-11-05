@@ -23,6 +23,14 @@
 #include "FDTD/engine.h"
 #include "FDTD/operator.h"
 #include "engine_extension_dispatcher.h"
+#include "tools/array_ops.h"
+#include <cstring>
+
+#if defined(__GNUC__) || defined(__clang__)
+//! four consecutive floats at any float address, for the merged ADE line hooks
+inline v4sf Load4(const float* p) {v4sf v; memcpy(&v, p, sizeof(v)); return v;}
+inline void Store4(float* p, v4sf v) {memcpy(p, &v, sizeof(v));}
+#endif
 
 class Operator_Ext_Dispersive;
 
@@ -51,6 +59,14 @@ protected:
 	std::vector<std::vector<unsigned int> > m_SortedIdx; //!< [order][k]: original position index, sorted by x
 	std::vector<std::vector<unsigned int> > m_SortedX;   //!< [order][k]: its x
 	std::vector<std::vector<unsigned int> > m_FloatIdx;  //!< [order][3*k+n]: float index of component n
+	//! All orders with voltage (current) ADE have the same positions, already in x order (e.g. the two orders of a
+	//! conducting sheet): the line hooks then run these orders back to back per position, four positions at a time,
+	//! with the same operations per float in the same order (OPENEMS_ADE_MERGED=0: one order after the other)
+	bool m_VoltMerged, m_CurrMerged;
+	std::vector<int> m_VoltOrders, m_CurrOrders; //!< those orders
+	bool MergeOrders(const bool* on, std::vector<int>& orders) const;
+	//! the merged Apply2*Lines(): field[float index] -= ADE of every order, in order
+	void ApplyMerged(float* field, FDTD_FLOAT*** ade, const std::vector<int>& orders, unsigned int x0, unsigned int x1);
 	void SetupLines();
 	void LineRange(int o, unsigned int x0, unsigned int x1, unsigned int& k0, unsigned int& k1) const;
 	bool AnyVoltADE() const;

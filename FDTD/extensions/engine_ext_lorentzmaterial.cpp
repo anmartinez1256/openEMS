@@ -82,10 +82,71 @@ unsigned int Engine_Ext_LorentzMaterial::GetUsedHooks() const
 	return DispersiveHooks() | (AnyVoltADE() ? PRE_VOLT : 0) | (AnyCurrADE() ? PRE_CURR : 0);
 }
 
+void Engine_Ext_LorentzMaterial::PreMerged(const float* __restrict field, FDTD_FLOAT*** ade, FDTD_FLOAT*** lor,
+	FDTD_FLOAT*** c_int, FDTD_FLOAT*** c_ext, FDTD_FLOAT*** c_lor, const bool* lor_on, const std::vector<int>& orders,
+	unsigned int x0, unsigned int x1)
+{
+	unsigned int k0, k1;
+	LineRange(orders[0], x0, x1, k0, k1);
+	const unsigned int* __restrict fi = m_FloatIdx[orders[0]].data();
+	const size_t no = orders.size();
+	unsigned int k = k0;
+#if defined(__GNUC__) || defined(__clang__)
+	for (; k+4<=k1; k+=4)
+		for (unsigned int n=0; n<3; ++n)
+		{
+			const unsigned int* f = fi + 3*(size_t)k + n;
+			const v4sf v = {field[f[0]], field[f[3]], field[f[6]], field[f[9]]};
+			for (size_t m=0; m<no; ++m)
+			{
+				const int o = orders[m];
+				v4sf a = Load4(ade[o][n]+k);
+				if (lor_on[o])
+				{
+					v4sf l = Load4(lor[o][n]+k);
+					l += Load4(c_lor[o][n]+k)*a;
+					a *= Load4(c_int[o][n]+k);
+					a += Load4(c_ext[o][n]+k)*(v-l);
+					Store4(lor[o][n]+k, l);
+				}
+				else
+				{
+					a *= Load4(c_int[o][n]+k);
+					a += Load4(c_ext[o][n]+k)*v;
+				}
+				Store4(ade[o][n]+k, a);
+			}
+		}
+#endif
+	for (; k<k1; ++k)
+		for (unsigned int n=0; n<3; ++n)
+		{
+			const float v = field[fi[3*k+n]];
+			for (size_t m=0; m<no; ++m)
+			{
+				const int o = orders[m];
+				if (lor_on[o])
+				{
+					lor[o][n][k]+=c_lor[o][n][k]*ade[o][n][k];
+					ade[o][n][k] *= c_int[o][n][k];
+					ade[o][n][k] += c_ext[o][n][k] * (v-lor[o][n][k]);
+				}
+				else
+				{
+					ade[o][n][k] *= c_int[o][n][k];
+					ade[o][n][k] += c_ext[o][n][k] * v;
+				}
+			}
+		}
+}
+
 // the same per-position operations as DoPreVoltageUpdatesImpl, for the positions on x-lines [x0,x1)
 void Engine_Ext_LorentzMaterial::DoPreVoltageUpdatesLines(unsigned int x0, unsigned int x1)
 {
 	const float* __restrict volt = (const float*)((Engine_sse*)m_Eng)->f4_volt_ptr->data();
+	if (m_VoltMerged)
+		return PreMerged(volt, volt_ADE, volt_Lor_ADE, m_Op_Ext_Lor->v_int_ADE, m_Op_Ext_Lor->v_ext_ADE,
+						 m_Op_Ext_Lor->v_Lor_ADE, m_Op_Ext_Lor->m_volt_Lor_ADE_On, m_VoltOrders, x0, x1);
 	for (int o=0;o<m_Order;++o)
 	{
 		if (m_Op_Ext_Lor->m_volt_ADE_On[o]==false) continue;
@@ -129,6 +190,9 @@ void Engine_Ext_LorentzMaterial::DoPreVoltageUpdatesLines(unsigned int x0, unsig
 void Engine_Ext_LorentzMaterial::DoPreCurrentUpdatesLines(unsigned int x0, unsigned int x1)
 {
 	const float* __restrict curr = (const float*)((Engine_sse*)m_Eng)->f4_curr_ptr->data();
+	if (m_CurrMerged)
+		return PreMerged(curr, curr_ADE, curr_Lor_ADE, m_Op_Ext_Lor->i_int_ADE, m_Op_Ext_Lor->i_ext_ADE,
+						 m_Op_Ext_Lor->i_Lor_ADE, m_Op_Ext_Lor->m_curr_Lor_ADE_On, m_CurrOrders, x0, x1);
 	for (int o=0;o<m_Order;++o)
 	{
 		if (m_Op_Ext_Lor->m_curr_ADE_On[o]==false) continue;

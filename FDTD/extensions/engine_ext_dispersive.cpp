@@ -18,13 +18,17 @@
 #include "engine_ext_dispersive.h"
 #include "operator_ext_dispersive.h"
 #include "FDTD/engine_sse.h"
+#include "tools/global.h"
 #include <algorithm>
+#include <cstdlib>
+#include <iostream>
 
 Engine_Ext_Dispersive::Engine_Ext_Dispersive(Operator_Ext_Dispersive* op_ext_disp) : Engine_Extension(op_ext_disp)
 {
 	m_Op_Ext_Disp = op_ext_disp;
 	m_LinesReady = false;
 	m_LinesChecked = false;
+	m_VoltMerged = m_CurrMerged = false;
 	int order = m_Op_Ext_Disp->m_Order;
 	curr_ADE = new FDTD_FLOAT**[order];
 	volt_ADE = new FDTD_FLOAT**[order];
@@ -148,6 +152,71 @@ void Engine_Ext_Dispersive::SetupLines()
 		}
 	}
 	m_LinesReady = true;
+	const char* env = getenv("OPENEMS_ADE_MERGED");
+	const bool merge = !(env && *env && (atoi(env)==0));
+	m_VoltMerged = merge && MergeOrders(m_Op_Ext_Disp->m_volt_ADE_On, m_VoltOrders);
+	m_CurrMerged = merge && MergeOrders(m_Op_Ext_Disp->m_curr_ADE_On, m_CurrOrders);
+	if (g_settings.GetVerboseLevel()>1)
+		std::cout << GetExtensionName() << ": line hooks, " << (m_Op_Ext_Disp->m_Order>0 ? m_Op_Ext_Disp->m_LM_Count.at(0) : 0) << " positions of order 0, orders merged: voltages "
+				  << (m_VoltMerged ? m_VoltOrders.size() : 0) << ", currents " << (m_CurrMerged ? m_CurrOrders.size() : 0) << std::endl;
+}
+
+bool Engine_Ext_Dispersive::MergeOrders(const bool* on, std::vector<int>& orders) const
+{
+	orders.clear();
+	for (int o=0; o<m_Op_Ext_Disp->m_Order; ++o)
+		if (on[o])
+			orders.push_back(o);
+	if (orders.empty())
+		return false;
+	for (int o : orders)
+	{
+		const std::vector<unsigned int>& idx = m_SortedIdx[o];
+		for (size_t k=0; k<idx.size(); ++k)
+			if (idx[k]!=k)
+				return false;
+		if (m_FloatIdx[o]!=m_FloatIdx[orders[0]])
+			return false;
+	}
+	// the merged apply gathers and scatters four positions at a time, so a position listed twice would lose
+	// one of its updates there: every position must appear once (the builders list each cell once)
+	const std::vector<unsigned int>& fi = m_FloatIdx[orders[0]];
+	std::vector<unsigned int> f(fi.size()/3);
+	for (size_t k=0; k<f.size(); ++k)
+		f[k] = fi[3*k];
+	std::sort(f.begin(), f.end());
+	return std::adjacent_find(f.begin(), f.end())==f.end();
+}
+
+void Engine_Ext_Dispersive::ApplyMerged(float* __restrict field, FDTD_FLOAT*** ade, const std::vector<int>& orders, unsigned int x0, unsigned int x1)
+{
+	unsigned int k0, k1;
+	LineRange(orders[0], x0, x1, k0, k1);
+	const unsigned int* __restrict fi = m_FloatIdx[orders[0]].data();
+	const size_t no = orders.size();
+	unsigned int k = k0;
+#if defined(__GNUC__) || defined(__clang__)
+	for (; k+4<=k1; k+=4)
+		for (unsigned int n=0; n<3; ++n)
+		{
+			const unsigned int* f = fi + 3*(size_t)k + n;
+			v4sf v = {field[f[0]], field[f[3]], field[f[6]], field[f[9]]};
+			for (size_t m=0; m<no; ++m)
+				v = v - Load4(ade[orders[m]][n] + k);
+			field[f[0]] = v[0];
+			field[f[3]] = v[1];
+			field[f[6]] = v[2];
+			field[f[9]] = v[3];
+		}
+#endif
+	for (; k<k1; ++k)
+		for (unsigned int n=0; n<3; ++n)
+		{
+			float v = field[fi[3*k+n]];
+			for (size_t m=0; m<no; ++m)
+				v = v - ade[orders[m]][n][k];
+			field[fi[3*k+n]] = v;
+		}
 }
 
 void Engine_Ext_Dispersive::LineRange(int o, unsigned int x0, unsigned int x1, unsigned int& k0, unsigned int& k1) const
@@ -160,6 +229,8 @@ void Engine_Ext_Dispersive::LineRange(int o, unsigned int x0, unsigned int x1, u
 void Engine_Ext_Dispersive::Apply2VoltagesLines(unsigned int x0, unsigned int x1)
 {
 	float* __restrict volt = (float*)((Engine_sse*)m_Eng)->f4_volt_ptr->data();
+	if (m_VoltMerged)
+		return ApplyMerged(volt, volt_ADE, m_VoltOrders, x0, x1);
 	for (int o=0; o<m_Op_Ext_Disp->m_Order; ++o)
 	{
 		if (m_Op_Ext_Disp->m_volt_ADE_On[o]==false) continue;
@@ -183,6 +254,8 @@ void Engine_Ext_Dispersive::Apply2VoltagesLines(unsigned int x0, unsigned int x1
 void Engine_Ext_Dispersive::Apply2CurrentLines(unsigned int x0, unsigned int x1)
 {
 	float* __restrict curr = (float*)((Engine_sse*)m_Eng)->f4_curr_ptr->data();
+	if (m_CurrMerged)
+		return ApplyMerged(curr, curr_ADE, m_CurrOrders, x0, x1);
 	for (int o=0; o<m_Op_Ext_Disp->m_Order; ++o)
 	{
 		if (m_Op_Ext_Disp->m_curr_ADE_On[o]==false) continue;

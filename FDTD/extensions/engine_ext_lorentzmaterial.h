@@ -38,6 +38,10 @@ public:
 	virtual void DoPreCurrentUpdatesLines(unsigned int x0, unsigned int x1);
 
 protected:
+	//! the merged DoPre*UpdatesLines() (see m_VoltMerged): per position the ADE update of every order
+	void PreMerged(const float* field, FDTD_FLOAT*** ade, FDTD_FLOAT*** lor, FDTD_FLOAT*** c_int, FDTD_FLOAT*** c_ext,
+				   FDTD_FLOAT*** c_lor, const bool* lor_on, const std::vector<int>& orders, unsigned int x0, unsigned int x1);
+
 	template <typename EngType>
 	void DoPreVoltageUpdatesImpl(EngType* eng);
 
