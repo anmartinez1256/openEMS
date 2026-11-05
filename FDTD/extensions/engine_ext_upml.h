@@ -99,6 +99,19 @@ protected:
 	std::vector<Coef4, aligned_allocator<Coef4> > m_CoefTab4;
 	std::vector<unsigned int> m_CoefIdx4;
 	void SetupCoefTable4();
+	//! y-vector form of the scalar SSE path (with the table): four consecutive y-rows of an x-line are one group, lane
+	//! l = row 4g+l, with the fluxes and the coefficient sets stored per group, so a group takes one vector operation
+	//! per step of the update; the field values are gathered and scattered lane by lane. Same operations per cell as
+	//! the scalar path. The last group of an x-line, when it has fewer than four rows, runs lane by lane on the same
+	//! arrays; the rows are always handed over in whole groups. OPENEMS_PML_YVEC=0: the scalar rows.
+	bool m_YVec;
+	unsigned int m_NG; //!< groups per x-line: ceil(NY/4)
+	std::vector<f4vector, aligned_allocator<f4vector> > m_y_volt_flux, m_y_curr_flux; //!< index ((lx*m_NG+g)*3+n)*NZ+lz
+	std::vector<Coef4, aligned_allocator<Coef4> > m_CoefTabY; //!< distinct coefficient sets of a group
+	std::vector<unsigned int> m_CoefIdxY; //!< same index as the fluxes
+	void SetupYVec();
+	//! HOOK 0: pre-voltage, 1: post-voltage, 2: pre-current, 3: post-current update of the rows [r0, r1)
+	template <int HOOK> void YVecRows(unsigned int r0, unsigned int r1);
 	void SetupScalarSSE();
 	void DoPreVoltageUpdatesSSERows(unsigned int r0, unsigned int r1);
 	void DoPostVoltageUpdatesSSERows(unsigned int r0, unsigned int r1);

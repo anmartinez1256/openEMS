@@ -39,6 +39,8 @@ Engine_Ext_UPML::Engine_Ext_UPML(Operator_Ext_UPML* op_ext) : Engine_Extension(o
 	m_Vec = false;
 	m_Sse = false;
 	m_CoefTable = false;
+	m_YVec = false;
+	m_NG = 0;
 	m_VecChecked = false;
 	m_nvec = 0;
 
@@ -65,7 +67,22 @@ void Engine_Ext_UPML::SetNumberOfThreads(int nrThread)
 		if (!m_Vec)
 			SetupScalarSSE();
 	}
-	if (m_Vec || m_Sse)
+	if (m_YVec)
+	{
+		// whole groups of four rows (see SetupYVec())
+		const unsigned int NY = m_Op_UPML->m_numLines[1], NG = m_NG;
+		const std::vector<unsigned int> num = AssignJobs2Threads(m_Op_UPML->m_numLines[0]*NG, m_NrThreads, false);
+		m_RowStart.assign(m_NrThreads, 0);
+		m_RowNum.assign(m_NrThreads, 0);
+		unsigned int u = 0;
+		for (size_t t=0; (t<num.size()) && (t<(size_t)m_NrThreads); ++t)
+		{
+			m_RowStart[t] = (u/NG)*NY + 4*(u%NG);
+			u += num[t];
+			m_RowNum[t] = (u/NG)*NY + 4*(u%NG) - m_RowStart[t];
+		}
+	}
+	else if (m_Vec || m_Sse)
 	{
 		// split the (x,y)-rows instead of the few x-lines of a PML slab
 		m_RowNum = AssignJobs2Threads(m_Op_UPML->m_numLines[0]*m_Op_UPML->m_numLines[1], m_NrThreads, false);
@@ -420,7 +437,147 @@ void Engine_Ext_UPML::SetupScalarSSE()
 	}
 	m_Sse = true;
 	SetupCoefTable();
+	SetupYVec();
 }
+
+void Engine_Ext_UPML::SetupYVec()
+{
+	m_YVec = false;
+#ifdef UPML_F4VECTOR
+	const char* env = getenv("OPENEMS_PML_YVEC");
+	if (!m_CoefTable || (env && *env && (atoi(env)==0)))
+		return;
+	const unsigned int NX = m_Op_UPML->m_numLines[0], NY = m_Op_UPML->m_numLines[1], NZ = m_Op_UPML->m_numLines[2];
+	m_NG = (NY+3)/4;
+	const size_t size = (size_t)NX*m_NG*3*NZ;
+	f4vector zero;
+	zero.f[0] = zero.f[1] = zero.f[2] = zero.f[3] = 0;
+	m_y_volt_flux.assign(size, zero);
+	m_y_curr_flux.assign(size, zero);
+	m_CoefIdxY.resize(size);
+	m_CoefTabY.clear();
+	struct Key
+	{
+		f4vector c[6];
+		bool operator<(const Key& o) const { return memcmp(c, o.c, sizeof(c))<0; }
+	};
+	std::map<Key, unsigned int> lut;
+	for (unsigned int lx=0; lx<NX; ++lx)
+		for (unsigned int g=0; g<m_NG; ++g)
+			for (unsigned int n=0; n<3; ++n)
+				for (unsigned int lz=0; lz<NZ; ++lz)
+				{
+					const size_t k = (((size_t)lx*m_NG+g)*3+n)*NZ+lz;
+					Key key;
+					memset(&key, 0, sizeof(key)); // the lanes past the last row of a short group stay 0 (never used)
+					for (unsigned int l=0; (l<4) && (4*g+l<NY); ++l)
+					{
+						const unsigned int ly = 4*g+l;
+						const Coef& s = m_CoefTab[m_CoefIdx[(((size_t)lx*NY+ly)*3+n)*NZ+lz]];
+						key.c[0].f[l] = s.vv; key.c[1].f[l] = s.vvfo; key.c[2].f[l] = s.vvfn;
+						key.c[3].f[l] = s.ii; key.c[4].f[l] = s.iifo; key.c[5].f[l] = s.iifn;
+						m_y_volt_flux[k].f[l] = volt_flux(n, lx, ly, lz);
+						m_y_curr_flux[k].f[l] = curr_flux(n, lx, ly, lz);
+					}
+					std::map<Key, unsigned int>::iterator it = lut.find(key);
+					if (it==lut.end())
+					{
+						it = lut.insert(std::make_pair(key, (unsigned int)m_CoefTabY.size())).first;
+						Coef4 cf = {key.c[0], key.c[1], key.c[2], key.c[3], key.c[4], key.c[5]};
+						m_CoefTabY.push_back(cf);
+					}
+					m_CoefIdxY[k] = it->second;
+				}
+	std::vector<unsigned int>().swap(m_CoefIdx); // the per-row index is not read any more
+	m_YVec = true;
+	if (g_settings.GetVerboseLevel()>1)
+		std::cout << "UPML (y-vectors): " << m_CoefTabY.size() << " distinct coefficient sets for " << size << " groups of up to four cells" << std::endl;
+#endif
+}
+
+#ifdef UPML_F4VECTOR
+template <int HOOK>
+void Engine_Ext_UPML::YVecRows(unsigned int r0, unsigned int r1)
+{
+	Engine_sse* eng = (Engine_sse*)m_Eng;
+	ArrayLib::ArrayENG<f4vector>* A = (HOOK<2) ? eng->f4_volt_ptr : eng->f4_curr_ptr;
+	float* __restrict field = (float*)A->data();
+	const size_t sx = 4*A->stride(1), sy = 4*A->stride(2);
+	const unsigned int NY = m_Op_UPML->m_numLines[1], NZ = m_Op_UPML->m_numLines[2], NG = m_NG;
+	const unsigned int* __restrict zo = m_zoff.data();
+	const Coef4* __restrict tab = m_CoefTabY.data();
+	f4vector* __restrict fluxes = (HOOK<2) ? m_y_volt_flux.data() : m_y_curr_flux.data();
+	for (unsigned int r=r0; r<r1; )
+	{
+		const unsigned int lx = r/NY, ly = r%NY; // ly = 4g: whole groups only
+		const unsigned int g = ly/4, lanes = std::min(4u, NY-ly);
+		float* __restrict e = field + (lx + m_Op_UPML->m_StartPos[0])*sx + (ly + m_Op_UPML->m_StartPos[1])*sy;
+		for (unsigned int n=0; n<3; ++n)
+		{
+			const size_t b = (((size_t)lx*NG+g)*3+n)*NZ;
+			f4vector* __restrict flux = fluxes + b;
+			const unsigned int* __restrict ix = m_CoefIdxY.data() + b;
+			float* __restrict e0 = e + 4*n;
+			if (lanes==4)
+			{
+				float* __restrict e1 = e0 + sy;
+				float* __restrict e2 = e1 + sy;
+				float* __restrict e3 = e2 + sy;
+				for (unsigned int lz=0; lz<NZ; ++lz)
+				{
+					const unsigned int o = zo[lz];
+					const Coef4& c = tab[ix[lz]];
+					const v4sf E = {e0[o], e1[o], e2[o], e3[o]};
+					const v4sf F = flux[lz].v;
+					v4sf En, Fn;
+					if ((HOOK==0) || (HOOK==2))
+					{
+						const v4sf p = -(((HOOK==0) ? c.vvfo.v : c.iifo.v) * F);
+						Fn = ((HOOK==0) ? c.vv.v : c.ii.v) * E + p;
+						En = F;
+					}
+					else
+					{
+						En = F + ((HOOK==1) ? c.vvfn.v : c.iifn.v) * E;
+						Fn = E;
+					}
+					e0[o] = En[0];
+					e1[o] = En[1];
+					e2[o] = En[2];
+					e3[o] = En[3];
+					flux[lz].v = Fn;
+				}
+				continue;
+			}
+			for (unsigned int l=0; l<lanes; ++l)
+			{
+				float* __restrict el = e0 + l*sy;
+				for (unsigned int lz=0; lz<NZ; ++lz)
+				{
+					float& V = el[zo[lz]];
+					float& Fl = flux[lz].f[l];
+					const Coef4& c = tab[ix[lz]];
+					if ((HOOK==0) || (HOOK==2))
+					{
+						const FDTD_FLOAT c1 = (HOOK==0) ? c.vv.f[l] : c.ii.f[l], c2 = (HOOK==0) ? c.vvfo.f[l] : c.iifo.f[l];
+						const FDTD_FLOAT f_help = c1 * V - c2 * Fl;
+						V = Fl;
+						Fl = f_help;
+					}
+					else
+					{
+						const FDTD_FLOAT c3 = (HOOK==1) ? c.vvfn.f[l] : c.iifn.f[l];
+						const FDTD_FLOAT f_help = Fl;
+						Fl = V;
+						V = f_help + c3 * Fl;
+					}
+				}
+			}
+		}
+		r += lanes;
+	}
+}
+#endif
 
 void Engine_Ext_UPML::SetupCoefTable4()
 {
@@ -511,6 +668,10 @@ void Engine_Ext_UPML::SetupCoefTable()
 
 void Engine_Ext_UPML::DoPreVoltageUpdatesSSERows(unsigned int r0, unsigned int r1)
 {
+#ifdef UPML_F4VECTOR
+	if (m_YVec)
+		return YVecRows<0>(r0, r1);
+#endif
 	UPML_SSE_ROW_SETUP(f4_volt_ptr)
 	const ArrayLib::ArrayNIJK<FDTD_FLOAT>& cvv = m_Op_UPML->vv;
 	const ArrayLib::ArrayNIJK<FDTD_FLOAT>& cfo = m_Op_UPML->vvfo;
@@ -557,6 +718,10 @@ void Engine_Ext_UPML::DoPreVoltageUpdatesSSERows(unsigned int r0, unsigned int r
 
 void Engine_Ext_UPML::DoPostVoltageUpdatesSSERows(unsigned int r0, unsigned int r1)
 {
+#ifdef UPML_F4VECTOR
+	if (m_YVec)
+		return YVecRows<1>(r0, r1);
+#endif
 	UPML_SSE_ROW_SETUP(f4_volt_ptr)
 	const ArrayLib::ArrayNIJK<FDTD_FLOAT>& cfn = m_Op_UPML->vvfn;
 	for (unsigned int r=r0; r<r1; ++r)
@@ -599,6 +764,10 @@ void Engine_Ext_UPML::DoPostVoltageUpdatesSSERows(unsigned int r0, unsigned int 
 
 void Engine_Ext_UPML::DoPreCurrentUpdatesSSERows(unsigned int r0, unsigned int r1)
 {
+#ifdef UPML_F4VECTOR
+	if (m_YVec)
+		return YVecRows<2>(r0, r1);
+#endif
 	UPML_SSE_ROW_SETUP(f4_curr_ptr)
 	const ArrayLib::ArrayNIJK<FDTD_FLOAT>& cii = m_Op_UPML->ii;
 	const ArrayLib::ArrayNIJK<FDTD_FLOAT>& cfo = m_Op_UPML->iifo;
@@ -645,6 +814,10 @@ void Engine_Ext_UPML::DoPreCurrentUpdatesSSERows(unsigned int r0, unsigned int r
 
 void Engine_Ext_UPML::DoPostCurrentUpdatesSSERows(unsigned int r0, unsigned int r1)
 {
+#ifdef UPML_F4VECTOR
+	if (m_YVec)
+		return YVecRows<3>(r0, r1);
+#endif
 	UPML_SSE_ROW_SETUP(f4_curr_ptr)
 	const ArrayLib::ArrayNIJK<FDTD_FLOAT>& cfn = m_Op_UPML->iifn;
 	for (unsigned int r=r0; r<r1; ++r)
