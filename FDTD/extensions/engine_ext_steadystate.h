@@ -38,7 +38,10 @@ public:
 	virtual ~Engine_Ext_SteadyState();
 
 	virtual void SetNumberOfThreads(int nrThread);
-	virtual unsigned int GetUsedHooks() const {OPENEMS_HOOKS_DECLARED_BY(Engine_Ext_SteadyState); return APPLY_VOLT | (m_Lines ? LINE_HOOKS : 0);}
+	//! TS_LOCAL while a period is longer than twice the thread count: the threads are then less than a period apart (the
+	//! records keep three periods, the copies and the count of copied lines are not touched again before the next
+	//! evaluation step), and every evaluation sees the records and copies of its timestep
+	virtual unsigned int GetUsedHooks() const;
 
 	virtual void Apply2Voltages();
 	virtual void Apply2Current();

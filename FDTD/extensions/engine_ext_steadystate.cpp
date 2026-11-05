@@ -27,9 +27,10 @@ Engine_Ext_SteadyState::Engine_Ext_SteadyState(Operator_Ext_SteadyState* op_ext)
 	m_Op_SS = op_ext;
 	m_Priority = ENG_EXT_PRIO_STEADYSTATE;
 
+	// three periods of records (see RecordProbes)
 	for (size_t n=0;n<m_Op_SS->m_E_probe_dir.size();++n)
 	{
-		double* rec = new double[m_Op_SS->m_TS_period*2];
+		double* rec = new double[m_Op_SS->m_TS_period*3];
 		m_E_records.push_back(rec);
 	}
 	m_last_max_diff = 1;
@@ -78,6 +79,12 @@ void Engine_Ext_SteadyState::SetupLines()
 	m_Lines = true;
 }
 
+unsigned int Engine_Ext_SteadyState::GetUsedHooks() const
+{
+	OPENEMS_HOOKS_DECLARED_BY(Engine_Ext_SteadyState);
+	return APPLY_VOLT | (m_Lines ? LINE_HOOKS | ((m_Op_SS->m_TS_period>2u*m_NrThreads) ? TS_LOCAL : 0) : 0);
+}
+
 bool Engine_Ext_SteadyState::IsEvaluationStep(unsigned int TS) const
 {
 	const unsigned int p = m_Op_SS->m_TS_period;
@@ -86,7 +93,9 @@ bool Engine_Ext_SteadyState::IsEvaluationStep(unsigned int TS) const
 
 void Engine_Ext_SteadyState::RecordProbes(unsigned int TS, unsigned int x0, unsigned int x1)
 {
-	const unsigned int rel_pos = TS%(2*m_Op_SS->m_TS_period);
+	// the record of timestep TS at TS mod 3 periods: an evaluation step reads the last two periods, while a thread up to a
+	// period ahead (neighbour flags, see GetUsedHooks) writes the third
+	const unsigned int rel_pos = TS%(3*m_Op_SS->m_TS_period);
 	for (size_t n=0;n<m_E_records.size();++n)
 	{
 		const unsigned int x = m_Op_SS->m_E_probe_pos[0].at(n);
@@ -149,6 +158,10 @@ void Engine_Ext_SteadyState::EvaluatePeriod(unsigned int TS, double curr_total_e
 		old_pos = p;
 	}
 	//cerr << TS << "/" << rel_pos << ": one period complete, new_pos" << new_pos << " old pos: " << old_pos << endl;
+	// slot k of the two-period ring (TS mod 2p) is the last timestep <= TS with that slot; it is kept at its timestep mod 3p
+	std::vector<unsigned int> slot(2*p);
+	for (unsigned int k=0;k<2*p;++k)
+		slot[k] = (TS - (TS+2*p-k)%(2*p)) % (3*p);
 	double *curr_pow = new double[m_E_records.size()];
 	double *diff_pow = new double[m_E_records.size()];
 	double max_pow = 0;
@@ -159,8 +172,9 @@ void Engine_Ext_SteadyState::EvaluatePeriod(unsigned int TS, double curr_total_e
 		diff_pow[n] = 0;
 		for (unsigned int nt=0;nt<p;++nt)
 		{
-			curr_pow[n] += buf[nt+new_pos]*buf[nt+new_pos];
-			diff_pow[n] += (buf[nt+old_pos]-buf[nt+new_pos])*(buf[nt+old_pos]-buf[nt+new_pos]);
+			const double vn = buf[slot[nt+new_pos]], vo = buf[slot[nt+old_pos]];
+			curr_pow[n] += vn*vn;
+			diff_pow[n] += (vo-vn)*(vo-vn);
 		}
 		max_pow = std::max(max_pow, curr_pow[n]);
 	}
