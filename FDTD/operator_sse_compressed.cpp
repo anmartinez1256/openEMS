@@ -19,6 +19,7 @@
 #include <iostream>
 #include "engine_sse_compressed.h"
 #include "engine_sse.h"
+#include "tools/useful.h"
 
 #include <map>
 #include <cstring>
@@ -100,7 +101,13 @@ void Operator_SSE_Compressed::InitOperator()
 	}
 
 	Operator_sse::InitOperator();
-	m_Op_index.Init("Op_index", numLines);
+	// one index per f4vector (x, y, zv): the operator and the engines use zv < numVectors only, and with numLines[2]
+	// entries per (x, y) the unused ones shared the cache lines of the used ones on meshes of up to 42 z lines, so the
+	// engines streamed 4 B of index per cell instead of 1 B (OPENEMS_OP_INDEX_PER_CELL=1: the old layout, to compare)
+	if (EnvFlag("OPENEMS_OP_INDEX_PER_CELL"))
+		m_Op_index.Init("Op_index", numLines);
+	else
+		m_Op_index.Init("Op_index", {numLines[0], numLines[1], numVectors});
 }
 
 void Operator_SSE_Compressed::ShowStat() const
