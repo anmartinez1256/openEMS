@@ -34,7 +34,7 @@ public:
 	virtual ~Engine_Ext_Mur_ABC();
 
 	virtual void SetNumberOfThreads(int nrThread);
-	virtual unsigned int GetUsedHooks() const {OPENEMS_HOOKS_DECLARED_BY(Engine_Ext_Mur_ABC); return PRE_VOLT | POST_VOLT | APPLY_VOLT | (m_Fast ? LINE_HOOKS : 0);}
+	virtual unsigned int GetUsedHooks() const {OPENEMS_HOOKS_DECLARED_BY(Engine_Ext_Mur_ABC); return PRE_VOLT | POST_VOLT | APPLY_VOLT | (m_Fast ? LINE_HOOKS | TS_LOCAL : 0);}
 
 	virtual void DoPreVoltageUpdates() {Engine_Ext_Mur_ABC::DoPreVoltageUpdates(0);}
 	virtual void DoPreVoltageUpdates(int threadID);

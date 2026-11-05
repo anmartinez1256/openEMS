@@ -31,8 +31,8 @@ Engine_Ext_LumpedRLC::Engine_Ext_LumpedRLC(Operator_Ext_LumpedRLC* op_ext_RLC) :
 	v_Vdn		= new FDTD_FLOAT*[3];
 	v_Jn		= new FDTD_FLOAT*[3];
 	v_Il		= NULL;
-	m_RotatedVd = -1;
-	m_RotatedJ = -1;
+	for (unsigned int k = 0 ; k < 3 ; k++)
+		v_Vdn[k] = v_Jn[k] = m_VdBase[k] = m_JBase[k] = NULL;
 
 	// No additional allocations are required if there are no actual lumped elements.
 	if (!(m_Op_Ext_RLC->RLC_count))
@@ -63,6 +63,8 @@ Engine_Ext_LumpedRLC::Engine_Ext_LumpedRLC(Operator_Ext_LumpedRLC* op_ext_RLC) :
 			v_Jn[k][posIdx] = 0.0;
 			v_Vdn[k][posIdx] = 0.0;
 		}
+		m_VdBase[k] = v_Vdn[k];
+		m_JBase[k] = v_Jn[k];
 	}
 
 }
@@ -76,8 +78,8 @@ Engine_Ext_LumpedRLC::~Engine_Ext_LumpedRLC()
 
 		for (unsigned int k = 0 ; k < 3 ; k++)
 		{
-			delete[] v_Vdn[k];
-			delete[] v_Jn[k];
+			delete[] m_VdBase[k];
+			delete[] m_JBase[k];
 		}
 	}
 
@@ -94,25 +96,12 @@ Engine_Ext_LumpedRLC::~Engine_Ext_LumpedRLC()
 
 }
 
-void Engine_Ext_LumpedRLC::Rotate(FDTD_FLOAT** c)
+void Engine_Ext_LumpedRLC::SetSlots(FDTD_FLOAT** c, FDTD_FLOAT* const* base, unsigned int ts)
 {
-	FDTD_FLOAT	*v_temp;
-	v_temp = c[2];
-	c[2] = c[1];
-	c[1] = c[0];
-	c[0] = v_temp;
-}
-
-void Engine_Ext_LumpedRLC::RotateOnce(std::atomic<int>& stamp, FDTD_FLOAT** c)
-{
-	const int ts = m_Eng->GetNumberOfTimesteps();
-	if (stamp.load(std::memory_order_acquire)==ts)
-		return;
-	std::lock_guard<std::mutex> lock(m_RotateMutex);
-	if (stamp.load(std::memory_order_relaxed)==ts)
-		return;
-	Rotate(c);
-	stamp.store(ts, std::memory_order_release);
+	// rotated once at the start of every timestep: c[2] = c[1], c[1] = c[0], c[0] = the old c[2]
+	const unsigned int r = (ts+1)%3;
+	for (unsigned int k = 0 ; k < 3 ; k++)
+		c[k] = base[(k+3-r)%3];
 }
 
 void Engine_Ext_LumpedRLC::LineRange(unsigned int x0, unsigned int x1, unsigned int& n0, unsigned int& n1) const
@@ -121,13 +110,13 @@ void Engine_Ext_LumpedRLC::LineRange(unsigned int x0, unsigned int x1, unsigned 
 	n1 = std::lower_bound(m_X.begin(), m_X.end(), x1) - m_X.begin();
 }
 
-void Engine_Ext_LumpedRLC::UpdateInductorCurrents(const unsigned int* order, unsigned int n0, unsigned int n1)
+void Engine_Ext_LumpedRLC::UpdateInductorCurrents(const FDTD_FLOAT* vd1, const unsigned int* order, unsigned int n0, unsigned int n1)
 {
 	// In pre-process, only update the parallel inductor current:
 	for (unsigned int k = n0 ; k < n1 ; k++)
 	{
 		const unsigned int pIdx = order ? order[k] : k;
-		v_Il[pIdx] += (m_Op_Ext_RLC->v_RLC_i2v[pIdx])*(m_Op_Ext_RLC->v_RLC_ilv[pIdx])*v_Vdn[1][pIdx];
+		v_Il[pIdx] += (m_Op_Ext_RLC->v_RLC_i2v[pIdx])*(m_Op_Ext_RLC->v_RLC_ilv[pIdx])*vd1[pIdx];
 	}
 }
 
@@ -137,22 +126,23 @@ void Engine_Ext_LumpedRLC::DoPreVoltageUpdates()
 		return;
 
 	// Iterate Vd containers
-	Rotate(v_Vdn);
-	UpdateInductorCurrents(NULL, 0, m_Op_Ext_RLC->RLC_count);
+	SetSlots(v_Vdn, m_VdBase, m_Eng->GetNumberOfTimesteps());
+	UpdateInductorCurrents(v_Vdn[1], NULL, 0, m_Op_Ext_RLC->RLC_count);
 }
 
 void Engine_Ext_LumpedRLC::DoPreVoltageUpdatesLines(unsigned int x0, unsigned int x1)
 {
 	if (!m_Op_Ext_RLC->RLC_count)
 		return;
-	RotateOnce(m_RotatedVd, v_Vdn);
+	FDTD_FLOAT* vd[3];
+	SetSlots(vd, m_VdBase, m_Eng->GetNumberOfTimesteps());
 	unsigned int n0, n1;
 	LineRange(x0, x1, n0, n1);
-	UpdateInductorCurrents(m_Order.data(), n0, n1);
+	UpdateInductorCurrents(vd[1], m_Order.data(), n0, n1);
 }
 
 template <typename EngType>
-void Engine_Ext_LumpedRLC::Apply2VoltagesImpl(EngType* eng, const unsigned int* order, unsigned int n0, unsigned int n1)
+void Engine_Ext_LumpedRLC::Apply2VoltagesImpl(EngType* eng, FDTD_FLOAT* const* vd, FDTD_FLOAT* const* j, const unsigned int* order, unsigned int n0, unsigned int n1)
 {
 	unsigned int **pos = m_Op_Ext_RLC->v_RLC_pos;
 	int *dir = m_Op_Ext_RLC->v_RLC_dir;
@@ -161,7 +151,7 @@ void Engine_Ext_LumpedRLC::Apply2VoltagesImpl(EngType* eng, const unsigned int* 
 	for (unsigned int k = n0 ; k < n1 ; k++)
 	{
 		const unsigned int pIdx = order ? order[k] : k;
-		v_Vdn[0][pIdx] = eng->EngType::GetVolt(dir[pIdx],pos[0][pIdx],pos[1][pIdx],pos[2][pIdx]);
+		vd[0][pIdx] = eng->EngType::GetVolt(dir[pIdx],pos[0][pIdx],pos[1][pIdx],pos[2][pIdx]);
 	}
 
 	// Post process: Calculate node voltage with respect to the lumped RLC auxilliary quantity, J
@@ -169,21 +159,21 @@ void Engine_Ext_LumpedRLC::Apply2VoltagesImpl(EngType* eng, const unsigned int* 
 	{
 		const unsigned int pIdx = order ? order[k] : k;
 		// Calculate updated node voltage, with series and parallel additions
-		v_Vdn[0][pIdx] = 	(m_Op_Ext_RLC->v_RLC_vvd[pIdx])*(
-							v_Vdn[0][pIdx] - v_Il[pIdx]						// Addition for Parallel inductor
+		vd[0][pIdx] = 	(m_Op_Ext_RLC->v_RLC_vvd[pIdx])*(
+							vd[0][pIdx] - v_Il[pIdx]						// Addition for Parallel inductor
 							+
-							(m_Op_Ext_RLC->v_RLC_vv2[pIdx])*v_Vdn[2][pIdx]	// Vd[n-2] addition
+							(m_Op_Ext_RLC->v_RLC_vv2[pIdx])*vd[2][pIdx]	// Vd[n-2] addition
 							+
-							(m_Op_Ext_RLC->v_RLC_vj1[pIdx])*v_Jn[1][pIdx]	// J[n-1] addition
+							(m_Op_Ext_RLC->v_RLC_vj1[pIdx])*j[1][pIdx]	// J[n-1] addition
 							+
-							(m_Op_Ext_RLC->v_RLC_vj2[pIdx])*v_Jn[2][pIdx]);	// J[n-2] addition
+							(m_Op_Ext_RLC->v_RLC_vj2[pIdx])*j[2][pIdx]);	// J[n-2] addition
 
 		// Update J[0]
-		v_Jn[0][pIdx] =	(m_Op_Ext_RLC->v_RLC_ib0[pIdx])*(v_Vdn[0][pIdx] - v_Vdn[2][pIdx])
+		j[0][pIdx] =	(m_Op_Ext_RLC->v_RLC_ib0[pIdx])*(vd[0][pIdx] - vd[2][pIdx])
 						-
-						((m_Op_Ext_RLC->v_RLC_b1[pIdx])*(m_Op_Ext_RLC->v_RLC_ib0[pIdx]))*v_Jn[1][pIdx]
+						((m_Op_Ext_RLC->v_RLC_b1[pIdx])*(m_Op_Ext_RLC->v_RLC_ib0[pIdx]))*j[1][pIdx]
 						-
-						((m_Op_Ext_RLC->v_RLC_b2[pIdx])*(m_Op_Ext_RLC->v_RLC_ib0[pIdx]))*v_Jn[2][pIdx];
+						((m_Op_Ext_RLC->v_RLC_b2[pIdx])*(m_Op_Ext_RLC->v_RLC_ib0[pIdx]))*j[2][pIdx];
 	}
 
 
@@ -191,7 +181,7 @@ void Engine_Ext_LumpedRLC::Apply2VoltagesImpl(EngType* eng, const unsigned int* 
 	for (unsigned int k = n0 ; k < n1 ; k++)
 	{
 		const unsigned int pIdx = order ? order[k] : k;
-		eng->EngType::SetVolt(dir[pIdx],pos[0][pIdx],pos[1][pIdx],pos[2][pIdx],v_Vdn[0][pIdx]);
+		eng->EngType::SetVolt(dir[pIdx],pos[0][pIdx],pos[1][pIdx],pos[2][pIdx],vd[0][pIdx]);
 	}
 }
 
@@ -201,18 +191,22 @@ void Engine_Ext_LumpedRLC::Apply2Voltages()
 		return;
 
 	// Iterate J containers
-	Rotate(v_Jn);
-	ENG_DISPATCH_ARGS(Apply2VoltagesImpl, (const unsigned int*)NULL, 0u, m_Op_Ext_RLC->RLC_count);
+	SetSlots(v_Jn, m_JBase, m_Eng->GetNumberOfTimesteps());
+	ENG_DISPATCH_ARGS(Apply2VoltagesImpl, v_Vdn, v_Jn, (const unsigned int*)NULL, 0u, m_Op_Ext_RLC->RLC_count);
 }
 
 void Engine_Ext_LumpedRLC::Apply2VoltagesLines(unsigned int x0, unsigned int x1)
 {
 	if (!m_Op_Ext_RLC->RLC_count)
 		return;
-	RotateOnce(m_RotatedJ, v_Jn);
+	const unsigned int ts = m_Eng->GetNumberOfTimesteps();
+	FDTD_FLOAT* vd[3];
+	FDTD_FLOAT* j[3];
+	SetSlots(vd, m_VdBase, ts);
+	SetSlots(j, m_JBase, ts);
 	unsigned int n0, n1;
 	LineRange(x0, x1, n0, n1);
 	// the fused sweep runs on the SSE engines only
 	if (n0<n1)
-		Apply2VoltagesImpl<Engine_sse>((Engine_sse*)m_Eng, m_Order.data(), n0, n1);
+		Apply2VoltagesImpl<Engine_sse>((Engine_sse*)m_Eng, vd, j, m_Order.data(), n0, n1);
 }

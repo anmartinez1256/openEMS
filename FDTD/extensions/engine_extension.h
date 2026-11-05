@@ -53,6 +53,7 @@ public:
 	enum Hooks {PRE_VOLT=1, POST_VOLT=2, APPLY_VOLT=4, PRE_CURR=8, POST_CURR=16, APPLY_CURR=32,
 				PREPOST_WRITES_FIELDS=64, //!< its Pre/Post hooks do change engine fields (e.g. the UPML)
 				LINE_HOOKS=128, //!< implements the *Lines() hooks below, for the fused sweep
+				TS_LOCAL=256,   //!< its line hooks also work while the threads are at different timesteps, see below
 				LEGACY_HOOKS=~0u};
 	//! Which of the six update hooks this extension implements (or'ed Hooks).
 	/*!
@@ -98,6 +99,10 @@ public:
 	  Invariant: the engine never updates the currents of the last x-line (NX-1, they stay 0) and no
 	  excitation entry can sit on it, so the fused sweep never calls the *CurrentLines() hooks for it;
 	  a current hook of an extension must therefore be a no-op on NX-1 (true for every extension in tree).
+	  TS_LOCAL: the line hooks keep no state shared by x-lines that changes from one timestep to the next, and
+	  read the timestep through GetNumberOfTimesteps() only. When every extension declares it, the threads of the
+	  fused sweep wait for their neighbours only, so they can be timesteps apart from each other (each one counts
+	  its own timesteps, which GetNumberOfTimesteps() returns on that thread).
 	  */
 	virtual void DoPreVoltageUpdatesLines(unsigned int /*x0*/, unsigned int /*x1*/) {}
 	virtual void DoPostVoltageUpdatesLines(unsigned int /*x0*/, unsigned int /*x1*/) {}

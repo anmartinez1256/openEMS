@@ -22,6 +22,9 @@
 #include "engine_sse_compressed.h"
 #include "tools/spin_barrier.h"
 #include <atomic>
+#include <chrono>
+#include <condition_variable>
+#include <mutex>
 
 #include <boost/thread.hpp>
 #include <boost/fusion/include/list.hpp>
@@ -103,6 +106,9 @@ public:
 	virtual void Apply2Current()        {throw std::runtime_error("Engine_Multithread::Apply2Current without thread ID is invalid");}
 	virtual void Apply2Current(int threadID);
 
+	//! On an engine thread of a fused sweep with neighbour flags: that thread's timestep (the threads run apart)
+	virtual unsigned int GetNumberOfTimesteps();
+
 protected:
 	Engine_Multithread(const Operator_Multithread* op);
 	void changeNumThreads(unsigned int numThreads);
@@ -138,6 +144,26 @@ protected:
 	std::string m_FusedMsg; //!< the last fused-sweep line printed (verbose>0), see ReportFused()
 	void ReportFused(const std::string& msg);
 	void FusedTimestep(int threadID);
+
+	//! Neighbour flags (the fused sweep when every extension is TS_LOCAL; OPENEMS_FLAGS=0 keeps the barriers): a thread
+	//! waits for its neighbours only, instead of the two barriers of every timestep. A timestep count one thread
+	//! publishes and its neighbour waits for (spins like SpinBarrier, then sleeps); 256 B apart, so that two of them
+	//! never share a cache line (C++11: new does not align).
+	struct StepFlag
+	{
+		std::atomic<unsigned int> value;    //!< timesteps done in this IterateTS() call
+		std::atomic<unsigned int> sleepers; //!< the neighbour sleeps on cond
+		std::mutex mutex;
+		std::condition_variable cond;
+		char pad[256-2*sizeof(std::atomic<unsigned int>)-sizeof(std::mutex)-sizeof(std::condition_variable)];
+		void Publish(unsigned int v);
+		//! returns the time it waited (0 without a wait)
+		std::chrono::steady_clock::duration WaitFor(unsigned int v);
+	};
+	bool m_UseFlags;
+	StepFlag* m_SweepDone;    //!< per thread: timesteps of which its sweep (all voltages of its slab) is done
+	StepFlag* m_BoundaryDone; //!< per thread: timesteps of which the currents of the line before its slab are done
+	void FusedTimestepFlags(int threadID, unsigned int step);
 	//! time and x-lines of each thread's sweep, to size the slabs (threads on efficiency cores are slower, PML lines cost more)
 	struct FusedStat
 	{

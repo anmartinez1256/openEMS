@@ -50,6 +50,10 @@ using std::endl;
 using std::fixed;
 using std::setprecision;
 
+//! the timestep of an engine thread in a fused sweep with neighbour flags (t_OwnTS), see GetNumberOfTimesteps()
+static thread_local bool t_OwnTS = false;
+static thread_local unsigned int t_TS = 0;
+
 //! \brief construct an Engine_Multithread instance
 //! it's the responsibility of the caller to free the returned pointer
 Engine_Multithread* Engine_Multithread::New(const Operator_Multithread* op, unsigned int numThreads)
@@ -77,6 +81,9 @@ Engine_Multithread::Engine_Multithread(const Operator_Multithread* op) : Engine_
 	m_opt_speed = false;
 	m_auto_threads = false;
 	m_Fused = false;
+	m_UseFlags = false;
+	m_SweepDone = 0;
+	m_BoundaryDone = 0;
 	m_FusedStat = 0;
 	m_FusedStatThreads = 0;
 	m_Balance = false;
@@ -189,6 +196,11 @@ void Engine_Multithread::Reset()
 		delete[] m_FusedStat;
 		m_FusedStat = 0;
 		m_FusedStatThreads = 0;
+		delete[] m_SweepDone;
+		m_SweepDone = 0;
+		delete[] m_BoundaryDone;
+		m_BoundaryDone = 0;
+		m_UseFlags = false;
 		delete m_startBarrier;
 		m_startBarrier = 0;
 		delete m_stopBarrier;
@@ -309,8 +321,17 @@ double Engine_Multithread::RunTimesteps(unsigned int n)
 {
 	const std::chrono::steady_clock::time_point t0 = std::chrono::steady_clock::now();
 	m_iterTS = n;
+	const bool flags = m_Fused && m_UseFlags;
+	if (flags)   // the flags count the timesteps of this call
+		for (unsigned int t=0; t<m_numThreads; ++t)
+		{
+			m_SweepDone[t].value.store(0, std::memory_order_relaxed);
+			m_BoundaryDone[t].value.store(0, std::memory_order_relaxed);
+		}
 	m_startBarrier->wait(); // start the threads
 	m_stopBarrier->wait(); // wait for the threads to finish n time steps
+	if (flags)   // no barrier counted them
+		numTS += n;
 	return std::chrono::duration<double>(std::chrono::steady_clock::now()-t0).count();
 }
 
@@ -602,8 +623,34 @@ void Engine_Multithread::SetupFused()
 	m_LineCost.clear();
 	const char* bal = getenv("OPENEMS_BALANCE");
 	m_Balance = (m_numThreads>1) && !(bal && *bal && (atoi(bal)==0));
+
+	// neighbour flags instead of the two barriers per timestep, when every extension's line hooks allow the threads
+	// to be at different timesteps (TS_LOCAL)
+	const char* fenv = getenv("OPENEMS_FLAGS");
+	m_UseFlags = (m_numThreads>1) && !(fenv && *fenv && (atoi(fenv)==0));
+	std::string nonlocal;
+	for (int k=0; k<N; ++k)
+		if (!(m_Eng_exts.at(k)->GetUsedHooks() & Engine_Extension::TS_LOCAL))
+		{
+			m_UseFlags = false;
+			nonlocal = m_Eng_exts.at(k)->GetExtensionName();
+		}
+	delete[] m_SweepDone;
+	delete[] m_BoundaryDone;
+	m_SweepDone = m_BoundaryDone = 0;
+	if (m_UseFlags)
+	{
+		m_SweepDone = new StepFlag[m_numThreads];
+		m_BoundaryDone = new StepFlag[m_numThreads];
+		for (unsigned int t=0; t<m_numThreads; ++t)
+		{
+			m_SweepDone[t].value = m_SweepDone[t].sleepers = 0;
+			m_BoundaryDone[t].value = m_BoundaryDone[t].sleepers = 0;
+		}
+	}
 	m_Fused = true;
-	ReportFused("fused sweep, " + std::to_string(nb) + " blocks of x-lines");
+	ReportFused("fused sweep, " + std::to_string(nb) + " blocks of x-lines" +
+				(m_UseFlags ? ", neighbour flags" : (nonlocal.empty() ? "" : ", barriers (the extension \"" + nonlocal + "\" is not TS_LOCAL)")));
 }
 
 // SetupFused() runs after every change of the thread count, and the level engines of a cylindrical multigrid
@@ -692,12 +739,101 @@ void Engine_Multithread::FusedTimestep(int threadID)
 	m_IterateBarrier->wait(&numTS);
 }
 
+unsigned int Engine_Multithread::GetNumberOfTimesteps()
+{
+	return t_OwnTS ? t_TS : numTS;
+}
+
+void Engine_Multithread::StepFlag::Publish(unsigned int v)
+{
+	// seq_cst store and load: either the neighbour sees the new value before it sleeps, or this sees it asleep
+	value.store(v, std::memory_order_seq_cst);
+	if (sleepers.load(std::memory_order_seq_cst)>0)
+	{
+		std::lock_guard<std::mutex> lock(mutex);
+		cond.notify_all();
+	}
+}
+
+std::chrono::steady_clock::duration Engine_Multithread::StepFlag::WaitFor(unsigned int v)
+{
+	if (value.load(std::memory_order_acquire)>=v)
+		return std::chrono::steady_clock::duration::zero();
+	const std::chrono::steady_clock::time_point t0 = std::chrono::steady_clock::now();
+	const std::chrono::steady_clock::time_point stop = t0 + SpinBarrier::SpinTime();
+	for (unsigned int n=1;;++n)
+	{
+		if (value.load(std::memory_order_acquire)>=v)
+			return std::chrono::steady_clock::now()-t0;
+		SpinBarrier::CpuRelax();
+		if (((n%128)==0) && (std::chrono::steady_clock::now()>stop))
+			break;
+	}
+	std::unique_lock<std::mutex> lock(mutex);
+	sleepers.fetch_add(1, std::memory_order_seq_cst);
+	while (value.load(std::memory_order_seq_cst)<v)
+		cond.wait(lock);
+	sleepers.fetch_sub(1, std::memory_order_relaxed);
+	return std::chrono::steady_clock::now()-t0;
+}
+
+void Engine_Multithread::FusedTimestepFlags(int threadID, unsigned int step)
+{
+	// FusedTimestep() with the two barriers replaced by flags of the two neighbours (step = timesteps done in this
+	// IterateTS() call). The voltages of the last line need the currents of the line after the slab, which the next
+	// thread updates (its line before the slab) and which read these voltages: the last block waits until the next
+	// thread has done that line in the previous timestep. The line before the slab needs the final voltages of the
+	// previous thread's last line, of this timestep, and that thread must have read the old currents of the line:
+	// it waits until the previous thread's sweep of this timestep is done. Same operands for every cell as with the
+	// barriers (bit-identical); the extensions' line hooks see this thread's timestep (TS_LOCAL).
+	const unsigned int b0 = m_SlabBlocks[threadID], b1 = m_SlabBlocks[threadID+1];
+	const unsigned int start = m_Blocks[b0];
+	const bool last = ((unsigned int)threadID+1==m_numThreads);
+	const std::chrono::steady_clock::time_point t0 = std::chrono::steady_clock::now();
+	std::chrono::steady_clock::duration waited = std::chrono::steady_clock::duration::zero();
+	for (unsigned int b=b0; b<b1; ++b)
+	{
+		if ((b+1==b1) && !last)
+			waited += m_BoundaryDone[threadID+1].WaitFor(step);
+		const unsigned int x0 = m_Blocks[b], x1 = m_Blocks[b+1];
+		RunLineHooks(0, x0, x1);
+		UpdateVoltages(x0, x1-x0);
+		RunLineHooks(1, x0, x1);
+		RunLineHooks(2, x0, x1);
+		FusedCurrents((x0==start) ? x0 : x0-1, x1-1);
+	}
+	m_SweepDone[threadID].Publish(step+1);
+	const std::chrono::steady_clock::time_point t1 = std::chrono::steady_clock::now();
+	FusedStat& stat = m_FusedStat[threadID];
+	stat.busy += std::chrono::duration<double>(t1-t0-waited).count();
+	stat.lines += m_Blocks[b1]-start;
+	std::chrono::steady_clock::duration waited2 = std::chrono::steady_clock::duration::zero();
+	if (threadID>0)
+	{
+		waited2 = m_SweepDone[threadID-1].WaitFor(step+1);
+		FusedCurrents(start-1, start);
+		m_BoundaryDone[threadID].Publish(step+1);
+	}
+	++t_TS;
+	static const bool timing = EnvFlag("OPENEMS_FUSED_STAT");
+	if (timing)
+	{
+		// sweep without the wait / wait for the next thread / line before the slab / wait for the previous thread
+		stat.sweep += std::chrono::duration<double>(t1-t0-waited).count();
+		stat.wait1 += std::chrono::duration<double>(waited).count();
+		stat.wait2 += std::chrono::duration<double>(waited2).count();
+		stat.bound += std::chrono::duration<double>(std::chrono::steady_clock::now()-t1-waited2).count();
+		++stat.steps;
+	}
+}
+
 void Engine_Multithread::PrintFusedStat() const
 {
 	if (!m_FusedStat || (m_FusedStatThreads==0) || (m_FusedStat[0].steps==0))
 		return;
 	cout << "Fused sweep timing (OPENEMS_FUSED_STAT), " << m_FusedStatThreads << " threads, " << m_FusedStat[0].steps << " timesteps, ms per thread"
-		 << " (sweep / wait 1 / line before the slab / wait 2):" << endl;
+		 << (m_UseFlags ? " (sweep / wait for the next thread / line before the slab / wait for the previous thread):"
+						: " (sweep / wait 1 / line before the slab / wait 2):") << endl;
 	for (unsigned int t=0; t<m_FusedStatThreads; ++t)
 	{
 		const FusedStat& s = m_FusedStat[t];
@@ -808,8 +944,17 @@ void thread::operator()()
 
 		DEBUG_TIME( Timer timer1 );
 
+		// neighbour flags: this thread counts its own timesteps (the extensions read them, see GetNumberOfTimesteps)
+		const bool flags = m_enginePtr->m_Fused && m_enginePtr->m_UseFlags;
+		t_TS = m_enginePtr->numTS;
+		t_OwnTS = flags;
 		for (unsigned int iter=0; iter<m_enginePtr->m_iterTS; ++iter)
 		{
+			if (flags)
+			{
+				m_enginePtr->FusedTimestepFlags(m_threadID, iter);
+				continue;
+			}
 			if (m_enginePtr->m_Fused)
 			{
 				m_enginePtr->FusedTimestep(m_threadID);
@@ -864,6 +1009,7 @@ void thread::operator()()
 			m_enginePtr->Apply2Current(m_threadID);
 		}
 
+		t_OwnTS = false;
 		m_enginePtr->m_stopBarrier->wait();
 	}
 

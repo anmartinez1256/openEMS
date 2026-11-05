@@ -104,7 +104,7 @@ unsigned int Engine_Ext_Dispersive::GetUsedHooks() const
 
 unsigned int Engine_Ext_Dispersive::DispersiveHooks() const
 {
-	return (AnyVoltADE() ? APPLY_VOLT : 0) | (AnyCurrADE() ? APPLY_CURR : 0) | (m_LinesReady ? LINE_HOOKS : 0);
+	return (AnyVoltADE() ? APPLY_VOLT : 0) | (AnyCurrADE() ? APPLY_CURR : 0) | (m_LinesReady ? LINE_HOOKS | TS_LOCAL : 0);
 }
 
 void Engine_Ext_Dispersive::SetNumberOfThreads(int nrThread)

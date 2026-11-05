@@ -25,7 +25,7 @@
 unsigned int Engine_Ext_Excitation::GetUsedHooks() const
 {
 	OPENEMS_HOOKS_DECLARED_BY(Engine_Ext_Excitation);
-	return APPLY_VOLT | (m_Op_Exc->GetCurrCount() ? APPLY_CURR : 0) | LINE_HOOKS;
+	return APPLY_VOLT | (m_Op_Exc->GetCurrCount() ? APPLY_CURR : 0) | LINE_HOOKS | TS_LOCAL;
 }
 
 Engine_Ext_Excitation::Engine_Ext_Excitation(Operator_Ext_Excitation* op_ext) : Engine_Extension(op_ext)

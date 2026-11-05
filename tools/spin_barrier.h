@@ -88,6 +88,8 @@ protected:
 		return 50;
 	}
 
+public:
+	//! the spin-wait hint of the CPU (also used by the neighbour flags of Engine_Multithread)
 	static inline void CpuRelax()
 	{
 		// the yield hint exists from ARMv6K (both spellings of the ARMv6KZ macro: clang, GCC) and on ARMv6-M
@@ -101,6 +103,7 @@ protected:
 #endif
 	}
 
+protected:
 	const unsigned int m_numThreads;
 	std::atomic<unsigned int> m_count;
 	std::atomic<unsigned int> m_generation;

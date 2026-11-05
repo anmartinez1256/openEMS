@@ -23,8 +23,6 @@
 #include "FDTD/engine.h"
 #include "FDTD/operator.h"
 #include "engine_extension_dispatcher.h"
-#include <atomic>
-#include <mutex>
 #include <vector>
 
 class Operator_Ext_LumpedRLC;
@@ -41,7 +39,7 @@ public:
 	Engine_Ext_LumpedRLC(Operator_Ext_LumpedRLC *op_ext_RLC);
 	virtual ~Engine_Ext_LumpedRLC();
 
-	virtual unsigned int GetUsedHooks() const {OPENEMS_HOOKS_DECLARED_BY(Engine_Ext_LumpedRLC); return PRE_VOLT | APPLY_VOLT | LINE_HOOKS;}
+	virtual unsigned int GetUsedHooks() const {OPENEMS_HOOKS_DECLARED_BY(Engine_Ext_LumpedRLC); return PRE_VOLT | APPLY_VOLT | LINE_HOOKS | TS_LOCAL;}
 
 	virtual void DoPreVoltageUpdates();
 	virtual void Apply2Voltages();
@@ -50,17 +48,17 @@ public:
 	virtual void Apply2VoltagesLines(unsigned int x0, unsigned int x1);
 
 protected:
-	//! update the elements order[n0..n1) (the elements n0..n1 if order is NULL)
+	//! update the elements order[n0..n1) (the elements n0..n1 if order is NULL), with the [n],[n-1],[n-2] containers vd and j
 	template <typename EngType>
-	void Apply2VoltagesImpl(EngType* eng, const unsigned int* order, unsigned int n0, unsigned int n1);
-	void UpdateInductorCurrents(const unsigned int* order, unsigned int n0, unsigned int n1);
+	void Apply2VoltagesImpl(EngType* eng, FDTD_FLOAT* const* vd, FDTD_FLOAT* const* j, const unsigned int* order, unsigned int n0, unsigned int n1);
+	void UpdateInductorCurrents(const FDTD_FLOAT* vd1, const unsigned int* order, unsigned int n0, unsigned int n1);
 
-	//! the [n],[n-1],[n-2] containers move on once per timestep
-	static void Rotate(FDTD_FLOAT** c);
-	//! line hooks: the first call of a timestep rotates (the other threads wait for it)
-	void RotateOnce(std::atomic<int>& stamp, FDTD_FLOAT** c);
-	std::mutex m_RotateMutex;
-	std::atomic<int> m_RotatedVd, m_RotatedJ; //!< timestep of the last rotation by a line hook
+	//! The [n],[n-1],[n-2] containers move on once per timestep, from the first one on: at timestep ts, [k] is
+	//! the array base[(k-ts-1) mod 3]. The line hooks take them from their own timestep (TS_LOCAL), the
+	//! single hooks set v_Vdn and v_Jn (the same arrays as a rotation of the pointers at every timestep).
+	static void SetSlots(FDTD_FLOAT** c, FDTD_FLOAT* const* base, unsigned int ts);
+	FDTD_FLOAT* m_VdBase[3];
+	FDTD_FLOAT* m_JBase[3];
 
 	//! the elements sorted by x-line, for the line hooks
 	std::vector<unsigned int> m_Order, m_X;
