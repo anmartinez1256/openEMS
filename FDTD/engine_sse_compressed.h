@@ -20,6 +20,7 @@
 
 #include "engine_sse.h"
 #include "operator_sse_compressed.h"
+#include <cstdint>
 
 class Engine_SSE_Compressed : public Engine_sse
 {
@@ -41,10 +42,14 @@ protected:
 	//! loop invariants in local restrict pointers (union stores otherwise make the compiler reload them).
 	void UpdateVoltages_IJKN(unsigned int startX, unsigned int numX);
 	void UpdateCurrents_IJKN(unsigned int startX, unsigned int numX);
-	//! true if both field arrays use the I-J-K-N layout (component stride 1, z stride 3) and the packed
-	//! coefficient tables below exist (not with OPENEMS_NO_PACKED_COEFF or after a failed allocation);
+	//! The loops above, with the coefficients from the packed or the geometry tables (CoefPacked, CoefGeom in the .cpp)
+	template<class C> void UpdateVoltages_IJKN_T(unsigned int startX, unsigned int numX, const C& coef);
+	template<class C> void UpdateCurrents_IJKN_T(unsigned int startX, unsigned int numX, const C& coef);
+	//! true if both field arrays use the I-J-K-N layout (component stride 1, z stride 3) and the packed or
+	//! the geometry coefficient tables below exist (not with OPENEMS_NO_PACKED_COEFF or after a failed allocation);
 	//! otherwise the generic loops run and Engine_Multithread does not fuse its sweep
 	bool UseIJKN() const;
+	bool HasCoeffTables() const {return !m_PackedV.empty() || !m_GeomV.empty();}
 
 	//! The six coefficient vectors one operator needs for a voltage (or current) update, packed in
 	//! access order (vv0 vi0 vv1 vi1 vv2 vi2 / ii0 iv0 ii1 iv1 ii2 iv2): the operator's six separate
@@ -53,9 +58,18 @@ protected:
 	//! and with them the generic loops and the unfused sweep.
 	struct PackedCoeff { f4vector c[6]; };
 	std::vector<PackedCoeff, aligned_allocator<PackedCoeff> > m_PackedV, m_PackedI;
+	//! Geometry tables, instead of the packed ones when those would exceed 4 MB (a graded mesh with many operators, the
+	//! SMA launch: 64410 operators, 12.4 MB packed); OPENEMS_COEF=packed or geom chooses one. Per operator only vi0 vi1 vi2
+	//! in m_GeomV (iv0 iv1 iv2 in m_GeomI), 48 B in the order of the operators, and the 16-bit index of its vv0 vv1 vv2
+	//! (ii0 ii1 ii2) in a small table of the distinct triplets, m_MatTabV (m_MatTabI): 100 B per operator for both
+	//! updates instead of 192. Same values, same arithmetic.
+	std::vector<f4vector, aligned_allocator<f4vector> > m_GeomV, m_GeomI, m_MatTabV, m_MatTabI;
+	std::vector<uint16_t> m_MatV, m_MatI;
 	virtual void Init();
 	virtual void Reset();
 	void BuildPackedCoeffs();
+	bool BuildGeomCoeffs();
+	void FreeCoeffTables();
 };
 
 #endif // ENGINE_SSE_COMPRESSED_H

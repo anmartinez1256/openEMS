@@ -16,8 +16,12 @@
 */
 
 #include "engine_sse_compressed.h"
+#include "tools/global.h"
 #include "tools/useful.h"
 #include <cstdlib>
+#include <cstring>
+#include <string>
+#include <unordered_map>
 
 // enable AltiVec mode on ppc64le in GCC's emmintrin.h
 #include <boost/predef.h>
@@ -58,15 +62,25 @@ void Engine_SSE_Compressed::Init()
 
 void Engine_SSE_Compressed::Reset()
 {
-	m_PackedV.clear();
-	m_PackedI.clear();
+	FreeCoeffTables();
 	Engine_sse::Reset();
+}
+
+void Engine_SSE_Compressed::FreeCoeffTables()
+{
+	std::vector<PackedCoeff, aligned_allocator<PackedCoeff> >().swap(m_PackedV);
+	std::vector<PackedCoeff, aligned_allocator<PackedCoeff> >().swap(m_PackedI);
+	std::vector<f4vector, aligned_allocator<f4vector> >().swap(m_GeomV);
+	std::vector<f4vector, aligned_allocator<f4vector> >().swap(m_GeomI);
+	std::vector<f4vector, aligned_allocator<f4vector> >().swap(m_MatTabV);
+	std::vector<f4vector, aligned_allocator<f4vector> >().swap(m_MatTabI);
+	std::vector<uint16_t>().swap(m_MatV);
+	std::vector<uint16_t>().swap(m_MatI);
 }
 
 void Engine_SSE_Compressed::BuildPackedCoeffs()
 {
-	m_PackedV.clear();
-	m_PackedI.clear();
+	FreeCoeffTables();
 	if (EnvFlag("OPENEMS_NO_PACKED_COEFF"))
 		return;
 	const size_t numOps = Op->f4_vv_Compressed[0].size();
@@ -74,6 +88,16 @@ void Engine_SSE_Compressed::BuildPackedCoeffs()
 		if ((Op->f4_vv_Compressed[n].size()!=numOps) || (Op->f4_vi_Compressed[n].size()!=numOps) ||
 		    (Op->f4_ii_Compressed[n].size()!=numOps) || (Op->f4_iv_Compressed[n].size()!=numOps))
 			return;
+	// the layout of the coefficients: the geometry tables when the packed ones would exceed 4 MB (on the Apple M5 the
+	// SMA launch's 12.4 MB of packed tables run 3-7 % faster as geometry tables at 8 threads and with the automatic
+	// thread count, within the noise at 1 and 4; models with packed tables of 1.6 MB and less lose 2-5 % at 4 threads),
+	// else packed; OPENEMS_COEF=packed or geom chooses one
+	std::string layout = (192*numOps > ((size_t)4<<20)) ? "geom" : "packed";
+	if (const char* c = getenv("OPENEMS_COEF"))
+		if (*c)
+			layout = c;
+	if ((layout=="geom") && BuildGeomCoeffs())
+		return;
 	// 192 B per operator, at most one operator per z-vector: never more than twice the field memory.
 	// Only a failed allocation skips the tables (both are freed then).
 	try
@@ -83,8 +107,7 @@ void Engine_SSE_Compressed::BuildPackedCoeffs()
 	}
 	catch (const std::bad_alloc&)
 	{
-		std::vector<PackedCoeff, aligned_allocator<PackedCoeff> >().swap(m_PackedV);
-		std::vector<PackedCoeff, aligned_allocator<PackedCoeff> >().swap(m_PackedI);
+		FreeCoeffTables();
 		std::cerr << "Engine_SSE_Compressed: out of memory for the packed coefficient tables, not packed: "
 				  << "the generic update loops run (and the multithreaded engine does not fuse its sweep)" << std::endl;
 		return;
@@ -97,6 +120,84 @@ void Engine_SSE_Compressed::BuildPackedCoeffs()
 			m_PackedI[i].c[2*n]   = Op->f4_ii_Compressed[n][i];
 			m_PackedI[i].c[2*n+1] = Op->f4_iv_Compressed[n][i];
 		}
+}
+
+namespace
+{
+// three f4vectors by their bits (one operator's vv0 vv1 vv2 or ii0 ii1 ii2)
+struct F12Key
+{
+	uint32_t w[12];
+	bool operator==(const F12Key& o) const {return memcmp(w, o.w, sizeof(w))==0;}
+};
+struct F12KeyHash
+{
+	size_t operator()(const F12Key& k) const
+	{
+		uint64_t h = 1469598103934665603ull;
+		for (int i=0; i<12; ++i)
+			h = (h ^ k.w[i]) * 1099511628211ull;
+		return (size_t)(h ^ (h>>32));
+	}
+};
+typedef std::vector<f4vector, aligned_allocator<f4vector> > F4Table;
+// the index of operator k's triplet c[0..2][k] in tab (appended when new); false when tab is full (65535 triplets)
+bool TripletIndex(std::unordered_map<F12Key, uint16_t, F12KeyHash>& lut, F4Table& tab, const F4Table* c, size_t k, uint16_t& id)
+{
+	F12Key key;
+	for (int n=0; n<3; ++n)
+		memcpy(key.w+4*n, &c[n][k], 4*sizeof(uint32_t));
+	auto it = lut.find(key);
+	if (it!=lut.end())
+	{
+		id = it->second;
+		return true;
+	}
+	if (lut.size()>=65535)
+		return false;
+	id = (uint16_t)lut.size();
+	lut.emplace(key, id);
+	for (int n=0; n<3; ++n)
+		tab.push_back(c[n][k]);
+	return true;
+}
+}
+
+bool Engine_SSE_Compressed::BuildGeomCoeffs()
+{
+	const size_t numOps = Op->f4_vv_Compressed[0].size();
+	try
+	{
+		std::unordered_map<F12Key, uint16_t, F12KeyHash> lutV, lutI;
+		m_GeomV.resize(3*numOps);
+		m_GeomI.resize(3*numOps);
+		m_MatV.resize(numOps);
+		m_MatI.resize(numOps);
+		for (size_t k=0; k<numOps; ++k)
+		{
+			for (int n=0; n<3; ++n)
+			{
+				m_GeomV[3*k+n] = Op->f4_vi_Compressed[n][k];
+				m_GeomI[3*k+n] = Op->f4_iv_Compressed[n][k];
+			}
+			if (!TripletIndex(lutV, m_MatTabV, Op->f4_vv_Compressed, k, m_MatV[k]) ||
+				!TripletIndex(lutI, m_MatTabI, Op->f4_ii_Compressed, k, m_MatI[k]))
+			{
+				FreeCoeffTables();
+				return false;
+			}
+		}
+	}
+	catch (const std::bad_alloc&)
+	{
+		FreeCoeffTables();
+		return false;
+	}
+	if (g_settings.GetVerboseLevel()>0)
+		cout << "Engine_SSE_Compressed: geometry coefficient tables, " << numOps << " operators, " << m_MatTabV.size()/3 << " + "
+			 << m_MatTabI.size()/3 << " distinct vv / ii triplets (" << (96*numOps + 4*numOps + 48*(m_MatTabV.size()/3+m_MatTabI.size()/3))/1024
+			 << " KB instead of " << 192*numOps/1024 << " KB packed)" << endl;
+	return true;
 }
 
 void Engine_SSE_Compressed::UpdateVoltages_Generic(unsigned int startX, unsigned int numX)
@@ -366,7 +467,8 @@ bool Engine_SSE_Compressed::UseIJKN() const
 	return (f4_volt_ptr->stride(0)==1) && (f4_volt_ptr->stride(3)==3) &&
 		   (f4_curr_ptr->stride(0)==1) && (f4_curr_ptr->stride(3)==3) &&
 		   (f4_volt_ptr->stride(1)==f4_curr_ptr->stride(1)) && (f4_volt_ptr->stride(2)==f4_curr_ptr->stride(2)) &&
-		   (Op->m_Op_index.stride(2)==1) && (m_PackedV.size()==Op->f4_vv_Compressed[0].size()) && (m_PackedV.size()>0);
+		   (Op->m_Op_index.stride(2)==1) && (Op->f4_vv_Compressed[0].size()>0) &&
+		   ((m_PackedV.size()==Op->f4_vv_Compressed[0].size()) || (m_MatV.size()==Op->f4_vv_Compressed[0].size()));
 }
 
 void Engine_SSE_Compressed::UpdateVoltages(unsigned int startX, unsigned int numX)
@@ -419,13 +521,47 @@ static inline f4vector ShiftLanesDown(const f4vector& a)
 	return r;
 }
 
-void Engine_SSE_Compressed::UpdateVoltages_IJKN(unsigned int startX, unsigned int numX)
+// The six coefficient vectors of one operator in access order (vv0 vi0 vv1 vi1 vv2 vi2 for the voltages, ii0 iv0 ii1 iv1
+// ii2 iv2 for the currents), from the packed table (six per operator) or from the geometry tables (vi or iv per
+// operator, vv or ii from the table of distinct triplets). The same values either way.
+namespace
+{
+struct CoefPacked
+{
+	const f4vector* __restrict pk;
+	inline void Get(unsigned int op, const f4vector* (&k)[6]) const
+	{
+		const f4vector* p = pk + 6*(size_t)op;
+		for (int i=0; i<6; ++i)
+			k[i] = p + i;
+	}
+};
+
+struct CoefGeom
+{
+	const f4vector* __restrict geom;   // per operator: vi0 vi1 vi2 (iv0 iv1 iv2)
+	const f4vector* __restrict mat;    // per triplet: vv0 vv1 vv2 (ii0 ii1 ii2)
+	const uint16_t* __restrict id;     // per operator: its triplet
+	inline void Get(unsigned int op, const f4vector* (&k)[6]) const
+	{
+		const f4vector* g = geom + 3*(size_t)op;
+		const f4vector* m = mat + 3*(size_t)id[op];
+		k[0] = m;
+		k[1] = g;
+		k[2] = m+1;
+		k[3] = g+1;
+		k[4] = m+2;
+		k[5] = g+2;
+	}
+};
+}
+
+template<class C> void Engine_SSE_Compressed::UpdateVoltages_IJKN_T(unsigned int startX, unsigned int numX, const C& coef)
 {
 	// (x,y,z-vector) holds the three components at [0..2], z-vectors are 3 apart
 	f4vector* __restrict volt = f4_volt_ptr->data();
 	const f4vector* __restrict curr = f4_curr_ptr->data();
 	const unsigned int* __restrict op_idx = Op->m_Op_index.data();
-	const PackedCoeff* __restrict pk = m_PackedV.data();   // per operator: vv0 vi0 vv1 vi1 vv2 vi2
 	const ptrdiff_t sx = f4_curr_ptr->stride(1);
 	const ptrdiff_t sy = f4_curr_ptr->stride(2);
 	const ptrdiff_t isx = Op->m_Op_index.stride(0);
@@ -445,51 +581,52 @@ void Engine_SSE_Compressed::UpdateVoltages_IJKN(unsigned int startX, unsigned in
 			f4vector_t a, t;
 			for (unsigned int z=1; z<nvec; ++z)
 			{
-				const f4vector* __restrict k = pk[ip[z]].c;
+				const f4vector* k[6];
+				coef.Get(ip[z], k);
 				f4vector* __restrict vz = v + 3*z;
 				const f4vector* __restrict cz = c + 3*z;
 
 				// x-polarization
 				t = cz[2].v - cz[2-shy].v - cz[1].v + cz[1-3].v;
-				a = vz[0].v * k[0].v;
-				vz[0].v = a + k[1].v * t;
+				a = vz[0].v * k[0]->v;
+				vz[0].v = a + k[1]->v * t;
 
 				// y-polarization
 				t = cz[0].v - cz[0-3].v - cz[2].v + cz[2-shx].v;
-				a = vz[1].v * k[2].v;
-				vz[1].v = a + k[3].v * t;
+				a = vz[1].v * k[2]->v;
+				vz[1].v = a + k[3]->v * t;
 
 				// z-polarization
 				t = cz[1].v - cz[1-shx].v - cz[0].v + cz[0-shy].v;
-				a = vz[2].v * k[4].v;
-				vz[2].v = a + k[5].v * t;
+				a = vz[2].v * k[4]->v;
+				vz[2].v = a + k[5]->v * t;
 			}
 
 			// z-vector 0
-			const f4vector* __restrict k = pk[ip[0]].c;
+			const f4vector* k[6];
+			coef.Get(ip[0], k);
 			const f4vector* __restrict ce = c + 3*(nvec-1);
 
 			t = c[2].v - c[2-shy].v - c[1].v + ShiftLanesUp(ce[1]).v;
-			a = v[0].v * k[0].v;
-			v[0].v = a + k[1].v * t;
+			a = v[0].v * k[0]->v;
+			v[0].v = a + k[1]->v * t;
 
 			t = c[0].v - ShiftLanesUp(ce[0]).v - c[2].v + c[2-shx].v;
-			a = v[1].v * k[2].v;
-			v[1].v = a + k[3].v * t;
+			a = v[1].v * k[2]->v;
+			v[1].v = a + k[3]->v * t;
 
 			t = c[1].v - c[1-shx].v - c[0].v + c[0-shy].v;
-			a = v[2].v * k[4].v;
-			v[2].v = a + k[5].v * t;
+			a = v[2].v * k[4]->v;
+			v[2].v = a + k[5]->v * t;
 		}
 	}
 }
 
-void Engine_SSE_Compressed::UpdateCurrents_IJKN(unsigned int startX, unsigned int numX)
+template<class C> void Engine_SSE_Compressed::UpdateCurrents_IJKN_T(unsigned int startX, unsigned int numX, const C& coef)
 {
 	const f4vector* __restrict volt = f4_volt_ptr->data();
 	f4vector* __restrict curr = f4_curr_ptr->data();
 	const unsigned int* __restrict op_idx = Op->m_Op_index.data();
-	const PackedCoeff* __restrict pk = m_PackedI.data();   // per operator: ii0 iv0 ii1 iv1 ii2 iv2
 	const ptrdiff_t sx = f4_volt_ptr->stride(1);
 	const ptrdiff_t sy = f4_volt_ptr->stride(2);
 	const ptrdiff_t isx = Op->m_Op_index.stride(0);
@@ -507,42 +644,60 @@ void Engine_SSE_Compressed::UpdateCurrents_IJKN(unsigned int startX, unsigned in
 			f4vector_t a, t;
 			for (unsigned int z=0; z+1<nvec; ++z)
 			{
-				const f4vector* __restrict k = pk[ip[z]].c;
+				const f4vector* k[6];
+				coef.Get(ip[z], k);
 				const f4vector* __restrict vz = v + 3*z;
 				f4vector* __restrict cz = c + 3*z;
 
 				// x-pol
 				t = vz[2].v - vz[2+sy].v - vz[1].v + vz[1+3].v;
-				a = cz[0].v * k[0].v;
-				cz[0].v = a + k[1].v * t;
+				a = cz[0].v * k[0]->v;
+				cz[0].v = a + k[1]->v * t;
 
 				// y-pol
 				t = vz[0].v - vz[0+3].v - vz[2].v + vz[2+sx].v;
-				a = cz[1].v * k[2].v;
-				cz[1].v = a + k[3].v * t;
+				a = cz[1].v * k[2]->v;
+				cz[1].v = a + k[3]->v * t;
 
 				// z-pol
 				t = vz[1].v - vz[1+sx].v - vz[0].v + vz[0+sy].v;
-				a = cz[2].v * k[4].v;
-				cz[2].v = a + k[5].v * t;
+				a = cz[2].v * k[4]->v;
+				cz[2].v = a + k[5]->v * t;
 			}
 
 			// last z-vector
-			const f4vector* __restrict k = pk[ip[nvec-1]].c;
+			const f4vector* k[6];
+			coef.Get(ip[nvec-1], k);
 			const f4vector* __restrict ve = v + 3*(nvec-1);
 			f4vector* __restrict ce = c + 3*(nvec-1);
 
 			t = ve[2].v - ve[2+sy].v - ve[1].v + ShiftLanesDown(v[1]).v;
-			a = ce[0].v * k[0].v;
-			ce[0].v = a + k[1].v * t;
+			a = ce[0].v * k[0]->v;
+			ce[0].v = a + k[1]->v * t;
 
 			t = ve[0].v - ShiftLanesDown(v[0]).v - ve[2].v + ve[2+sx].v;
-			a = ce[1].v * k[2].v;
-			ce[1].v = a + k[3].v * t;
+			a = ce[1].v * k[2]->v;
+			ce[1].v = a + k[3]->v * t;
 
 			t = ve[1].v - ve[1+sx].v - ve[0].v + ve[0+sy].v;
-			a = ce[2].v * k[4].v;
-			ce[2].v = a + k[5].v * t;
+			a = ce[2].v * k[4]->v;
+			ce[2].v = a + k[5]->v * t;
 		}
 	}
+}
+
+void Engine_SSE_Compressed::UpdateVoltages_IJKN(unsigned int startX, unsigned int numX)
+{
+	if (!m_MatV.empty())
+		UpdateVoltages_IJKN_T(startX, numX, CoefGeom{m_GeomV.data(), m_MatTabV.data(), m_MatV.data()});
+	else
+		UpdateVoltages_IJKN_T(startX, numX, CoefPacked{m_PackedV.data()->c});
+}
+
+void Engine_SSE_Compressed::UpdateCurrents_IJKN(unsigned int startX, unsigned int numX)
+{
+	if (!m_MatI.empty())
+		UpdateCurrents_IJKN_T(startX, numX, CoefGeom{m_GeomI.data(), m_MatTabI.data(), m_MatI.data()});
+	else
+		UpdateCurrents_IJKN_T(startX, numX, CoefPacked{m_PackedI.data()->c});
 }

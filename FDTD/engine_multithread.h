@@ -128,7 +128,7 @@ protected:
 	//! Fused sweep: every thread runs the voltage update, the voltage hooks, and the current update with
 	//! its hooks x-line by x-line over its own slab, so a line is still in the cache when its currents are
 	//! updated (one pass over the fields per timestep instead of two) and a timestep needs two barriers.
-	//! It needs UseIJKN() (the IJKN field layout and the packed coefficient tables) and extensions that
+	//! It needs UseIJKN() (the IJKN field layout and the packed or geometry coefficient tables) and extensions that
 	//! all implement the line hooks (LINE_HOOKS).
 	bool m_Fused;
 	std::vector<unsigned int> m_Blocks;     //!< x-line blocks [m_Blocks[b], m_Blocks[b+1]) of the fused sweep

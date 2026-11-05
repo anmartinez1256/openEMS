@@ -515,7 +515,7 @@ void Engine_Multithread::SetupFused()
 	}
 	if (!UseIJKN())
 	{
-		ReportFused(m_PackedV.empty() ? "no fused sweep, no packed coefficient tables"
+		ReportFused(!HasCoeffTables() ? "no fused sweep, no coefficient tables (packed or geometry)"
 									  : "no fused sweep, the field arrays are not in the I-J-K-N layout");
 		return;
 	}
