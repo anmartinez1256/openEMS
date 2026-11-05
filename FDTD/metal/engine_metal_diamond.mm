@@ -80,11 +80,16 @@ inline uint I(uint n, uint x, uint y, uint zv, constant Dims& d) { return ((n*d.
 inline uint F(uint n, uint x, uint y, uint z, constant Dims& d) { return I(n, x, y, z % d.nv, d)*4 + z / d.nv; }
 
 // Engine_SSE_Compressed::UpdateVoltages_IJKN / UpdateCurrents_IJKN for one f4vector, same operands in the same
-// order; packed coefficients per operator: vv0 vi0 vv1 vi1 vv2 vi2 (ii0 iv0 ii1 iv1 ii2 iv2 for the currents)
-inline void cellV(device float4* volt, device const float4* curr, device const float4* pv, device const uint* opi,
-                  constant Dims& d, uint x, uint y, uint zv)
+// order; packed coefficients per operator: vv0 vi0 vv1 vi1 vv2 vi2 (ii0 iv0 ii1 iv1 ii2 iv2 for the currents); split
+// (DIAMOND_SPLIT): per operator the indices of vi0 vi1 vi2 and vv0 | vv1 << 10 | vv2 << 20 in the table pc
+inline void cellV(device float4* volt, device const float4* curr, device const float4* pv, device const float4* pc,
+                  device const uint* opi, constant Dims& d, uint x, uint y, uint zv)
 {
+#if DIAMOND_SPLIT
+    const uint4 q = ((device const uint4*)pv)[opi[(x*d.ny + y)*d.nv + zv]];
+#else
     device const float4* c = pv + 6*opi[(x*d.ny + y)*d.nv + zv];
+#endif
     const uint xm = x > 0 ? x-1 : x, ym = y > 0 ? y-1 : y;
     const float4 c0 = curr[I(0,x,y,zv,d)], c1 = curr[I(1,x,y,zv,d)], c2 = curr[I(2,x,y,zv,d)];
     float4 c1zm, c0zm;
@@ -96,15 +101,25 @@ inline void cellV(device float4* volt, device const float4* curr, device const f
     const float4 c2ym = curr[I(2,x,ym,zv,d)], c2xm = curr[I(2,xm,y,zv,d)];
     const float4 c1xm = curr[I(1,xm,y,zv,d)], c0ym = curr[I(0,x,ym,zv,d)];
     float4 v;
+#if DIAMOND_SPLIT
+    v = volt[I(0,x,y,zv,d)]; v = v * pc[q.w & 1023u]; v = fma(pc[q.x], ((c2 - c2ym) - c1) + c1zm, v); volt[I(0,x,y,zv,d)] = v;
+    v = volt[I(1,x,y,zv,d)]; v = v * pc[(q.w >> 10) & 1023u]; v = fma(pc[q.y], ((c0 - c0zm) - c2) + c2xm, v); volt[I(1,x,y,zv,d)] = v;
+    v = volt[I(2,x,y,zv,d)]; v = v * pc[q.w >> 20]; v = fma(pc[q.z], ((c1 - c1xm) - c0) + c0ym, v); volt[I(2,x,y,zv,d)] = v;
+#else
     v = volt[I(0,x,y,zv,d)]; v = v * c[0]; v = fma(c[1], ((c2 - c2ym) - c1) + c1zm, v); volt[I(0,x,y,zv,d)] = v;
     v = volt[I(1,x,y,zv,d)]; v = v * c[2]; v = fma(c[3], ((c0 - c0zm) - c2) + c2xm, v); volt[I(1,x,y,zv,d)] = v;
     v = volt[I(2,x,y,zv,d)]; v = v * c[4]; v = fma(c[5], ((c1 - c1xm) - c0) + c0ym, v); volt[I(2,x,y,zv,d)] = v;
+#endif
 }
 
-inline void cellI(device float4* curr, device const float4* volt, device const float4* pi, device const uint* opi,
-                  constant Dims& d, uint x, uint y, uint zv)
+inline void cellI(device float4* curr, device const float4* volt, device const float4* pi, device const float4* pc,
+                  device const uint* opi, constant Dims& d, uint x, uint y, uint zv)
 {
+#if DIAMOND_SPLIT
+    const uint4 q = ((device const uint4*)pi)[opi[(x*d.ny + y)*d.nv + zv]];
+#else
     device const float4* c = pi + 6*opi[(x*d.ny + y)*d.nv + zv];
+#endif
     const float4 v0 = volt[I(0,x,y,zv,d)], v1 = volt[I(1,x,y,zv,d)], v2 = volt[I(2,x,y,zv,d)];
     float4 v1zp, v0zp;
     if (zv+1 < d.nv) { v1zp = volt[I(1,x,y,zv+1,d)]; v0zp = volt[I(0,x,y,zv+1,d)]; }
@@ -115,9 +130,15 @@ inline void cellI(device float4* curr, device const float4* volt, device const f
     const float4 v2yp = volt[I(2,x,y+1,zv,d)], v0yp = volt[I(0,x,y+1,zv,d)];
     const float4 v2xp = volt[I(2,x+1,y,zv,d)], v1xp = volt[I(1,x+1,y,zv,d)];
     float4 i;
+#if DIAMOND_SPLIT
+    i = curr[I(0,x,y,zv,d)]; i = i * pc[q.w & 1023u]; i = fma(pc[q.x], ((v2 - v2yp) - v1) + v1zp, i); curr[I(0,x,y,zv,d)] = i;
+    i = curr[I(1,x,y,zv,d)]; i = i * pc[(q.w >> 10) & 1023u]; i = fma(pc[q.y], ((v0 - v0zp) - v2) + v2xp, i); curr[I(1,x,y,zv,d)] = i;
+    i = curr[I(2,x,y,zv,d)]; i = i * pc[q.w >> 20]; i = fma(pc[q.z], ((v1 - v1xp) - v0) + v0yp, i); curr[I(2,x,y,zv,d)] = i;
+#else
     i = curr[I(0,x,y,zv,d)]; i = i * c[0]; i = fma(c[1], ((v2 - v2yp) - v1) + v1zp, i); curr[I(0,x,y,zv,d)] = i;
     i = curr[I(1,x,y,zv,d)]; i = i * c[2]; i = fma(c[3], ((v0 - v0zp) - v2) + v2xp, i); curr[I(1,x,y,zv,d)] = i;
     i = curr[I(2,x,y,zv,d)]; i = i * c[4]; i = fma(c[5], ((v1 - v1xp) - v0) + v0yp, i); curr[I(2,x,y,zv,d)] = i;
+#endif
 }
 
 // The range of a tile at half-step s: a mountain [lo, hi) is [lo + s/2, hi - (s+1)/2), a valley between two
@@ -354,7 +375,7 @@ inline void adeApply(device float* Fd, device const uint4* ar, device const uint
 // Apply in extension order). Metal has 31 buffer slots, so the extension data come in three blobs (U, Fc, St).
 kernel void diamond(device float4* volt [[buffer(0)]], device float4* curr [[buffer(1)]],
                     device const float4* pv [[buffer(2)]], device const float4* pi [[buffer(3)]],
-                    device const uint* opi [[buffer(4)]],
+                    device const uint* opi [[buffer(4)]], device const float4* pc [[buffer(5)]],
                     device const int2* xr [[buffer(6)]], device const int2* yr [[buffer(7)]],
                     constant Phase& p [[buffer(8)]], constant Ext& e [[buffer(9)]],
                     device const uint* U [[buffer(10)]], device const float* Fc [[buffer(11)]],
@@ -462,8 +483,8 @@ kernel void diamond(device float4* volt [[buffer(0)]], device float4* curr [[buf
         {
             const uint zv = i % d.nv, r = i / d.nv;
             const uint y = uint(sy.x) + r % uint(wy), x = uint(sx.x) + r / uint(wy);
-            if (eStep) cellV(volt, curr, pv, opi, d, x, y, zv);
-            else if (x + 1 < d.nx && y + 1 < d.ny) cellI(curr, volt, pi, opi, d, x, y, zv);
+            if (eStep) cellV(volt, curr, pv, pc, opi, d, x, y, zv);
+            else if (x + 1 < d.nx && y + 1 < d.ny) cellI(curr, volt, pi, pc, opi, d, x, y, zv);
         }
         threadgroup_barrier(mem_flags::mem_device);
 #if DIAMOND_UPML
@@ -555,6 +576,7 @@ struct Phase { uint32_t depth, ts0, xtype, ytype, lbase, nty; };
 struct Ext { uint32_t vcount, ccount, length, period0, numMur, numApply, rlcSerial, numUpml, numAde; };
 struct MurFace { uint32_t ny, nyP, nyPP, line, shift, n1, startTS, coef, size; };
 struct Upml { uint32_t x0, y0, z0, nx, ny, nz, cidx, flux; };
+typedef std::array<uint32_t,4> U4;   // a uint4 in the kernel: 16-byte aligned in U
 struct Ofs { uint32_t xrun, xro, xele, mf, apply, rlcI, roff, rlist, upml, arun, aro, aele;
 			 uint32_t vsig, csig, mcoef, rlcC, ucoef, adeC;
 			 uint32_t mscr, rlcS, adeS; };
@@ -614,7 +636,8 @@ struct Engine_Metal_Diamond::State
 	id<MTLCommandQueue> queue = nil;
 	id<MTLComputePipelineState> pso = nil;
 	id<MTLBuffer> volt = nil, curr = nil;
-	id<MTLBuffer> pv = nil, pi = nil, opi = nil;
+	id<MTLBuffer> pv = nil, pi = nil, opi = nil, pc = nil;
+	bool split = false;   // the split coefficient tables
 	id<MTLBuffer> tiles[4] = {nil, nil, nil, nil};   // x mountains, x valleys, y mountains, y valleys
 	unsigned int numTiles[4] = {0, 0, 0, 0};
 	id<MTLBuffer> U = nil, Fc = nil, St = nil;   // the extension data: read-only words, read-only floats, state
@@ -822,6 +845,90 @@ bool Engine_Metal_Diamond::SetupGPU()
 		return false;
 	}
 
+	// operator: packed coefficients (6 f4vectors per operator, in access order: vv0 vi0 vv1 vi1 vv2 vi2, ii0 iv0 ..) and the
+	// index per f4vector; or split (OPENEMS_DIAMOND_COEF=packed or split): the distinct f4vectors in one table pc, vv and ii
+	// first (at most 1024: 10-bit indices), and per operator the indices of vi0 vi1 vi2 and vv0 | vv1 << 10 | vv2 << 20 (ii,
+	// iv the same). The operators share most of their f4vectors (the SMA launch: 12.4 MB packed; split 1.4 MB and 2.1 MB
+	// of indices), so the caches hold the coefficients of more cells, for one more dependent load per cell. Split by default
+	// when the packed coefficients of a 16x16-column block exceed 32 KB on average (SMA launch 275 KB, GCPW line 46 KB:
+	// split 4-6 % and 3-4 % faster; patch x5 21 KB, notch x3 6 KB: no clear difference either way)
+	const size_t numOps = Op->f4_vv_Compressed[0].size();
+	double blockKB = 0;
+	{
+		std::vector<uint32_t> seen(numOps, 0);
+		size_t blocks = 0, reads = 0;
+		for (unsigned int bx=0; bx<numLines[0]; bx+=16)
+			for (unsigned int by=0; by<numLines[1]; by+=16)
+			{
+				++blocks;
+				for (unsigned int x=bx; x<std::min(bx+16, numLines[0]); ++x)
+					for (unsigned int y=by; y<std::min(by+16, numLines[1]); ++y)
+						for (unsigned int zv=0; zv<numVectors; ++zv)
+						{
+							const unsigned int op = Op->m_Op_index(x,y,zv);
+							if (seen[op]!=blocks)
+							{
+								seen[op] = blocks;
+								++reads;
+							}
+						}
+			}
+		blockKB = blocks ? 192.0*reads/blocks/1024 : 0;
+	}
+	bool split = blockKB > 32;
+	if (const char* c = getenv("OPENEMS_DIAMOND_COEF"))
+		if (*c)
+			split = (strcmp(c, "split")==0);
+	std::vector<f4vector> pv, pi, pc;
+	std::vector<U4> qv, qi;
+	if (split)
+	{
+		std::map<std::array<uint32_t,4>, uint32_t> lut;
+		auto idx = [&](const f4vector& v) -> uint32_t
+		{
+			std::array<uint32_t,4> key;
+			memcpy(key.data(), &v, sizeof(key));
+			auto it = lut.find(key);
+			if (it==lut.end())
+			{
+				it = lut.insert(std::make_pair(key, (uint32_t)pc.size())).first;
+				pc.push_back(v);
+			}
+			return it->second;
+		};
+		qv.assign(numOps, U4{0, 0, 0, 0});
+		qi.assign(numOps, U4{0, 0, 0, 0});
+		for (size_t k=0; k<numOps; ++k)
+			for (int n=0; n<3; ++n)
+			{
+				qv[k][3] |= idx(Op->f4_vv_Compressed[n][k]) << (10*n);
+				qi[k][3] |= idx(Op->f4_ii_Compressed[n][k]) << (10*n);
+			}
+		if (pc.size()>1024)
+			split = false;
+		else
+			for (size_t k=0; k<numOps; ++k)
+				for (int n=0; n<3; ++n)
+				{
+					qv[k][n] = idx(Op->f4_vi_Compressed[n][k]);
+					qi[k][n] = idx(Op->f4_iv_Compressed[n][k]);
+				}
+	}
+	if (!split)
+	{
+		pc.clear();
+		pv.resize(6*numOps);
+		pi.resize(6*numOps);
+		for (size_t k=0; k<numOps; ++k)
+			for (int n=0; n<3; ++n)
+			{
+				pv[6*k+2*n] = Op->f4_vv_Compressed[n][k];
+				pv[6*k+2*n+1] = Op->f4_vi_Compressed[n][k];
+				pi[6*k+2*n] = Op->f4_ii_Compressed[n][k];
+				pi[6*k+2*n+1] = Op->f4_iv_Compressed[n][k];
+			}
+	}
+
 	@autoreleasepool
 	{
 		NSError* error = nil;
@@ -845,6 +952,7 @@ bool Engine_Metal_Diamond::SetupGPU()
 									   @"DIAMOND_UPML": @(upmls.empty() ? 0 : 1),
 									   @"DIAMOND_ADE": @(lors.empty() ? 0 : 1),
 									   @"DIAMOND_DEBYE": @(hasDebye ? 1 : 0),
+									   @"DIAMOND_SPLIT": @(split ? 1 : 0),
 									   @"DIAMOND_NX": @(numLines[0]), @"DIAMOND_NY": @(numLines[1]),
 									   @"DIAMOND_NZ": @(numLines[2]), @"DIAMOND_NV": @(numVectors)};
 		id<MTLLibrary> lib = [md.dev newLibraryWithSource:[NSString stringWithUTF8String:DIAMOND_SOURCE] options:options error:&error];
@@ -869,19 +977,18 @@ bool Engine_Metal_Diamond::SetupGPU()
 			return [md.dev newBufferWithBytes:data length:bytes options:MTLResourceStorageModeShared];
 		};
 
-		// operator: packed coefficients (6 f4vectors per operator, in access order) and the index per f4vector
-		const size_t numOps = Op->f4_vv_Compressed[0].size();
-		std::vector<f4vector> pv(6*numOps), pi(6*numOps);
-		for (size_t k=0; k<numOps; ++k)
-			for (int n=0; n<3; ++n)
-			{
-				pv[6*k+2*n] = Op->f4_vv_Compressed[n][k];
-				pv[6*k+2*n+1] = Op->f4_vi_Compressed[n][k];
-				pi[6*k+2*n] = Op->f4_ii_Compressed[n][k];
-				pi[6*k+2*n+1] = Op->f4_iv_Compressed[n][k];
-			}
-		md.pv = buffer(pv.data(), pv.size()*sizeof(f4vector));
-		md.pi = buffer(pi.data(), pi.size()*sizeof(f4vector));
+		if (split)
+		{
+			md.pv = buffer(qv.data(), qv.size()*sizeof(U4));
+			md.pi = buffer(qi.data(), qi.size()*sizeof(U4));
+		}
+		else
+		{
+			md.pv = buffer(pv.data(), pv.size()*sizeof(f4vector));
+			md.pi = buffer(pi.data(), pi.size()*sizeof(f4vector));
+		}
+		md.pc = buffer(pc.data(), pc.size()*sizeof(f4vector));
+		md.split = split;
 		std::vector<uint32_t> opi((size_t)numLines[0]*numLines[1]*numVectors);
 		for (unsigned int x=0; x<numLines[0]; ++x)
 			for (unsigned int y=0; y<numLines[1]; ++y)
@@ -929,7 +1036,6 @@ bool Engine_Metal_Diamond::SetupGPU()
 		std::vector<float> Fb;
 		size_t Sn = 0;
 		auto addU = [&](const uint32_t* p, size_t n) -> uint32_t { const size_t o = Ub.size(); Ub.insert(Ub.end(), p, p+n); return (uint32_t)o; };
-		typedef std::array<uint32_t,4> U4;   // a uint4 in the kernel: 16-byte aligned in U
 		auto addU4 = [&](const std::vector<U4>& v) -> uint32_t { Ub.resize((Ub.size()+3) & ~(size_t)3, 0); return addU((const uint32_t*)v.data(), 4*v.size()); };
 		auto addF = [&](const float* p, size_t n) -> uint32_t { const size_t o = Fb.size(); Fb.insert(Fb.end(), p, p+n); return (uint32_t)o; };
 		auto addS = [&](size_t n) -> uint32_t { const size_t o = Sn; Sn += n; return (uint32_t)o; };
@@ -1239,7 +1345,8 @@ bool Engine_Metal_Diamond::SetupGPU()
 
 		if (g_settings.GetVerboseLevel()>0)
 			cout << "Engine_Metal_Diamond: " << numLines[0] << "x" << numLines[1] << "x" << numLines[2] << " cells (" << numVectors
-				 << " z-vectors, " << numOps << " operators), K=" << md.K << ", tiles " << M << "," << Vw << " (x " << md.numTiles[0] << "+" << md.numTiles[1]
+				 << " z-vectors, " << numOps << " operators, " << (int)(blockKB+0.5) << " KB per 16x16 columns, "
+				 << (md.split ? "split coefficients (" + std::to_string(pc.size()) + " f4vectors)" : std::string("packed coefficients")) << "), K=" << md.K << ", tiles " << M << "," << Vw << " (x " << md.numTiles[0] << "+" << md.numTiles[1]
 				 << ", y " << md.numTiles[2] << "+" << md.numTiles[3] << "), " << md.tg << " threads per tile, " << murs.size()
 				 << " Mur faces, " << md.numRLC << " lumped RLC elements, " << upmls.size() << " UPML boxes (" << upmlCells << " cells, "
 				 << utab.size()/6 << " coefficient sets), " << numADE << " dispersive positions, " << md.ext.vcount << "+" << md.ext.ccount << " excitation entries" << endl;
@@ -1275,8 +1382,8 @@ bool Engine_Metal_Diamond::IterateTS(unsigned int iterTS)
 				cb = [md.queue commandBuffer];
 				enc = [cb computeCommandEncoder];
 				[enc setComputePipelineState:md.pso];
-				id<MTLBuffer> bufs[] = {md.volt, md.curr, md.pv, md.pi, md.opi};
-				for (int n=0; n<5; ++n)
+				id<MTLBuffer> bufs[] = {md.volt, md.curr, md.pv, md.pi, md.opi, md.pc};
+				for (int n=0; n<6; ++n)
 					[enc setBuffer:bufs[n] offset:0 atIndex:n];
 				[enc setBytes:&md.ext length:sizeof(Ext) atIndex:9];
 				[enc setBuffer:md.U offset:0 atIndex:10];
