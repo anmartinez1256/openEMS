@@ -271,9 +271,14 @@ double Engine_Interface_FDTD::CalcFastEnergy() const
 {
 	// the engine knows how its fields are stored
 	unsigned int numNodes[3];
+	GetFastEnergyNodes(numNodes);
+	return m_Eng->CalcFastEnergy(numNodes);
+}
+
+void Engine_Interface_FDTD::GetFastEnergyNodes(unsigned int numNodes[3]) const
+{
 	for (int n=0; n<3; ++n)
 		numNodes[n] = m_Op->GetNumberOfLines(n)-1;
-	return m_Eng->CalcFastEnergy(numNodes);
 }
 
 void Engine_Interface_FDTD::PrepareFieldAccess()

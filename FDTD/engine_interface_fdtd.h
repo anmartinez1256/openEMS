@@ -55,6 +55,8 @@ public:
 	virtual unsigned int GetNumberOfTimesteps() const {return m_Eng->GetNumberOfTimesteps();}
 
 	virtual double CalcFastEnergy() const;
+	//! the nodes CalcFastEnergy() sums: the first numNodes[n] in each direction
+	void GetFastEnergyNodes(unsigned int numNodes[3]) const;
 
 	// the fields belong to the engine, which may keep them elsewhere (e.g. on a GPU)
 	virtual void PrepareFieldAccess();

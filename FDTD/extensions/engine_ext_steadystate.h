@@ -21,6 +21,10 @@
 #include "engine_extension.h"
 #include "FDTD/engine.h"
 #include "FDTD/operator.h"
+#include "tools/array_ops.h"
+#include "tools/arraylib/array_e.h"
+#include <atomic>
+#include <mutex>
 
 class Operator_Ext_SteadyState;
 class Engine_Interface_FDTD;
@@ -33,13 +37,38 @@ public:
 	Engine_Ext_SteadyState(Operator_Ext_SteadyState* op_ext);
 	virtual ~Engine_Ext_SteadyState();
 
+	virtual void SetNumberOfThreads(int nrThread);
+	virtual unsigned int GetUsedHooks() const {OPENEMS_HOOKS_DECLARED_BY(Engine_Ext_SteadyState); return APPLY_VOLT | (m_Lines ? LINE_HOOKS : 0);}
+
 	virtual void Apply2Voltages();
 	virtual void Apply2Current();
+	virtual void Apply2VoltagesLines(unsigned int x0, unsigned int x1);
 
 	void SetEngineInterface(Engine_Interface_FDTD* eng_if) {m_Eng_Interface=eng_if;}
 	double GetLastDiff() {return m_last_max_diff;}
 
 protected:
+	//! the E-field records of timestep TS, the probes on the x-lines [x0, x1) only
+	void RecordProbes(unsigned int TS, unsigned int x0, unsigned int x1);
+	//! timestep TS ends a period (from the third period on): compare the last two periods
+	bool IsEvaluationStep(unsigned int TS) const;
+	void EvaluatePeriod(unsigned int TS, double curr_total_energy);
+
+	//! Line hooks for the fused sweep of the SSE engines (fields in the I-J-K-N layout). The unfused hook sees all fields
+	//! at one point of the timestep: the voltages after their update, the post hooks and the apply hooks before this one
+	//! (the extension comes first in that order), the currents before their update. The fused sweep has that state line
+	//! by line, at this hook: the hook records the probes of its lines, and on an evaluation step copies the voltages and
+	//! currents of its lines; the thread that copies the last line evaluates the period from the copies with the same
+	//! energy sum (Engine_sse::FastEnergy). Same values, same operations (bit-identical). The copies (24 B per cell) are
+	//! allocated at the first evaluation step that runs the fused sweep.
+	bool m_Lines;
+	bool m_LinesChecked;
+	void SetupLines();
+	ArrayLib::ArrayENG<f4vector> m_SnapVolt, m_SnapCurr;
+	std::once_flag m_SnapOnce;
+	std::atomic<unsigned int> m_SnapLines; //!< x-lines copied in this evaluation step
+	unsigned int m_NX;
+
 	Operator_Ext_SteadyState* m_Op_SS;
 	double m_last_max_diff;
 	std::vector<double*> m_E_records;

@@ -86,6 +86,9 @@ public:
 
 	//! The energy estimate from the sse vectors, including the last z-line(s)
 	virtual double CalcFastEnergy(const unsigned int numNodes[3]) const;
+	//! The same sum over the given arrays (this engine's layout and extents, e.g. copies of its fields)
+	static double FastEnergy(const ArrayLib::ArrayENG<f4vector>& f4_volt, const ArrayLib::ArrayENG<f4vector>& f4_curr,
+							 const unsigned int numNodes[3], unsigned int numVectors);
 
 protected:
 	Engine_sse(const Operator_sse* op);

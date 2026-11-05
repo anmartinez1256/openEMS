@@ -280,6 +280,12 @@ void Engine_sse::UpdateCurrents(unsigned int startX, unsigned int numX)
 
 double Engine_sse::CalcFastEnergy(const unsigned int numNodes[3]) const
 {
+	return FastEnergy(*f4_volt_ptr, *f4_curr_ptr, numNodes, numVectors);
+}
+
+double Engine_sse::FastEnergy(const ArrayLib::ArrayENG<f4vector>& f4_volt, const ArrayLib::ArrayENG<f4vector>& f4_curr,
+							  const unsigned int numNodes[3], unsigned int numVectors)
+{
 	f4vector E_energy;
 	E_energy.f[0]=0;
 	E_energy.f[1]=0;
@@ -287,9 +293,6 @@ double Engine_sse::CalcFastEnergy(const unsigned int numNodes[3]) const
 	E_energy.f[3]=0;
 	f4vector H_energy;
 	H_energy = E_energy;
-
-	ArrayLib::ArrayENG<f4vector>& f4_volt = *f4_volt_ptr;
-	ArrayLib::ArrayENG<f4vector>& f4_curr = *f4_curr_ptr;
 
 	unsigned int pos[3];
 	for (pos[0]=0; pos[0]<numNodes[0]; ++pos[0])
