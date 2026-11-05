@@ -638,14 +638,28 @@ struct Engine_Metal_Diamond::State
 	id<MTLBuffer> volt = nil, curr = nil;
 	id<MTLBuffer> pv = nil, pi = nil, opi = nil, pc = nil;
 	bool split = false;   // the split coefficient tables
-	id<MTLBuffer> tiles[4] = {nil, nil, nil, nil};   // x mountains, x valleys, y mountains, y valleys
-	unsigned int numTiles[4] = {0, 0, 0, 0};
-	id<MTLBuffer> U = nil, Fc = nil, St = nil;   // the extension data: read-only words, read-only floats, state
-	Ofs ofs = {};
+	// a tiling: K time steps per block, mountains of width M and valleys of width V; its tiles (x mountains, x valleys,
+	// y mountains, y valleys), threads per tile, and the extension words (U: the shared ones, then its per-tile lists)
+	struct Tiling
+	{
+		unsigned int K = 4, M = 8, V = 8, tg = 0;
+		id<MTLBuffer> tiles[4] = {nil, nil, nil, nil};
+		unsigned int numTiles[4] = {0, 0, 0, 0}, lbase[4] = {0, 0, 0, 0};
+		id<MTLBuffer> U = nil;
+		Ofs ofs = {};
+		double best = 0;           // while tuning: the least GPU time per step of its timed command buffers
+		unsigned int samples = 0;
+	};
+	std::vector<Tiling> tilings;
+	unsigned int cur = 0;          // the tiling in use
+	bool tuning = false;           // the command buffers take the tilings in turn until each has `tune` timed ones
+	bool warm = false;             // the first command buffer of the run is encoded
+	unsigned int tune = 4;
+	unsigned long long rr = 0, tuneSteps = 0;
+	id<MTLBuffer> Fc = nil, St = nil;   // the extension data of all tilings: read-only floats, state
 	unsigned int numRLC = 0;
-	unsigned int lbase[4] = {0, 0, 0, 0};
 	Ext ext = {};
-	unsigned int K = 4, tg = 0, batch = 64;
+	unsigned int batch = 64;
 	// OPENEMS_DIAMOND_TIMING=1 prints these at the end: setup and IterateTS wall times, the calls, the GPU time of the
 	// command buffers (busy) and from the first start to the last end of each call (span); =2 also commits every phase
 	// dispatch in a command buffer of its own and adds the GPU time per phase (MM, MV, VM, VV; slower, for the split)
@@ -699,7 +713,8 @@ Engine_Metal_Diamond::~Engine_Metal_Diamond()
 			 << " command buffers, GPU busy " << md.gpuBusy << " s, span " << md.gpuSpan << " s";
 		if (md.timing>1)
 			cout << "; per phase MM " << md.phaseSec[0] << " MV " << md.phaseSec[1] << " VM " << md.phaseSec[2] << " VV " << md.phaseSec[3] << " s";
-		cout << endl;
+		const State::Tiling& c = md.tilings[md.cur];
+		cout << "; K=" << c.K << " tiles " << c.M << "," << c.V << (md.tuning ? " (still tuning)" : "") << endl;
 	}
 	Reset();
 	delete m_md;
@@ -996,42 +1011,11 @@ bool Engine_Metal_Diamond::SetupGPU()
 					opi[((size_t)x*numLines[1]+y)*numVectors+zv] = Op->m_Op_index(x,y,zv);
 		md.opi = buffer(opi.data(), opi.size()*sizeof(uint32_t));
 
-		// tiles
-		md.K = std::max(1u, EnvUInt("OPENEMS_DIAMOND_K", 4));
-		unsigned int M = 2*md.K, Vw = 2*md.K;
-		if (const char* t = getenv("OPENEMS_DIAMOND_TILE"))
-			if (*t)
-			{
-				unsigned int m=0, v=0;
-				if ((sscanf(t, "%u%*[,:]%u", &m, &v)==2) && (m>=2*md.K-1))
-				{
-					M = m;
-					Vw = v;
-				}
-				else
-					cerr << "Engine_Metal_Diamond: OPENEMS_DIAMOND_TILE=" << t << " ignored (M,V or M:V with M >= 2K-1 = " << 2*md.K-1 << ")" << endl;
-			}
-		std::vector<int32_t> t[4];
-		DiamondTiles(numLines[0], M, Vw, md.K, t[0], t[1]);
-		DiamondTiles(numLines[1], M, Vw, md.K, t[2], t[3]);
-		for (int n=0; n<4; ++n)
-		{
-			md.numTiles[n] = t[n].size()/2;
-			md.tiles[n] = buffer(t[n].data(), t[n].size()*sizeof(int32_t));
-		}
-		// threads per tile: by default the power of two at or below 3/5 of a mountain's f4vectors per half-step (M*M*nv),
-		// 256 to 1024 (OPENEMS_DIAMOND_TG; a K, threads sweep on the five models that run on the GPU: idle threads in a
-		// small tile cost barrier time; at K=4 the patch tutorial (768 f4vectors) ran best with 256, the SMA launch (960)
-		// with 512, patch x5 (2880) with 512-1024)
-		unsigned int tgDef = 256;
-		while ((tgDef < 1024) && (5*2*tgDef <= 3*(size_t)M*M*numVectors))
-			tgDef *= 2;
-		md.tg = std::min<unsigned int>(EnvUInt("OPENEMS_DIAMOND_TG", 0) ? EnvUInt("OPENEMS_DIAMOND_TG", 0) : tgDef,
-									   (unsigned int)md.pso.maxTotalThreadsPerThreadgroup);
 		md.batch = std::max(1u, EnvUInt("OPENEMS_DIAMOND_BATCH", 64));
 		md.timing = EnvUInt("OPENEMS_DIAMOND_TIMING", 0);
 
-		// the extension data in three blobs: read-only words (Ub), read-only floats (Fb) and the state (Sn floats, zero)
+		// the extension data in three blobs: read-only words (Ub), read-only floats (Fb) and the state (Sn floats, zero); the
+		// per-tile lists depend on the tiling and follow the shared words in each tiling's copy of them (below)
 		std::vector<uint32_t> Ub;
 		std::vector<float> Fb;
 		size_t Sn = 0;
@@ -1040,71 +1024,6 @@ bool Engine_Metal_Diamond::SetupGPU()
 		auto addF = [&](const float* p, size_t n) -> uint32_t { const size_t o = Fb.size(); Fb.insert(Fb.end(), p, p+n); return (uint32_t)o; };
 		auto addS = [&](size_t n) -> uint32_t { const size_t o = Sn; Sn += n; return (uint32_t)o; };
 
-		// per tile of each phase (the kernel's li = lbase[phase] + tile x * tiles in y + tile y), the entries inside the union
-		// of its ranges (a mountain stays in [lo, hi), a valley in [lo-K, hi+K)), in entry order
-		unsigned int numAll = 0;
-		for (int ph=0; ph<4; ++ph)
-		{
-			md.lbase[ph] = numAll;
-			numAll += md.numTiles[ph/2]*md.numTiles[2+ph%2];
-		}
-		auto lists = [&](const std::vector<uint32_t>& ent, size_t stride, std::vector<uint32_t>& off, std::vector<uint32_t>& list)
-		{
-			const size_t count = ent.size()/stride;
-			off.assign(1, 0);
-			list.clear();
-			for (int ph=0; ph<4; ++ph)
-			{
-				const int xt = ph/2, yt = ph%2;
-				for (unsigned int tx=0; tx<md.numTiles[xt]; ++tx)
-				{
-					const int x0 = t[xt][2*tx] - (xt ? (int)md.K : 0), x1 = t[xt][2*tx+1] + (xt ? (int)md.K : 0);
-					for (unsigned int ty=0; ty<md.numTiles[2+yt]; ++ty)
-					{
-						const int y0 = t[2+yt][2*ty] - (yt ? (int)md.K : 0), y1 = t[2+yt][2*ty+1] + (yt ? (int)md.K : 0);
-						for (size_t k=0; k<count; ++k)
-						{
-							const int x = ent[stride*k], y = ent[stride*k+1];
-							if ((x>=x0) && (x<x1) && (y>=y0) && (y<y1))
-								list.push_back(k);
-						}
-						off.push_back(list.size());
-					}
-				}
-			}
-		};
-		// the same for runs (float index, x << 16 | y, ...; each segment sorted by x): per tile, the runs of every segment inside
-		// the union of its ranges, the segments one after the other; off: the start of each (tile, segment), then the end
-		auto tileRuns = [&](const std::vector<std::vector<U4> >& segs, std::vector<U4>& out, std::vector<uint32_t>& off)
-		{
-			out.clear();
-			off.clear();
-			for (int ph=0; ph<4; ++ph)
-			{
-				const int xt = ph/2, yt = ph%2;
-				for (unsigned int tx=0; tx<md.numTiles[xt]; ++tx)
-				{
-					const int x0 = std::max(0, t[xt][2*tx] - (xt ? (int)md.K : 0)), x1 = t[xt][2*tx+1] + (xt ? (int)md.K : 0);
-					for (unsigned int ty=0; ty<md.numTiles[2+yt]; ++ty)
-					{
-						const int y0 = t[2+yt][2*ty] - (yt ? (int)md.K : 0), y1 = t[2+yt][2*ty+1] + (yt ? (int)md.K : 0);
-						for (const std::vector<U4>& seg : segs)
-						{
-							off.push_back(out.size());
-							auto r = std::lower_bound(seg.begin(), seg.end(), (uint32_t)x0 << 16, [](const U4& a, uint32_t v) { return a[1] < v; });
-							for (; (r!=seg.end()) && ((int)((*r)[1] >> 16) < x1); ++r)
-							{
-								const int y = (*r)[1] & 0xffff;
-								if ((y>=y0) && (y<y1))
-									out.push_back(*r);
-							}
-						}
-					}
-				}
-			}
-			off.push_back(out.size());
-		};
-
 		// excitation entries and the signals, as runs per step type (voltages, currents): the entries of one field value in
 		// entry order (the CPU's: its line hooks sort the entries stably by x); run: float index, x << 16 | y, first and end
 		// entry; entry: amplitude (float bits), delay
@@ -1112,7 +1031,7 @@ bool Engine_Metal_Diamond::SetupGPU()
 		std::vector<std::vector<U4> > xruns(2);
 		std::vector<uint32_t> xele;
 		md.ext = {0, 0, 0, 0, (uint32_t)murs.size(), (uint32_t)applyOrder.size(), 0, (uint32_t)upmls.size()};
-		md.ofs = {};
+		Ofs ofs = {};
 		if (excSeen && exc)
 		{
 			for (int st=0; st<2; ++st)
@@ -1146,16 +1065,11 @@ bool Engine_Metal_Diamond::SetupGPU()
 			md.ext.ccount = exc->Curr_Count;
 			md.ext.length = len;
 			md.ext.period0 = sig->GetSignalPeriod()>0 ? (uint32_t)int(sig->GetSignalPeriod()/sig->GetTimestep()) : 0;
-			md.ofs.vsig = addF(sig->GetVoltageSignal(), (exc->Volt_Count && len) ? len : 0);
-			md.ofs.csig = addF(sig->GetCurrentSignal(), (exc->Curr_Count && len) ? len : 0);
+			ofs.vsig = addF(sig->GetVoltageSignal(), (exc->Volt_Count && len) ? len : 0);
+			ofs.csig = addF(sig->GetCurrentSignal(), (exc->Curr_Count && len) ? len : 0);
 		}
-		std::vector<U4> xrun;
-		std::vector<uint32_t> xro;
-		tileRuns(xruns, xrun, xro);
-		md.ofs.xro = addU(xro.data(), xro.size());
-		md.ofs.xrun = addU4(xrun);
 		Ub.resize((Ub.size()+3) & ~(size_t)3, 0);   // the entries are uint2
-		md.ofs.xele = addU(xele.data(), xele.size());
+		ofs.xele = addU(xele.data(), xele.size());
 
 		// Mur faces, in Apply order: coefficients nyP then nyPP per face, a scratch array of the same size
 		std::vector<MurFace> faces;
@@ -1168,11 +1082,11 @@ bool Engine_Metal_Diamond::SetupGPU()
 			coef.insert(coef.end(), m->m_Mur_Coeff_nyP.data(), m->m_Mur_Coeff_nyP.data()+size);
 			coef.insert(coef.end(), m->m_Mur_Coeff_nyPP.data(), m->m_Mur_Coeff_nyPP.data()+size);
 		}
-		md.ofs.mf = addU((const uint32_t*)faces.data(), faces.size()*sizeof(MurFace)/4);
-		md.ofs.mcoef = addF(coef.data(), coef.size());
-		md.ofs.mscr = addS(coef.size());
+		ofs.mf = addU((const uint32_t*)faces.data(), faces.size()*sizeof(MurFace)/4);
+		ofs.mcoef = addF(coef.data(), coef.size());
+		ofs.mscr = addS(coef.size());
 
-		// lumped RLC elements of all extensions in Apply order, their per-tile lists and a zero state (as the CPU's)
+		// lumped RLC elements of all extensions in Apply order (their per-tile lists below) and a zero state (as the CPU's)
 		std::vector<uint32_t> ri;
 		std::vector<float> rc;
 		std::set<std::array<uint32_t,5> > cells;
@@ -1191,14 +1105,10 @@ bool Engine_Metal_Diamond::SetupGPU()
 			}
 		}
 		md.numRLC = ri.size()/5;
-		std::vector<uint32_t> ro, rl;
-		lists(ri, 5, ro, rl);
-		md.ofs.rlcI = addU(ri.data(), ri.size());
-		md.ofs.rlcC = addF(rc.data(), rc.size());
-		md.ofs.rlcS = addS((size_t)md.numRLC*5);
-		md.ofs.roff = addU(ro.data(), ro.size());
-		md.ofs.rlist = addU(rl.data(), rl.size());
-		md.ofs.apply = addU(applyOrder.data(), applyOrder.size());
+		ofs.rlcI = addU(ri.data(), ri.size());
+		ofs.rlcC = addF(rc.data(), rc.size());
+		ofs.rlcS = addS((size_t)md.numRLC*5);
+		ofs.apply = addU(applyOrder.data(), applyOrder.size());
 
 		// UPML boxes: one table of the distinct coefficient sets (vv vvfo vvfn ii iifo iifn) of all boxes, an index per
 		// component and box cell [n][x][y][z], the flux (zero, as the CPU's): voltages [n][x][y][z], then the currents
@@ -1230,8 +1140,8 @@ bool Engine_Metal_Diamond::SetupGPU()
 			boxes.push_back({o->m_StartPos[0], o->m_StartPos[1], o->m_StartPos[2], NX, NY, NZ, addU(idx.data(), idx.size()), addS(6*N)});
 			upmlCells += N;
 		}
-		md.ofs.upml = addU((const uint32_t*)boxes.data(), boxes.size()*sizeof(Upml)/4);
-		md.ofs.ucoef = addF(utab.data(), utab.size());
+		ofs.upml = addU((const uint32_t*)boxes.data(), boxes.size()*sizeof(Upml)/4);
+		ofs.ucoef = addF(utab.data(), utab.size());
 
 		// dispersive materials: flags per (extension, order): 1 voltage ADE, 2 current ADE, 4 voltage Lorentz term, 8 current
 		// Lorentz term, 16 Debye (poles << 8); Lorentz: 18 coefficients and 12 state floats per element, Debye with P poles:
@@ -1240,7 +1150,7 @@ bool Engine_Metal_Diamond::SetupGPU()
 		// the other, the list order within an order), so one thread subtracts them all from its field value in that order
 		// (Engine_Ext_Dispersive::Apply2*Lines) and the orders share one pass. Run: the float index of component 0, x << 16 | y,
 		// first and end element; element: coefficient and state offset (the H step's parts included), flags. Per tile of each
-		// phase, the runs inside the union of its ranges, by step type and extension.
+		// phase, the runs inside the union of its ranges, by step type and extension (below).
 		std::vector<float> acf;
 		std::vector<U4> aele;
 		std::vector<std::vector<U4> > aruns(2*lors.size());   // [step type * extensions + extension], by cell
@@ -1318,38 +1228,194 @@ bool Engine_Metal_Diamond::SetupGPU()
 					aele.insert(aele.end(), cl.second.begin(), cl.second.end());
 				}
 		}
-		std::vector<U4> arun;
-		std::vector<uint32_t> aro;
-		tileRuns(aruns, arun, aro);
 		md.ext.numAde = lors.size();
-		md.ofs.aro = addU(aro.data(), aro.size());
-		md.ofs.arun = addU4(arun);
-		md.ofs.aele = addU4(aele);
-		md.ofs.adeC = addF(acf.data(), acf.size());
-		md.ofs.adeS = addS(adeState);
+		ofs.aele = addU4(aele);
+		ofs.adeC = addF(acf.data(), acf.size());
+		ofs.adeS = addS(adeState);
 
-		if ((Ub.size()>=(1ull<<32)) || (Fb.size()>=(1ull<<32)) || (Sn>=(1ull<<32)))
+		if ((Fb.size()>=(1ull<<32)) || (Sn>=(1ull<<32)))
 		{
 			cerr << "Engine_Metal_Diamond: the extension data exceed 2^32 words, running the CPU loops" << endl;
 			return false;
 		}
-		md.U = buffer(Ub.data(), Ub.size()*4);
 		md.Fc = buffer(Fb.data(), Fb.size()*4);
 		md.St = [md.dev newBufferWithLength:std::max<size_t>(16, Sn*4) options:MTLResourceStorageModeShared];
-		if ((md.U==nil) || (md.Fc==nil) || (md.St==nil))
+		if ((md.Fc==nil) || (md.St==nil))
 		{
 			cerr << "Engine_Metal_Diamond: cannot allocate the extension buffers, running the CPU loops" << endl;
 			return false;
 		}
 		memset([md.St contents], 0, std::max<size_t>(16, Sn*4));
 
+		// tilings: K time steps per block, mountains of width M and valleys of width V in x and y. OPENEMS_DIAMOND_K and
+		// OPENEMS_DIAMOND_TILE (M,V or M:V) set one; otherwise IterateTS gives its first command buffers the tilings below
+		// in turn and keeps the one with the least GPU time per step (OPENEMS_DIAMOND_TUNE: timed command buffers per
+		// tiling, default 4; 0: K=4 8,8 without tuning). The best of the six benchmark models' tile and K sweeps is one of
+		// these four, up to 12 % ahead of K=4 8,8 (paired runs on cg23 and cg27: K=4 8,8 for patch x5 and the notch
+		// tutorial, K=4 12,8 for the GCPW line and notch x3, K=3 8,6 for the SMA launch, K=3 6,6 for the patch tutorial).
+		// Every tiling gives every value the same operations in the same order (only independent cells change their
+		// order), so the fields do not depend on the choice.
+		std::vector<std::array<unsigned int,3> > cand;   // K, M, V
+		{
+			const char* envK = getenv("OPENEMS_DIAMOND_K");
+			const char* envT = getenv("OPENEMS_DIAMOND_TILE");
+			md.tune = EnvUInt("OPENEMS_DIAMOND_TUNE", 4);
+			if ((envK && *envK) || (envT && *envT) || (md.tune==0) || (md.timing>1))
+			{
+				const unsigned int K = std::max(1u, EnvUInt("OPENEMS_DIAMOND_K", 4));
+				unsigned int M = 2*K, Vw = 2*K;
+				if (envT && *envT)
+				{
+					unsigned int m=0, v=0;
+					if ((sscanf(envT, "%u%*[,:]%u", &m, &v)==2) && (m>=2*K-1))
+					{
+						M = m;
+						Vw = v;
+					}
+					else
+						cerr << "Engine_Metal_Diamond: OPENEMS_DIAMOND_TILE=" << envT << " ignored (M,V or M:V with M >= 2K-1 = " << 2*K-1 << ")" << endl;
+				}
+				cand.push_back({K, M, Vw});
+			}
+			else
+				cand = {{4, 8, 8}, {4, 12, 8}, {3, 8, 6}, {3, 6, 6}};
+		}
+		for (const auto& kmv : cand)
+		{
+			State::Tiling c;
+			c.K = kmv[0];
+			c.M = kmv[1];
+			c.V = kmv[2];
+			std::vector<int32_t> t[4];
+			DiamondTiles(numLines[0], c.M, c.V, c.K, t[0], t[1]);
+			DiamondTiles(numLines[1], c.M, c.V, c.K, t[2], t[3]);
+			for (int n=0; n<4; ++n)
+			{
+				c.numTiles[n] = t[n].size()/2;
+				c.tiles[n] = buffer(t[n].data(), t[n].size()*sizeof(int32_t));
+			}
+			unsigned int numAll = 0;
+			for (int ph=0; ph<4; ++ph)
+			{
+				c.lbase[ph] = numAll;
+				numAll += c.numTiles[ph/2]*c.numTiles[2+ph%2];
+			}
+			// threads per tile: by default the power of two at or below 3/5 of a mountain's f4vectors per half-step (M*M*nv),
+			// 256 to 1024 (OPENEMS_DIAMOND_TG; a K, threads sweep on the five models that run on the GPU: idle threads in a
+			// small tile cost barrier time; at K=4 the patch tutorial (768 f4vectors) ran best with 256, the SMA launch (960)
+			// with 512, patch x5 (2880) with 512-1024)
+			unsigned int tgDef = 256;
+			while ((tgDef < 1024) && (5*2*tgDef <= 3*(size_t)c.M*c.M*numVectors))
+				tgDef *= 2;
+			c.tg = std::min<unsigned int>(EnvUInt("OPENEMS_DIAMOND_TG", 0) ? EnvUInt("OPENEMS_DIAMOND_TG", 0) : tgDef,
+										  (unsigned int)md.pso.maxTotalThreadsPerThreadgroup);
+
+			// per tile of each phase (the kernel's li = lbase[phase] + tile x * tiles in y + tile y), the entries inside the
+			// union of its ranges (a mountain stays in [lo, hi), a valley in [lo-K, hi+K)), in entry order
+			auto lists = [&](const std::vector<uint32_t>& ent, size_t stride, std::vector<uint32_t>& off, std::vector<uint32_t>& list)
+			{
+				const size_t count = ent.size()/stride;
+				off.assign(1, 0);
+				list.clear();
+				for (int ph=0; ph<4; ++ph)
+				{
+					const int xt = ph/2, yt = ph%2;
+					for (unsigned int tx=0; tx<c.numTiles[xt]; ++tx)
+					{
+						const int x0 = t[xt][2*tx] - (xt ? (int)c.K : 0), x1 = t[xt][2*tx+1] + (xt ? (int)c.K : 0);
+						for (unsigned int ty=0; ty<c.numTiles[2+yt]; ++ty)
+						{
+							const int y0 = t[2+yt][2*ty] - (yt ? (int)c.K : 0), y1 = t[2+yt][2*ty+1] + (yt ? (int)c.K : 0);
+							for (size_t k=0; k<count; ++k)
+							{
+								const int x = ent[stride*k], y = ent[stride*k+1];
+								if ((x>=x0) && (x<x1) && (y>=y0) && (y<y1))
+									list.push_back(k);
+							}
+							off.push_back(list.size());
+						}
+					}
+				}
+			};
+			// the same for runs (float index, x << 16 | y, ...; each segment sorted by x): per tile, the runs of every segment
+			// inside the union of its ranges, the segments one after the other; off: the start of each (tile, segment), then
+			// the end
+			auto tileRuns = [&](const std::vector<std::vector<U4> >& segs, std::vector<U4>& out, std::vector<uint32_t>& off)
+			{
+				out.clear();
+				off.clear();
+				for (int ph=0; ph<4; ++ph)
+				{
+					const int xt = ph/2, yt = ph%2;
+					for (unsigned int tx=0; tx<c.numTiles[xt]; ++tx)
+					{
+						const int x0 = std::max(0, t[xt][2*tx] - (xt ? (int)c.K : 0)), x1 = t[xt][2*tx+1] + (xt ? (int)c.K : 0);
+						for (unsigned int ty=0; ty<c.numTiles[2+yt]; ++ty)
+						{
+							const int y0 = t[2+yt][2*ty] - (yt ? (int)c.K : 0), y1 = t[2+yt][2*ty+1] + (yt ? (int)c.K : 0);
+							for (const std::vector<U4>& seg : segs)
+							{
+								off.push_back(out.size());
+								auto r = std::lower_bound(seg.begin(), seg.end(), (uint32_t)x0 << 16, [](const U4& a, uint32_t v) { return a[1] < v; });
+								for (; (r!=seg.end()) && ((int)((*r)[1] >> 16) < x1); ++r)
+								{
+									const int y = (*r)[1] & 0xffff;
+									if ((y>=y0) && (y<y1))
+										out.push_back(*r);
+								}
+							}
+						}
+					}
+				}
+				off.push_back(out.size());
+			};
+			std::vector<U4> xrun, arun;
+			std::vector<uint32_t> xro, ro, rl, aro;
+			tileRuns(xruns, xrun, xro);
+			lists(ri, 5, ro, rl);
+			tileRuns(aruns, arun, aro);
+
+			// this tiling's words: the shared ones, then its lists
+			std::vector<uint32_t> W(Ub);
+			auto addW = [&](const uint32_t* p, size_t n) -> uint32_t { const size_t o = W.size(); W.insert(W.end(), p, p+n); return (uint32_t)o; };
+			auto addW4 = [&](const std::vector<U4>& v) -> uint32_t { W.resize((W.size()+3) & ~(size_t)3, 0); return addW((const uint32_t*)v.data(), 4*v.size()); };
+			c.ofs = ofs;
+			c.ofs.xro = addW(xro.data(), xro.size());
+			c.ofs.xrun = addW4(xrun);
+			c.ofs.roff = addW(ro.data(), ro.size());
+			c.ofs.rlist = addW(rl.data(), rl.size());
+			c.ofs.aro = addW(aro.data(), aro.size());
+			c.ofs.arun = addW4(arun);
+			if (W.size()>=(1ull<<32))
+			{
+				cerr << "Engine_Metal_Diamond: the extension data exceed 2^32 words, running the CPU loops" << endl;
+				return false;
+			}
+			c.U = buffer(W.data(), W.size()*4);
+			if (c.U==nil)
+			{
+				cerr << "Engine_Metal_Diamond: cannot allocate the extension buffers, running the CPU loops" << endl;
+				return false;
+			}
+			md.tilings.push_back(c);
+		}
+		md.cur = 0;
+		md.tuning = md.tilings.size()>1;
+
 		if (g_settings.GetVerboseLevel()>0)
+		{
 			cout << "Engine_Metal_Diamond: " << numLines[0] << "x" << numLines[1] << "x" << numLines[2] << " cells (" << numVectors
 				 << " z-vectors, " << numOps << " operators, " << (int)(blockKB+0.5) << " KB per 16x16 columns, "
-				 << (md.split ? "split coefficients (" + std::to_string(pc.size()) + " f4vectors)" : std::string("packed coefficients")) << "), K=" << md.K << ", tiles " << M << "," << Vw << " (x " << md.numTiles[0] << "+" << md.numTiles[1]
-				 << ", y " << md.numTiles[2] << "+" << md.numTiles[3] << "), " << md.tg << " threads per tile, " << murs.size()
-				 << " Mur faces, " << md.numRLC << " lumped RLC elements, " << upmls.size() << " UPML boxes (" << upmlCells << " cells, "
-				 << utab.size()/6 << " coefficient sets), " << numADE << " dispersive positions, " << md.ext.vcount << "+" << md.ext.ccount << " excitation entries" << endl;
+				 << (md.split ? "split coefficients (" + std::to_string(pc.size()) + " f4vectors)" : std::string("packed coefficients")) << "), ";
+			if (md.tuning)
+				cout << "the fastest of";
+			for (const State::Tiling& c : md.tilings)
+				cout << (&c==&md.tilings[0] ? " " : ", ") << "K=" << c.K << " tiles " << c.M << "," << c.V << " (x " << c.numTiles[0] << "+"
+					 << c.numTiles[1] << ", y " << c.numTiles[2] << "+" << c.numTiles[3] << ", " << c.tg << " threads per tile)";
+			cout << ", " << murs.size() << " Mur faces, " << md.numRLC << " lumped RLC elements, " << upmls.size() << " UPML boxes ("
+				 << upmlCells << " cells, " << utab.size()/6 << " coefficient sets), " << numADE << " dispersive positions, "
+				 << md.ext.vcount << "+" << md.ext.ccount << " excitation entries" << endl;
+		}
 	}
 	md.gpu = true;
 	return true;
@@ -1370,11 +1436,69 @@ bool Engine_Metal_Diamond::IterateTS(unsigned int iterTS)
 	const auto t0 = std::chrono::steady_clock::now();
 	NSMutableArray* timed = md.timing ? [NSMutableArray array] : nil;   // OPENEMS_DIAMOND_TIMING: the command buffers
 	std::vector<int> timedPhase;                                         // and their phase (-1 = several)
+	// while tuning: the command buffers in flight (at most two, so the choice follows the measurements closely), their
+	// tiling, steps, and whether they count (a full batch or a whole call: every tiling is timed on the same work)
+	NSMutableArray* tuned = md.tuning ? [NSMutableArray array] : nil;
+	std::vector<std::array<unsigned int,3> > tunedInfo;
+	auto harvest = [&](NSUInteger keep)
+	{
+		while (tuned && (tuned.count>keep))
+		{
+			id<MTLCommandBuffer> b = tuned[0];
+			[b waitUntilCompleted];
+			const std::array<unsigned int,3> info = tunedInfo.front();
+			[tuned removeObjectAtIndex:0];
+			tunedInfo.erase(tunedInfo.begin());
+			const double sec = (b.GPUEndTime - b.GPUStartTime)/info[1];
+			if (!md.tuning || !info[2] || (b.status!=MTLCommandBufferStatusCompleted) || !(sec>0))
+				continue;
+			State::Tiling& c = md.tilings[info[0]];
+			c.best = c.samples ? std::min(c.best, sec) : sec;
+			++c.samples;
+			bool ready = true;
+			unsigned int best = 0;
+			for (unsigned int n=0; n<md.tilings.size(); ++n)
+			{
+				ready = ready && (md.tilings[n].samples>=md.tune);
+				if (md.tilings[n].best<md.tilings[best].best)
+					best = n;
+			}
+			if (!ready)
+				continue;
+			md.tuning = false;
+			md.cur = best;
+			if ((g_settings.GetVerboseLevel()>0) || md.timing)
+			{
+				const double cells = 1e-6*numLines[0]*numLines[1]*numLines[2];
+				cout << "Engine_Metal_Diamond: K=" << md.tilings[best].K << " tiles " << md.tilings[best].M << "," << md.tilings[best].V
+					 << " after " << md.tuneSteps << " timesteps of tuning (MC/s of the fastest timed command buffer:";
+				for (const State::Tiling& t : md.tilings)
+					cout << (&t==&md.tilings[0] ? " " : ", ") << "K=" << t.K << " " << t.M << "," << t.V << " " << (int)(cells/t.best+0.5);
+				cout << ")" << endl;
+			}
+			for (unsigned int n=0; n<md.tilings.size(); ++n)   // the command buffers in flight keep what they use
+				if (n!=best)
+				{
+					md.tilings[n].U = nil;
+					for (int k=0; k<4; ++k)
+						md.tilings[n].tiles[k] = nil;
+				}
+		}
+	};
 	unsigned int done = 0;
 	while (done<iterTS)
 	{
 		@autoreleasepool
 		{
+			// while tuning, the command buffers that are timed (a full batch, or a whole call: the same work per step for every
+			// tiling) take the tilings in turn; the others (the end of a call, and the first buffer of the run, which also maps
+			// the buffers and warms the GPU up) run the first tiling, so no tiling always gets the short ones
+			const unsigned int batch = md.tuning ? std::max(1u, md.batch/2) : md.batch;   // tuning: more samples in fewer steps
+			const bool timedCB = md.tuning && md.warm && ((done==0) || (iterTS-done>=batch));
+			const unsigned int ti = timedCB ? (unsigned int)(md.rr++ % md.tilings.size()) : md.cur;
+			md.warm = true;
+			const State::Tiling& c = md.tilings[ti];
+			const unsigned int first = done;
 			id<MTLCommandBuffer> cb = nil;
 			id<MTLComputeCommandEncoder> enc = nil;
 			auto begin = [&]()
@@ -1386,10 +1510,10 @@ bool Engine_Metal_Diamond::IterateTS(unsigned int iterTS)
 				for (int n=0; n<6; ++n)
 					[enc setBuffer:bufs[n] offset:0 atIndex:n];
 				[enc setBytes:&md.ext length:sizeof(Ext) atIndex:9];
-				[enc setBuffer:md.U offset:0 atIndex:10];
+				[enc setBuffer:c.U offset:0 atIndex:10];
 				[enc setBuffer:md.Fc offset:0 atIndex:11];
 				[enc setBuffer:md.St offset:0 atIndex:12];
-				[enc setBytes:&md.ofs length:sizeof(Ofs) atIndex:13];
+				[enc setBytes:&c.ofs length:sizeof(Ofs) atIndex:13];
 			};
 			auto end = [&](int ph)
 			{
@@ -1403,20 +1527,20 @@ bool Engine_Metal_Diamond::IterateTS(unsigned int iterTS)
 			};
 			begin();
 			unsigned int inCB = 0;
-			while ((done<iterTS) && (inCB<md.batch))
+			while ((done<iterTS) && (inCB<batch))
 			{
-				const unsigned int depth = std::min(md.K, iterTS-done);
+				const unsigned int depth = std::min(c.K, iterTS-done);
 				for (int ph=0; ph<4; ++ph)   // MM, MV, VM, VV
 				{
 					const int xt = ph/2, yt = ph%2;
-					if ((md.numTiles[xt]==0) || (md.numTiles[2+yt]==0))
+					if ((c.numTiles[xt]==0) || (c.numTiles[2+yt]==0))
 						continue;
-					const Phase p = {depth, numTS+done, (uint32_t)xt, (uint32_t)yt, md.lbase[ph], md.numTiles[2+yt]};
-					[enc setBuffer:md.tiles[xt] offset:0 atIndex:6];
-					[enc setBuffer:md.tiles[2+yt] offset:0 atIndex:7];
+					const Phase p = {depth, numTS+done, (uint32_t)xt, (uint32_t)yt, c.lbase[ph], c.numTiles[2+yt]};
+					[enc setBuffer:c.tiles[xt] offset:0 atIndex:6];
+					[enc setBuffer:c.tiles[2+yt] offset:0 atIndex:7];
 					[enc setBytes:&p length:sizeof(Phase) atIndex:8];
-					[enc dispatchThreadgroups:MTLSizeMake(md.numTiles[xt], md.numTiles[2+yt], 1)
-						threadsPerThreadgroup:MTLSizeMake(md.tg, 1, 1)];
+					[enc dispatchThreadgroups:MTLSizeMake(c.numTiles[xt], c.numTiles[2+yt], 1)
+						threadsPerThreadgroup:MTLSizeMake(c.tg, 1, 1)];
 					if (md.timing>1)
 					{
 						end(ph);
@@ -1427,14 +1551,22 @@ bool Engine_Metal_Diamond::IterateTS(unsigned int iterTS)
 				inCB += depth;
 			}
 			end(-1);
+			if (md.tuning)
+			{
+				[tuned addObject:cb];
+				tunedInfo.push_back({ti, done-first, timedCB ? 1u : 0u});
+				md.tuneSteps += done-first;
+			}
 			if (done>=iterTS)
 			{
 				[cb waitUntilCompleted];
 				if (cb.status==MTLCommandBufferStatusError)
 					throw std::runtime_error(std::string("Engine_Metal_Diamond: command buffer failed: ") + [[cb.error localizedDescription] UTF8String]);
 			}
+			harvest(1);
 		}
 	}
+	harvest(0);
 	numTS += iterTS;
 	md.runSec += std::chrono::duration<double>(std::chrono::steady_clock::now()-t0).count();
 	md.steps += iterTS;
