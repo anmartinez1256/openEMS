@@ -147,7 +147,7 @@ protected:
 
 	//! Neighbour flags (the fused sweep when every extension is TS_LOCAL; OPENEMS_FLAGS=0 keeps the barriers): a thread
 	//! waits for its neighbours only, instead of the two barriers of every timestep. A timestep count one thread
-	//! publishes and its neighbour waits for (spins like SpinBarrier, then sleeps); 256 B apart, so that two of them
+	//! publishes and its neighbour waits for (spins for m_FlagSpin, then sleeps); 256 B apart, so that two of them
 	//! never share a cache line (C++11: new does not align).
 	struct StepFlag
 	{
@@ -157,10 +157,11 @@ protected:
 		std::condition_variable cond;
 		char pad[256-2*sizeof(std::atomic<unsigned int>)-sizeof(std::mutex)-sizeof(std::condition_variable)];
 		void Publish(unsigned int v);
-		//! returns the time it waited (0 without a wait)
-		std::chrono::steady_clock::duration WaitFor(unsigned int v);
+		//! spins for \a spin, then sleeps until the count is at least \a v; returns the time it waited (0 without a wait)
+		std::chrono::steady_clock::duration WaitFor(unsigned int v, std::chrono::microseconds spin);
 	};
 	bool m_UseFlags;
+	std::chrono::microseconds m_FlagSpin; //!< spin time of the flag waits, from the thread count (SetupFused, FlagSpinTime)
 	StepFlag* m_SweepDone;    //!< per thread: timesteps of which its sweep (all voltages of its slab) is done
 	StepFlag* m_BoundaryDone; //!< per thread: timesteps of which the currents of the line before its slab are done
 	void FusedTimestepFlags(int threadID, unsigned int step);

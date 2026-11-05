@@ -82,6 +82,7 @@ Engine_Multithread::Engine_Multithread(const Operator_Multithread* op) : Engine_
 	m_auto_threads = false;
 	m_Fused = false;
 	m_UseFlags = false;
+	m_FlagSpin = std::chrono::microseconds(0);
 	m_SweepDone = 0;
 	m_BoundaryDone = 0;
 	m_FusedStat = 0;
@@ -90,19 +91,40 @@ Engine_Multithread::Engine_Multithread(const Operator_Multithread* op) : Engine_
 	m_stopThreads = true;
 }
 
-//! first thread count of the automatic search: the performance cores (Apple) or half the hardware threads
-static unsigned int StartThreads(unsigned int maxThreads)
+//! the performance cores of an Apple CPU (hw.perflevel0), 0 elsewhere or when unknown
+static unsigned int PerformanceCores()
 {
-	unsigned int n = 0;
 #ifdef __APPLE__
 	int pcores = 0;
 	size_t len = sizeof(pcores);
 	if ((sysctlbyname("hw.perflevel0.physicalcpu", &pcores, &len, NULL, 0)==0) && (pcores>0))
-		n = pcores;
+		return pcores;
 #endif
+	return 0;
+}
+
+//! first thread count of the automatic search: the performance cores (Apple) or half the hardware threads
+static unsigned int StartThreads(unsigned int maxThreads)
+{
+	unsigned int n = PerformanceCores();
 	if (n==0)
 		n = (maxThreads+1)/2;
 	return std::max(1u, std::min(n, maxThreads));
+}
+
+//! How long a wait for a neighbour flag spins before it sleeps (StepFlag::WaitFor): OPENEMS_FLAGS_SPIN_US for any
+//! thread count; else none when the threads outnumber the performance cores of an Apple CPU (some of them run on the
+//! efficiency cores, the waits for them are long, and a spinning thread only takes power and a core from the others),
+//! and SpinBarrier's spin time (OPENEMS_BARRIER_SPIN_US, default 50 us) up to that count and on other CPUs.
+static std::chrono::microseconds FlagSpinTime(unsigned int numThreads)
+{
+	const char* env = getenv("OPENEMS_FLAGS_SPIN_US");
+	if (env && *env)   // an empty value is the same as unset
+		return std::chrono::microseconds(atol(env));
+	const unsigned int p = PerformanceCores();
+	if ((p>0) && (numThreads>p))
+		return std::chrono::microseconds(0);
+	return SpinBarrier::SpinTime();
 }
 
 Engine_Multithread::~Engine_Multithread()
@@ -640,6 +662,7 @@ void Engine_Multithread::SetupFused()
 	m_SweepDone = m_BoundaryDone = 0;
 	if (m_UseFlags)
 	{
+		m_FlagSpin = FlagSpinTime(m_numThreads);
 		m_SweepDone = new StepFlag[m_numThreads];
 		m_BoundaryDone = new StepFlag[m_numThreads];
 		for (unsigned int t=0; t<m_numThreads; ++t)
@@ -649,8 +672,11 @@ void Engine_Multithread::SetupFused()
 		}
 	}
 	m_Fused = true;
+	std::string flagMsg = ", neighbour flags";
+	if (g_settings.GetVerboseLevel()>1)
+		flagMsg += " (wait spin " + std::to_string(m_FlagSpin.count()) + " us)";
 	ReportFused("fused sweep, " + std::to_string(nb) + " blocks of x-lines" +
-				(m_UseFlags ? ", neighbour flags" : (nonlocal.empty() ? "" : ", barriers (the extension \"" + nonlocal + "\" is not TS_LOCAL)")));
+				(m_UseFlags ? flagMsg : (nonlocal.empty() ? "" : ", barriers (the extension \"" + nonlocal + "\" is not TS_LOCAL)")));
 }
 
 // SetupFused() runs after every change of the thread count, and the level engines of a cylindrical multigrid
@@ -755,12 +781,12 @@ void Engine_Multithread::StepFlag::Publish(unsigned int v)
 	}
 }
 
-std::chrono::steady_clock::duration Engine_Multithread::StepFlag::WaitFor(unsigned int v)
+std::chrono::steady_clock::duration Engine_Multithread::StepFlag::WaitFor(unsigned int v, std::chrono::microseconds spin)
 {
 	if (value.load(std::memory_order_acquire)>=v)
 		return std::chrono::steady_clock::duration::zero();
 	const std::chrono::steady_clock::time_point t0 = std::chrono::steady_clock::now();
-	const std::chrono::steady_clock::time_point stop = t0 + SpinBarrier::SpinTime();
+	const std::chrono::steady_clock::time_point stop = t0 + spin;
 	for (unsigned int n=1;;++n)
 	{
 		if (value.load(std::memory_order_acquire)>=v)
@@ -794,7 +820,7 @@ void Engine_Multithread::FusedTimestepFlags(int threadID, unsigned int step)
 	for (unsigned int b=b0; b<b1; ++b)
 	{
 		if ((b+1==b1) && !last)
-			waited += m_BoundaryDone[threadID+1].WaitFor(step);
+			waited += m_BoundaryDone[threadID+1].WaitFor(step, m_FlagSpin);
 		const unsigned int x0 = m_Blocks[b], x1 = m_Blocks[b+1];
 		RunLineHooks(0, x0, x1);
 		UpdateVoltages(x0, x1-x0);
@@ -810,7 +836,7 @@ void Engine_Multithread::FusedTimestepFlags(int threadID, unsigned int step)
 	std::chrono::steady_clock::duration waited2 = std::chrono::steady_clock::duration::zero();
 	if (threadID>0)
 	{
-		waited2 = m_SweepDone[threadID-1].WaitFor(step+1);
+		waited2 = m_SweepDone[threadID-1].WaitFor(step+1, m_FlagSpin);
 		FusedCurrents(start-1, start);
 		m_BoundaryDone[threadID].Publish(step+1);
 	}
