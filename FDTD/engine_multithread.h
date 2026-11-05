@@ -143,9 +143,14 @@ protected:
 	{
 		double busy;
 		double lines;
-		char pad[64-2*sizeof(double)]; // 64 B each (C++11: new does not align to 64; the Apple M5's cache line is 128 B)
+		// OPENEMS_FUSED_STAT=1: totals since the slabs were set up (the sweep, the waits at the two barriers, the
+		// currents of the line before the slab), printed when the threads change or stop (PrintFusedStat)
+		double sweep, wait1, bound, wait2, steps;
+		char pad[64-7*sizeof(double)]; // 64 B each (C++11: new does not align to 64; the Apple M5's cache line is 128 B)
 	};
 	FusedStat* m_FusedStat;
+	unsigned int m_FusedStatThreads; //!< entries of m_FusedStat
+	void PrintFusedStat() const;
 	bool m_Balance;
 	std::vector<double> m_LineCost; //!< smoothed time per x-line (s), from the threads' measurements
 	//! Between two IterateTS() calls: move the slab boundaries so that every thread gets the same estimated time
