@@ -64,6 +64,8 @@ using namespace metal;
 #pragma METAL fp contract(off)
 
 struct Dims { uint nx, ny, nz, nv; };
+// the grid as compile-time constants (the kernel is built per model): the divisions by nv and nz become multiplications
+constant Dims dims = {DIAMOND_NX, DIAMOND_NY, DIAMOND_NZ, DIAMOND_NV};
 struct Phase { uint depth, ts0, xtype, ytype, lbase, nty; }; // type 0 = mountain, 1 = valley; lbase, nty: entry lists
 struct Ext { uint vcount, ccount, length, period0, numMur, numApply, rlcSerial, numUpml, numAde; }; // period0: 0 = no signal period
 struct MurFace { uint ny, nyP, nyPP, line, shift, n1, startTS, coef, size; };
@@ -140,12 +142,12 @@ inline int excPos(uint ts, uint delay, constant Ext& e)
 
 // The Mur face cells inside the tile: the face line lies in the tile's x (y) range for an x (y) face, the shift line
 // too (the domain edges sit inside the edge valleys), a z face is complete in every tile
-inline uint murCount(device const MurFace& m, int2 sx, int2 sy, constant Dims& d)
+inline uint murCount(thread const MurFace& m, int2 sx, int2 sy, constant Dims& d)
 {
     const uint wx = uint(sx.y - sx.x), wy = uint(sy.y - sy.x);
     return m.ny == 0 ? wy*d.nz : (m.ny == 1 ? wx*d.nz : wx*wy);
 }
-inline void murPos(device const MurFace& m, uint i, int2 sx, int2 sy, constant Dims& d, thread uint* pos)
+inline void murPos(thread const MurFace& m, uint i, int2 sx, int2 sy, constant Dims& d, thread uint* pos)
 {
     const uint wy = uint(sy.y - sy.x);
     if (m.ny == 0)      { pos[0] = m.line; pos[1] = uint(sy.x) + i / d.nz; pos[2] = i % d.nz; }
@@ -155,7 +157,7 @@ inline void murPos(device const MurFace& m, uint i, int2 sx, int2 sy, constant D
 
 // stage 0: Pre (before the E update), 1: Post (after it), 2: Apply; Engine_Ext_Mur_ABC's MurFast arithmetic
 // (vP = E_shift - c*E_face is one fmsub on arm64, vP += c*E_shift one fmadd)
-inline void murStage(uint stage, device const MurFace& m, device float* E, device const float* mc, device float* ms,
+inline void murStage(uint stage, const MurFace m, device float* E, device const float* mc, device float* ms,
                      int2 sx, int2 sy, constant Dims& d, uint tid, uint tgs)
 {
     const uint count = murCount(m, sx, sy, d);
@@ -221,7 +223,7 @@ inline void rlcStage(uint stage, uint ext, device float* E, device const uint* r
 // before the update, 1 after it; the voltages in the E step, the currents in the H step. Clang's contraction of the
 // CPU expressions: vv*E - vvfo*flux is fma(vv, E, -(vvfo*flux)), flux_old + vvfn*E one fmadd. Coefficient sets:
 // vv vvfo vvfn ii iifo iifn, one index per component and box cell; the flux: voltages, then currents.
-inline void upmlStage(uint stage, bool eStep, device const Upml& u, device float* Fd, device const uint* U,
+inline void upmlStage(uint stage, bool eStep, const Upml u, device float* Fd, device const uint* U,
                       device const float* tab, device float* St, int2 sx, int2 sy, constant Dims& d, uint tid, uint tgs)
 {
     const int x0 = max(sx.x, int(u.x0)), x1 = min(sx.y, int(u.x0 + u.nx));
@@ -352,7 +354,7 @@ inline void adeApply(device float* Fd, device const uint4* ar, device const uint
 // Apply in extension order). Metal has 31 buffer slots, so the extension data come in three blobs (U, Fc, St).
 kernel void diamond(device float4* volt [[buffer(0)]], device float4* curr [[buffer(1)]],
                     device const float4* pv [[buffer(2)]], device const float4* pi [[buffer(3)]],
-                    device const uint* opi [[buffer(4)]], constant Dims& d [[buffer(5)]],
+                    device const uint* opi [[buffer(4)]],
                     device const int2* xr [[buffer(6)]], device const int2* yr [[buffer(7)]],
                     constant Phase& p [[buffer(8)]], constant Ext& e [[buffer(9)]],
                     device const uint* U [[buffer(10)]], device const float* Fc [[buffer(11)]],
@@ -381,6 +383,7 @@ kernel void diamond(device float4* volt [[buffer(0)]], device float4* curr [[buf
     device float* mscr = St + o.mscr;
     device float* rlcS = St + o.rlcS;
     device float* adeS = St + o.adeS;
+    constant Dims& d = dims;
     const uint tgs = tptg.x;
     const int2 rx = xr[tg.x], ry = yr[tg.y];
     device float* E = (device float*)volt;
@@ -548,7 +551,6 @@ kernel void diamond(device float4* volt [[buffer(0)]], device float4* curr [[buf
 }
 )MSL";
 
-struct Dims { uint32_t nx, ny, nz, nv; };
 struct Phase { uint32_t depth, ts0, xtype, ytype, lbase, nty; };
 struct Ext { uint32_t vcount, ccount, length, period0, numMur, numApply, rlcSerial, numUpml, numAde; };
 struct MurFace { uint32_t ny, nyP, nyPP, line, shift, n1, startTS, coef, size; };
@@ -619,7 +621,6 @@ struct Engine_Metal_Diamond::State
 	Ofs ofs = {};
 	unsigned int numRLC = 0;
 	unsigned int lbase[4] = {0, 0, 0, 0};
-	Dims dims = {0, 0, 0, 0};
 	Ext ext = {};
 	unsigned int K = 4, tg = 0, batch = 64;
 	// OPENEMS_DIAMOND_TIMING=1 prints these at the end: setup and IterateTS wall times, the calls, the GPU time of the
@@ -843,7 +844,9 @@ bool Engine_Metal_Diamond::SetupGPU()
 									   @"DIAMOND_RLC": @(rlcs.empty() ? 0 : 1),
 									   @"DIAMOND_UPML": @(upmls.empty() ? 0 : 1),
 									   @"DIAMOND_ADE": @(lors.empty() ? 0 : 1),
-									   @"DIAMOND_DEBYE": @(hasDebye ? 1 : 0)};
+									   @"DIAMOND_DEBYE": @(hasDebye ? 1 : 0),
+									   @"DIAMOND_NX": @(numLines[0]), @"DIAMOND_NY": @(numLines[1]),
+									   @"DIAMOND_NZ": @(numLines[2]), @"DIAMOND_NV": @(numVectors)};
 		id<MTLLibrary> lib = [md.dev newLibraryWithSource:[NSString stringWithUTF8String:DIAMOND_SOURCE] options:options error:&error];
 		if (lib==nil)
 		{
@@ -885,7 +888,6 @@ bool Engine_Metal_Diamond::SetupGPU()
 				for (unsigned int zv=0; zv<numVectors; ++zv)
 					opi[((size_t)x*numLines[1]+y)*numVectors+zv] = Op->m_Op_index(x,y,zv);
 		md.opi = buffer(opi.data(), opi.size()*sizeof(uint32_t));
-		md.dims = {numLines[0], numLines[1], numLines[2], numVectors};
 
 		// tiles
 		md.K = std::max(1u, EnvUInt("OPENEMS_DIAMOND_K", 4));
@@ -1276,7 +1278,6 @@ bool Engine_Metal_Diamond::IterateTS(unsigned int iterTS)
 				id<MTLBuffer> bufs[] = {md.volt, md.curr, md.pv, md.pi, md.opi};
 				for (int n=0; n<5; ++n)
 					[enc setBuffer:bufs[n] offset:0 atIndex:n];
-				[enc setBytes:&md.dims length:sizeof(Dims) atIndex:5];
 				[enc setBytes:&md.ext length:sizeof(Ext) atIndex:9];
 				[enc setBuffer:md.U offset:0 atIndex:10];
 				[enc setBuffer:md.Fc offset:0 atIndex:11];
