@@ -61,6 +61,10 @@ public:
 	virtual void DoPreVoltageUpdates();
 	virtual void DoPostVoltageUpdates();
 	virtual unsigned int GetUsedHooks() const;
+	//! the line hooks of the fused sweep: the two hooks above for the positions on the x-lines [x0, x1), in x order
+	//! (every position has its own state and reads only its own cell); same operations per position
+	virtual void DoPreVoltageUpdatesLines(unsigned int x0, unsigned int x1);
+	virtual void DoPostVoltageUpdatesLines(unsigned int x0, unsigned int x1);
 
 protected:
 	template <typename EngType>

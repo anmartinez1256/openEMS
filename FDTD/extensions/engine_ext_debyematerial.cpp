@@ -123,12 +123,63 @@ void Engine_Ext_DebyeMaterial::DoPostVoltageUpdates()
 	ENG_DISPATCH(DoPostVoltageUpdatesImpl);
 }
 
+void Engine_Ext_DebyeMaterial::DoPreVoltageUpdatesLines(unsigned int x0, unsigned int x1)
+{
+	const float* __restrict volt = (const float*)((Engine_sse*)m_Eng)->f4_volt_ptr->data();
+	unsigned int k0, k1;
+	LineRange(0, x0, x1, k0, k1);
+	const unsigned int* __restrict idx = m_SortedIdx[0].data();
+	const unsigned int* __restrict fi = m_FloatIdx[0].data();
+	int poles = m_Op_Ext_Deb->m_PoleCount;
+
+	for (unsigned int k=k0; k<k1; ++k)
+	{
+		const unsigned int i = idx[k];
+		for (int n=0; n<3; ++n)
+		{
+			FDTD_FLOAT volt_n = volt[fi[3*(size_t)k+n]];
+			FDTD_FLOAT pre = 0.0;
+			for (int o=0; o<poles; ++o)
+			{
+				FDTD_FLOAT W = m_Op_Ext_Deb->v_relax_ADE[o][n][i]*volt_pole_ADE[o][n][i]
+				             + m_Op_Ext_Deb->v_drive_ADE[o][n][i]*volt_n;
+				pre += W - volt_pole_ADE[o][n][i];
+				volt_pole_ADE[o][n][i] = W;
+			}
+			volt_pre_ADE[n][i] = pre;
+		}
+	}
+}
+
+void Engine_Ext_DebyeMaterial::DoPostVoltageUpdatesLines(unsigned int x0, unsigned int x1)
+{
+	const float* __restrict volt = (const float*)((Engine_sse*)m_Eng)->f4_volt_ptr->data();
+	unsigned int k0, k1;
+	LineRange(0, x0, x1, k0, k1);
+	const unsigned int* __restrict idx = m_SortedIdx[0].data();
+	const unsigned int* __restrict fi = m_FloatIdx[0].data();
+	int poles = m_Op_Ext_Deb->m_PoleCount;
+
+	for (unsigned int k=k0; k<k1; ++k)
+	{
+		const unsigned int i = idx[k];
+		for (int n=0; n<3; ++n)
+		{
+			FDTD_FLOAT v_raw = volt[fi[3*(size_t)k+n]];
+			FDTD_FLOAT volt_n = (v_raw - volt_pre_ADE[n][i]) * m_Op_Ext_Deb->v_solve_ADE[n][i];
+			volt_ADE[0][n][i] = v_raw - volt_n;
+			for (int o=0; o<poles; ++o)
+				volt_pole_ADE[o][n][i] += m_Op_Ext_Deb->v_drive_ADE[o][n][i]*volt_n;
+		}
+	}
+}
+
 // This used to inherit Engine_Ext_Dispersive's declaration (APPLY_VOLT | LINE_HOOKS), so the
 // multithreaded engine never called the Pre/Post voltage hooks above and Debye cells ran as their base material.
 // The Pre/Post hooks only read engine fields and write the extension's own state; the poles are applied by the
-// inherited Apply2Voltages(). There are no *Lines() versions, so the fused sweep stays off with this extension.
+// inherited Apply2Voltages() (and its line hook).
 unsigned int Engine_Ext_DebyeMaterial::GetUsedHooks() const
 {
 	OPENEMS_HOOKS_DECLARED_BY(Engine_Ext_DebyeMaterial);
-	return (DispersiveHooks() & ~LINE_HOOKS) | PRE_VOLT | POST_VOLT;
+	return DispersiveHooks() | PRE_VOLT | POST_VOLT;
 }
