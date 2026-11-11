@@ -227,9 +227,18 @@ inline void murPos(thread const MurFace& m, uint i, int2 sx, int2 sy, constant D
 
 // stage 0: Pre (before the E update), 1: Post (after it), 2: Apply, 3: Post and Apply; Engine_Ext_Mur_ABC's MurFast arithmetic
 // (vP = E_shift - c*E_face is one fmsub on arm64, vP += c*E_shift one fmadd)
-inline void murStage(uint stage, const MurFace m, device float* E, device const float* mc, device float* ms,
+inline void murStage(uint stage, device const MurFace* mp, device float* E, device const float* mc, device float* ms,
                      int2 sx, int2 sy, constant Dims& d, uint tid, uint tgs)
 {
+    // a face has fewer cells in a tile than the tile has threads (a z face: its columns): the others leave after one load
+#if DIAMOND_FASTIDX
+    {
+        const uint ny = mp->ny, wx = uint(sx.y - sx.x), wy = uint(sy.y - sy.x);
+        if (tid >= (ny == 0 ? wy*d.nz : (ny == 1 ? wx*d.nz : wx*wy)))
+            return;
+    }
+#endif
+    const MurFace m = *mp;
     const uint count = murCount(m, sx, sy, d);
     const uint rcp = rcpW(uint(sy.y - sy.x));
     const bool ok = okW(count, uint(sy.y - sy.x));
@@ -580,7 +589,7 @@ kernel void diamond(device float4* volt [[buffer(0)]], device float4* curr [[buf
             // the Pre stages that only read the field (Mur, Drude/Lorentz) run before the UPML's, which writes it
 #if DIAMOND_MUR
             for (uint f = 0; f < e.numMur; ++f)
-                if (mur & (1u << f)) murStage(0, mf[f], E, mcoef, mscr, sx, sy, d, tid, tgs);
+                if (mur & (1u << f)) murStage(0, mf + f, E, mcoef, mscr, sx, sy, d, tid, tgs);
 #endif
 #if DIAMOND_ADE
             if (ade) adePre(eStep, eStep ? E : H, arun, aele, adeC, adeS, a0, a1, sx, sy, cs, tid, tgs);
@@ -645,7 +654,7 @@ kernel void diamond(device float4* volt [[buffer(0)]], device float4* curr [[buf
         {
 #if DIAMOND_MUR
             for (uint f = 0; f < e.numMur; ++f)
-                if (mur & (1u << f)) murStage(murOne ? 3 : 1, mf[f], E, mcoef, mscr, sx, sy, d, tid, tgs);
+                if (mur & (1u << f)) murStage(murOne ? 3 : 1, mf + f, E, mcoef, mscr, sx, sy, d, tid, tgs);
 #endif
 #if DIAMOND_DEBYE
             if (deb) adePost(E, arun, aele, adeC, adeS, a0, a1, sx, sy, cs, tid, tgs);
@@ -669,10 +678,10 @@ kernel void diamond(device float4* volt [[buffer(0)]], device float4* curr [[buf
 #if DIAMOND_MURMERGE
                         if (pend != 3 && pend != mf[idx].ny)
                             threadgroup_barrier(mem_flags::mem_device);
-                        murStage(2, mf[idx], E, mcoef, mscr, sx, sy, d, tid, tgs);
+                        murStage(2, mf + idx, E, mcoef, mscr, sx, sy, d, tid, tgs);
                         pend = mf[idx].ny;
 #else
-                        murStage(2, mf[idx], E, mcoef, mscr, sx, sy, d, tid, tgs);
+                        murStage(2, mf + idx, E, mcoef, mscr, sx, sy, d, tid, tgs);
                         threadgroup_barrier(mem_flags::mem_device);
 #endif
                     }
