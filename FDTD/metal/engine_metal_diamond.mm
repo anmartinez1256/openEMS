@@ -96,11 +96,20 @@ inline void cellV(device float4* volt, device const float4* curr, device const f
     const uint xm = x > 0 ? x-1 : x, ym = y > 0 ? y-1 : y;
     const float4 c0 = curr[I(0,x,y,zv,d)], c1 = curr[I(1,x,y,zv,d)], c2 = curr[I(2,x,y,zv,d)];
     float4 c1zm, c0zm;
+#if DIAMOND_FASTIDX
+    {   // the z neighbour below: the vector before, or for the first one the last vector moved up a lane (one load each way)
+        const uint zq = zv > 0 ? zv-1 : d.nv-1;
+        const float4 a = curr[I(1,x,y,zq,d)], b = curr[I(0,x,y,zq,d)];
+        c1zm = zv > 0 ? a : float4(0.0f, a.x, a.y, a.z);
+        c0zm = zv > 0 ? b : float4(0.0f, b.x, b.y, b.z);
+    }
+#else
     if (zv > 0) { c1zm = curr[I(1,x,y,zv-1,d)]; c0zm = curr[I(0,x,y,zv-1,d)]; }
     else {
         const float4 a = curr[I(1,x,y,d.nv-1,d)]; c1zm = float4(0.0f, a.x, a.y, a.z);
         const float4 b = curr[I(0,x,y,d.nv-1,d)]; c0zm = float4(0.0f, b.x, b.y, b.z);
     }
+#endif
     const float4 c2ym = curr[I(2,x,ym,zv,d)], c2xm = curr[I(2,xm,y,zv,d)];
     const float4 c1xm = curr[I(1,xm,y,zv,d)], c0ym = curr[I(0,x,ym,zv,d)];
     float4 v;
@@ -125,11 +134,21 @@ inline void cellI(device float4* curr, device const float4* volt, device const f
 #endif
     const float4 v0 = volt[I(0,x,y,zv,d)], v1 = volt[I(1,x,y,zv,d)], v2 = volt[I(2,x,y,zv,d)];
     float4 v1zp, v0zp;
+#if DIAMOND_FASTIDX
+    {
+        const bool in = zv+1 < d.nv;
+        const uint zq = in ? zv+1 : 0u;
+        const float4 a = volt[I(1,x,y,zq,d)], b = volt[I(0,x,y,zq,d)];
+        v1zp = in ? a : float4(a.y, a.z, a.w, 0.0f);
+        v0zp = in ? b : float4(b.y, b.z, b.w, 0.0f);
+    }
+#else
     if (zv+1 < d.nv) { v1zp = volt[I(1,x,y,zv+1,d)]; v0zp = volt[I(0,x,y,zv+1,d)]; }
     else {
         const float4 a = volt[I(1,x,y,0,d)]; v1zp = float4(a.y, a.z, a.w, 0.0f);
         const float4 b = volt[I(0,x,y,0,d)]; v0zp = float4(b.y, b.z, b.w, 0.0f);
     }
+#endif
     const float4 v2yp = volt[I(2,x,y+1,zv,d)], v0yp = volt[I(0,x,y+1,zv,d)];
     const float4 v2xp = volt[I(2,x+1,y,zv,d)], v1xp = volt[I(1,x+1,y,zv,d)];
     float4 i;
@@ -142,6 +161,18 @@ inline void cellI(device float4* curr, device const float4* volt, device const f
     i = curr[I(1,x,y,zv,d)]; i = i * c[2]; i = fma(c[3], ((v0 - v0zp) - v2) + v2xp, i); curr[I(1,x,y,zv,d)] = i;
     i = curr[I(2,x,y,zv,d)]; i = i * c[4]; i = fma(c[5], ((v1 - v1xp) - v0) + v0yp, i); curr[I(2,x,y,zv,d)] = i;
 #endif
+}
+
+// r / w for the cell loops, w = a tile's width in y (it changes with the half-step, so the compiler cannot turn the division
+// into a multiplication): floor(r * ceil(2^16 / w) / 2^16) is exact while r * (w - 1) < 2^16, which mulDiv() tests for the
+// largest r of the loop
+inline bool mulDiv(uint count, uint w) { return count * w < 65536u; }
+inline uint divW(uint r, uint w, uint rcp, bool mul)
+{
+#if DIAMOND_FASTIDX
+    if (mul) return (r * rcp) >> 16;
+#endif
+    return r / w;
 }
 
 // The range of a tile at half-step s: a mountain [lo, hi) is [lo + s/2, hi - (s+1)/2), a valley between two
@@ -502,10 +533,13 @@ kernel void diamond(device float4* volt [[buffer(0)]], device float4* curr [[buf
         }
 #endif
         const uint count = uint(wx) * uint(wy) * d.nv;
+        const uint uwy = uint(wy), rcp = 65535u / uwy + 1u;
+        const bool mul = mulDiv(uint(wx) * uwy, uwy);
         for (uint i = tid; i < count; i += tgs)
         {
             const uint zv = i % d.nv, r = i / d.nv;
-            const uint y = uint(sy.x) + r % uint(wy), x = uint(sx.x) + r / uint(wy);
+            const uint q = divW(r, uwy, rcp, mul);
+            const uint y = uint(sy.x) + (r - q*uwy), x = uint(sx.x) + q;
             if (eStep) cellV(volt, curr, pv, pc, opi, d, x, y, zv);
             else if (x + 1 < d.nx && y + 1 < d.ny) cellI(curr, volt, pi, pc, opi, d, x, y, zv);
         }
@@ -1017,6 +1051,7 @@ bool Engine_Metal_Diamond::SetupGPU()
 		// the kernel without the parts this model does not use (fewer registers, more tiles in flight)
 		options.preprocessorMacros = @{@"DIAMOND_MUR": @(murs.empty() ? 0 : 1),
 									   @"DIAMOND_MURMERGE": @(murMerge ? 1 : 0),
+									   @"DIAMOND_FASTIDX": @(EnvUInt("OPENEMS_DIAMOND_FASTIDX", 1) ? 1 : 0),
 									   @"DIAMOND_EXC": @((excSeen && Op->GetExcitationExtension()) ? 1 : 0),
 									   @"DIAMOND_RLC": @(rlcs.empty() ? 0 : 1),
 									   @"DIAMOND_UPML": @(upmls.empty() ? 0 : 1),
@@ -1032,7 +1067,27 @@ bool Engine_Metal_Diamond::SetupGPU()
 			return false;
 		}
 		id<MTLFunction> fn = [lib newFunctionWithName:@"diamond"];
-		md.pso = [md.dev newComputePipelineStateWithFunction:fn error:&error];
+		// The threads per tile are 256, 512 or 1024 unless OPENEMS_DIAMOND_TG says otherwise: whole SIMD groups, which the
+		// pipeline may be told (OPENEMS_DIAMOND_TGFLAG=0: not told). Checked against the pipeline's width below.
+		const unsigned int envTG = EnvUInt("OPENEMS_DIAMOND_TG", 0);
+		auto pipeline = [&](bool whole) -> id<MTLComputePipelineState>
+		{
+			MTLComputePipelineDescriptor* desc = [MTLComputePipelineDescriptor new];
+			desc.computeFunction = fn;
+			desc.threadGroupSizeIsMultipleOfThreadExecutionWidth = whole ? YES : NO;
+			return [md.dev newComputePipelineStateWithDescriptor:desc options:MTLPipelineOptionNone reflection:nil error:&error];
+		};
+		bool whole = (EnvUInt("OPENEMS_DIAMOND_TGFLAG", 1)!=0) && (envTG%32==0);
+		md.pso = pipeline(whole);
+		if ((md.pso!=nil) && whole)
+		{
+			const NSUInteger w = md.pso.threadExecutionWidth, mx = md.pso.maxTotalThreadsPerThreadgroup;
+			bool ok = (w>0);
+			for (NSUInteger tg : {(NSUInteger)256, (NSUInteger)512, (NSUInteger)1024, (NSUInteger)envTG})
+				ok = ok && (tg==0 || (std::min(tg, mx) % w)==0);
+			if (!ok)
+				md.pso = pipeline(false);
+		}
 		if (md.pso==nil)
 		{
 			cerr << "Engine_Metal_Diamond: pipeline creation failed: " << [[error localizedDescription] UTF8String] << endl;
