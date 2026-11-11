@@ -176,7 +176,7 @@ inline void murPos(thread const MurFace& m, uint i, int2 sx, int2 sy, constant D
     else                { pos[0] = uint(sx.x) + i / wy; pos[1] = uint(sy.x) + i % wy; pos[2] = m.line; }
 }
 
-// stage 0: Pre (before the E update), 1: Post (after it), 2: Apply; Engine_Ext_Mur_ABC's MurFast arithmetic
+// stage 0: Pre (before the E update), 1: Post (after it), 2: Apply, 3: Post and Apply; Engine_Ext_Mur_ABC's MurFast arithmetic
 // (vP = E_shift - c*E_face is one fmsub on arm64, vP += c*E_shift one fmadd)
 inline void murStage(uint stage, const MurFace m, device float* E, device const float* mc, device float* ms,
                      int2 sx, int2 sy, constant Dims& d, uint tid, uint tgs)
@@ -197,10 +197,20 @@ inline void murStage(uint stage, const MurFace m, device float* E, device const 
             ms[m.coef + k]          = fma(-cP,  E[fP],  E[sP]);
             ms[m.coef + m.size + k] = fma(-cPP, E[fPP], E[sPP]);
         }
-        else
+        else if (stage == 1)
         {
             ms[m.coef + k]          = fma(cP,  E[sP],  ms[m.coef + k]);
             ms[m.coef + m.size + k] = fma(cPP, E[sPP], ms[m.coef + m.size + k]);
+        }
+        else
+        {
+            // stage 3: Post and Apply of this element in one go (the same values: the element's own scratch and face
+            // floats, the shift line's field, which no face of the same axis writes)
+            const float vP = fma(cP, E[sP], ms[m.coef + k]), vPP = fma(cPP, E[sPP], ms[m.coef + m.size + k]);
+            ms[m.coef + k] = vP;
+            ms[m.coef + m.size + k] = vPP;
+            E[fP] = vP;
+            E[fPP] = vPP;
         }
     }
 }
@@ -443,6 +453,7 @@ kernel void diamond(device float4* volt [[buffer(0)]], device float4* curr [[buf
         ade = a1 > a0;
 #endif
         uint mur = 0;   // the active Mur faces with cells in this tile
+        uint murAxes = 0;   // their axes (bit ny)
 #if DIAMOND_MUR
         if (eStep)
             for (uint f = 0; f < e.numMur; ++f)
@@ -452,6 +463,7 @@ kernel void diamond(device float4* volt [[buffer(0)]], device float4* curr [[buf
                 if (mf[f].ny == 0 && (L < sx.x || L >= sx.y)) continue;
                 if (mf[f].ny == 1 && (L < sy.x || L >= sy.y)) continue;
                 mur |= 1u << f;
+                murAxes |= 1u << mf[f].ny;
             }
 #endif
         if (mur || ade)
@@ -499,21 +511,32 @@ kernel void diamond(device float4* volt [[buffer(0)]], device float4* curr [[buf
 #if DIAMOND_DEBYE
         deb = eStep && ade;
 #endif
+        // Mur faces of one axis have no cell in common, and none of them writes another's shift line (DIAMOND_MURMERGE,
+        // set when every Mur face is at least two lines from its shift line's opposite face). So when the faces in this
+        // tile are all on one axis and nothing else is applied here, each thread does Post and Apply of its elements in
+        // one go (murOne: one barrier less per E step); otherwise consecutive faces of one axis in the Apply order
+        // share a barrier.
+        bool murOne = false;
+#if DIAMOND_MUR && DIAMOND_MURMERGE
+        murOne = mur && (murAxes == 1u || murAxes == 2u || murAxes == 4u) && !deb && !rlc && !ade;
+#endif
         if (mur || deb)
         {
 #if DIAMOND_MUR
             for (uint f = 0; f < e.numMur; ++f)
-                if (mur & (1u << f)) murStage(1, mf[f], E, mcoef, mscr, sx, sy, d, tid, tgs);
+                if (mur & (1u << f)) murStage(murOne ? 3 : 1, mf[f], E, mcoef, mscr, sx, sy, d, tid, tgs);
 #endif
 #if DIAMOND_DEBYE
             if (deb) adePost(E, arun, aele, adeC, adeS, a0, a1, sx, sy, cs, tid, tgs);
 #endif
             threadgroup_barrier(mem_flags::mem_device);
         }
-        if (mur || rlc || ade)
+        if ((mur && !murOne) || rlc || ade)
+        {
             // Apply in the engine's extension order (kind << 16 | index; 0 = Mur face, 1 = lumped RLC, 2 = Drude/Lorentz),
-            // one after the other: Mur faces share their edge cells, an element may sit on a face; in the H step only the
-            // Drude/Lorentz currents
+            // one after the other: Mur faces of different axes share their edge cells, an element may sit on a face; in
+            // the H step only the Drude/Lorentz currents
+            uint pend = 3;   // the axis of the Mur faces applied since the last barrier (3: none)
             for (uint a = 0; a < e.numApply; ++a)
             {
                 const uint idx = apply[a] & 0xffffu;
@@ -522,8 +545,15 @@ kernel void diamond(device float4* volt [[buffer(0)]], device float4* curr [[buf
 #if DIAMOND_MUR
                     if (mur & (1u << idx))
                     {
+#if DIAMOND_MURMERGE
+                        if (pend != 3 && pend != mf[idx].ny)
+                            threadgroup_barrier(mem_flags::mem_device);
+                        murStage(2, mf[idx], E, mcoef, mscr, sx, sy, d, tid, tgs);
+                        pend = mf[idx].ny;
+#else
                         murStage(2, mf[idx], E, mcoef, mscr, sx, sy, d, tid, tgs);
                         threadgroup_barrier(mem_flags::mem_device);
+#endif
                     }
 #endif
                 }
@@ -532,6 +562,7 @@ kernel void diamond(device float4* volt [[buffer(0)]], device float4* curr [[buf
 #if DIAMOND_ADE
                     if (ade && aro[ab + idx + 1] > aro[ab + idx])
                     {
+                        if (pend != 3) { threadgroup_barrier(mem_flags::mem_device); pend = 3; }
                         adeApply(eStep ? E : H, arun, aele, adeS, aro[ab + idx], aro[ab + idx + 1], sx, sy, cs, tid, tgs);
                         threadgroup_barrier(mem_flags::mem_device);
                     }
@@ -540,6 +571,7 @@ kernel void diamond(device float4* volt [[buffer(0)]], device float4* curr [[buf
                 else if (rlc)
                 {
 #if DIAMOND_RLC
+                    if (pend != 3) { threadgroup_barrier(mem_flags::mem_device); pend = 3; }
                     rlcStage(0, idx, E, rlcI, rlcC, rlcS, roff, rlist, li, sx, sy, d, tid, tgs, e.rlcSerial != 0);
                     threadgroup_barrier(mem_flags::mem_device);
                     rlcStage(1, idx, E, rlcI, rlcC, rlcS, roff, rlist, li, sx, sy, d, tid, tgs, e.rlcSerial != 0);
@@ -547,6 +579,9 @@ kernel void diamond(device float4* volt [[buffer(0)]], device float4* curr [[buf
 #endif
                 }
             }
+            if (pend != 3)
+                threadgroup_barrier(mem_flags::mem_device);
+        }
 #if DIAMOND_EXC
         // the excitation of this step for the cells this tile updated, as runs: the entries of one field value in entry
         // order (Engine_Ext_Excitation), one thread per run; run: float index, x << 16 | y, first and end entry; entry:
@@ -660,6 +695,7 @@ struct Engine_Metal_Diamond::State
 	unsigned int numRLC = 0;
 	Ext ext = {};
 	unsigned int batch = 64;
+	bool even = true;   // a call's rest of fewer than K steps is spread over its last blocks (OPENEMS_DIAMOND_EVEN=0: K, K, .., rest)
 	// OPENEMS_DIAMOND_TIMING=1 prints these at the end: setup and IterateTS wall times, the calls, the GPU time of the
 	// command buffers (busy) and from the first start to the last end of each call (span); =2 also commits every phase
 	// dispatch in a command buffer of its own and adds the GPU time per phase (MM, MV, VM, VV; slower, for the split)
@@ -960,8 +996,15 @@ bool Engine_Metal_Diamond::SetupGPU()
 			options.fastMathEnabled = NO;
 #pragma clang diagnostic pop
 		}
+		// Mur faces of one axis share barriers (see the kernel) when their lines keep them apart: a face line is never the
+		// opposite face's shift line with three lines or more. OPENEMS_DIAMOND_MURMERGE=0: one barrier per face and stage,
+		// as before.
+		bool murMerge = EnvUInt("OPENEMS_DIAMOND_MURMERGE", 1)!=0;
+		for (const Engine_Ext_Mur_ABC* m : murs)
+			murMerge = murMerge && (numLines[m->m_ny]>=3);
 		// the kernel without the parts this model does not use (fewer registers, more tiles in flight)
 		options.preprocessorMacros = @{@"DIAMOND_MUR": @(murs.empty() ? 0 : 1),
+									   @"DIAMOND_MURMERGE": @(murMerge ? 1 : 0),
 									   @"DIAMOND_EXC": @((excSeen && Op->GetExcitationExtension()) ? 1 : 0),
 									   @"DIAMOND_RLC": @(rlcs.empty() ? 0 : 1),
 									   @"DIAMOND_UPML": @(upmls.empty() ? 0 : 1),
@@ -1012,6 +1055,7 @@ bool Engine_Metal_Diamond::SetupGPU()
 		md.opi = buffer(opi.data(), opi.size()*sizeof(uint32_t));
 
 		md.batch = std::max(1u, EnvUInt("OPENEMS_DIAMOND_BATCH", 64));
+		md.even = EnvUInt("OPENEMS_DIAMOND_EVEN", 1)!=0;
 		md.timing = EnvUInt("OPENEMS_DIAMOND_TIMING", 0);
 
 		// the extension data in three blobs: read-only words (Ub), read-only floats (Fb) and the state (Sn floats, zero); the
@@ -1529,7 +1573,15 @@ bool Engine_Metal_Diamond::IterateTS(unsigned int iterTS)
 			unsigned int inCB = 0;
 			while ((done<iterTS) && (inCB<batch))
 			{
-				const unsigned int depth = std::min(c.K, iterTS-done);
+				// the block depth: K, and towards the end of a call the rest in blocks of nearly equal depth (10 steps at K=4:
+				// 4, 3, 3 and not 4, 4, 2; a shallow block reuses its tile's cached fields less). The fields do not depend
+				// on the depths.
+				unsigned int depth = std::min(c.K, iterTS-done);
+				if (md.even)
+				{
+					const unsigned int rest = iterTS-done, blocks = (rest+c.K-1)/c.K;
+					depth = (rest+blocks-1)/blocks;
+				}
 				for (int ph=0; ph<4; ++ph)   // MM, MV, VM, VV
 				{
 					const int xt = ph/2, yt = ph%2;
