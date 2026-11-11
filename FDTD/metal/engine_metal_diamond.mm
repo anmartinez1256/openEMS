@@ -72,7 +72,7 @@ constant Dims dims = {DIAMOND_NX, DIAMOND_NY, DIAMOND_NZ, DIAMOND_NV};
 struct Phase { uint depth, ts0, types, lbase0, ntx0, nty0, lbase1, ntx1, nty1; };
 struct Ext { uint vcount, ccount, length, period0, numMur, numApply, rlcSerial, numUpml, numAde; }; // period0: 0 = no signal period
 struct MurFace { uint ny, nyP, nyPP, line, shift, n1, startTS, coef, size; };
-struct Upml { uint x0, y0, z0, nx, ny, nz, cidx, flux; };   // box start and lines, coefficient index (U), flux (St)
+struct Upml { uint x0, y0, z0, nx, ny, nz, cidx, flux, rcpZ, okZ; };   // box start and lines, coefficient index (U), flux (St); ceil(2^32 / nz) and whether i / nz may use it
 // where the extension data sit in the read-only words (U), the read-only floats (Fc) and the state (St)
 struct Ofs { uint xrun, xro, xele, mf, apply, rlcI, roff, rlist, upml, arun, aro, aele;  // U
              uint vsig, csig, mcoef, rlcC, ucoef, adeC;                                // Fc
@@ -163,14 +163,27 @@ inline void cellI(device float4* curr, device const float4* volt, device const f
 #endif
 }
 
-// r / w for the cell loops, w = a tile's width in y (it changes with the half-step, so the compiler cannot turn the division
-// into a multiplication): floor(r * ceil(2^16 / w) / 2^16) is exact while r * (w - 1) < 2^16, which mulDiv() tests for the
-// largest r of the loop
-inline bool mulDiv(uint count, uint w) { return count * w < 65536u; }
-inline uint divW(uint r, uint w, uint rcp, bool mul)
+// r / w in the loops over a tile's cells, w = a width that is only known at run time (a tile's width in y changes with
+// the half-step), so the compiler cannot turn the division into a multiplication: with rcp = ceil(2^32 / w), the high
+// word of r * rcp is floor(r / w) while r * (w - 1) < 2^32. The reciprocals come from the host: RCPW[w] for the tile
+// widths 2 .. 64 (okW: such a width, and r < 2^26), a field of the record for a UPML box's lines. They are not computed
+// here: on the M5 (macOS 27.0.1) the GPU's 0xffffffffu / w returned 3579139454 for w = 3 (1431655765 is right).
+constant uint RCPW[65] = {   // ceil(2^32 / w), w = 2 .. 64
+    0u, 0u, 2147483648u, 1431655766u, 1073741824u, 858993460u, 715827883u, 613566757u,
+    536870912u, 477218589u, 429496730u, 390451573u, 357913942u, 330382100u, 306783379u, 286331154u,
+    268435456u, 252645136u, 238609295u, 226050911u, 214748365u, 204522253u, 195225787u, 186737709u,
+    178956971u, 171798692u, 165191050u, 159072863u, 153391690u, 148102321u, 143165577u, 138547333u,
+    134217728u, 130150525u, 126322568u, 122713352u, 119304648u, 116080198u, 113025456u, 110127367u,
+    107374183u, 104755300u, 102261127u, 99882961u, 97612894u, 95443718u, 93368855u, 91382283u,
+    89478486u, 87652394u, 85899346u, 84215046u, 82595525u, 81037119u, 79536432u, 78090315u,
+    76695845u, 75350304u, 74051161u, 72796056u, 71582789u, 70409300u, 69273667u, 68174085u,
+    67108864u };
+inline uint rcpW(uint w) { return RCPW[min(w, 64u)]; }
+inline bool okW(uint count, uint w) { return w >= 2u && w <= 64u && count < (1u << 26); }
+inline uint divW(uint r, uint w, uint rcp, bool ok)
 {
 #if DIAMOND_FASTIDX
-    if (mul) return (r * rcp) >> 16;
+    if (ok) return mulhi(r, rcp);
 #endif
     return r / w;
 }
@@ -202,12 +215,12 @@ inline uint murCount(thread const MurFace& m, int2 sx, int2 sy, constant Dims& d
     const uint wx = uint(sx.y - sx.x), wy = uint(sy.y - sy.x);
     return m.ny == 0 ? wy*d.nz : (m.ny == 1 ? wx*d.nz : wx*wy);
 }
-inline void murPos(thread const MurFace& m, uint i, int2 sx, int2 sy, constant Dims& d, thread uint* pos)
+inline void murPos(thread const MurFace& m, uint i, int2 sx, int2 sy, constant Dims& d, thread uint* pos, uint rcp, bool ok)
 {
     const uint wy = uint(sy.y - sy.x);
     if (m.ny == 0)      { pos[0] = m.line; pos[1] = uint(sy.x) + i / d.nz; pos[2] = i % d.nz; }
     else if (m.ny == 1) { pos[0] = uint(sx.x) + i / d.nz; pos[1] = m.line; pos[2] = i % d.nz; }
-    else                { pos[0] = uint(sx.x) + i / wy; pos[1] = uint(sy.x) + i % wy; pos[2] = m.line; }
+    else                { const uint q = divW(i, wy, rcp, ok); pos[0] = uint(sx.x) + q; pos[1] = uint(sy.x) + (i - q*wy); pos[2] = m.line; }
 }
 
 // stage 0: Pre (before the E update), 1: Post (after it), 2: Apply, 3: Post and Apply; Engine_Ext_Mur_ABC's MurFast arithmetic
@@ -216,10 +229,12 @@ inline void murStage(uint stage, const MurFace m, device float* E, device const 
                      int2 sx, int2 sy, constant Dims& d, uint tid, uint tgs)
 {
     const uint count = murCount(m, sx, sy, d);
+    const uint rcp = rcpW(uint(sy.y - sy.x));
+    const bool ok = okW(count, uint(sy.y - sy.x));
     for (uint i = tid; i < count; i += tgs)
     {
         uint pos[3];
-        murPos(m, i, sx, sy, d, pos);
+        murPos(m, i, sx, sy, d, pos, rcp, ok);
         const uint k = pos[m.nyP]*m.n1 + pos[m.nyPP];
         const uint fP = F(m.nyP, pos[0], pos[1], pos[2], d), fPP = F(m.nyPP, pos[0], pos[1], pos[2], d);
         if (stage == 2) { E[fP] = ms[m.coef + k]; E[fPP] = ms[m.coef + m.size + k]; continue; }
@@ -298,13 +313,16 @@ inline void upmlStage(uint stage, bool eStep, const Upml u, device float* Fd, de
     const uint count = uint(x1 - x0) * wy * 3 * u.nz;
     device float* flux = St + u.flux + (eStep ? 0 : 3*N);
     const uint co = eStep ? 0 : 3;
+    const uint rcpY = rcpW(wy);
+    const bool okZ = u.okZ != 0u, okY = okW(count, wy);
     for (uint i = tid; i < count; i += tgs)
     {
-        const uint lz = i % u.nz;
-        uint r = i / u.nz;
+        uint r = divW(i, u.nz, u.rcpZ, okZ);
+        const uint lz = i - r*u.nz;
         const uint n = r % 3;
         r /= 3;
-        const uint y = uint(y0) + r % wy, x = uint(x0) + r / wy;
+        const uint qx = divW(r, wy, rcpY, okY);
+        const uint y = uint(y0) + (r - qx*wy), x = uint(x0) + qx;
         const uint c = ((n*u.nx + (x - u.x0))*u.ny + (y - u.y0))*u.nz + lz;
         device const float* t = tab + 6*U[u.cidx + c] + co;
         const uint fi = F(n, x, y, u.z0 + lz, d);
@@ -533,12 +551,12 @@ kernel void diamond(device float4* volt [[buffer(0)]], device float4* curr [[buf
         }
 #endif
         const uint count = uint(wx) * uint(wy) * d.nv;
-        const uint uwy = uint(wy), rcp = 65535u / uwy + 1u;
-        const bool mul = mulDiv(uint(wx) * uwy, uwy);
+        const uint uwy = uint(wy), rcp = rcpW(uwy);
+        const bool okY = okW(uint(wx) * uwy, uwy);
         for (uint i = tid; i < count; i += tgs)
         {
             const uint zv = i % d.nv, r = i / d.nv;
-            const uint q = divW(r, uwy, rcp, mul);
+            const uint q = divW(r, uwy, rcp, okY);
             const uint y = uint(sy.x) + (r - q*uwy), x = uint(sx.x) + q;
             if (eStep) cellV(volt, curr, pv, pc, opi, d, x, y, zv);
             else if (x + 1 < d.nx && y + 1 < d.ny) cellI(curr, volt, pi, pc, opi, d, x, y, zv);
@@ -558,12 +576,13 @@ kernel void diamond(device float4* volt [[buffer(0)]], device float4* curr [[buf
 #endif
         // Mur faces of one axis have no cell in common, and none of them writes another's shift line (DIAMOND_MURMERGE,
         // set when every Mur face is at least two lines from its shift line's opposite face). So when the faces in this
-        // tile are all on one axis and nothing else is applied here, each thread does Post and Apply of its elements in
-        // one go (murOne: one barrier less per E step); otherwise consecutive faces of one axis in the Apply order
-        // share a barrier.
+        // tile are all on one axis, each thread does Post and Apply of its elements in one go (murOne: one barrier
+        // less per E step), provided the Mur faces come first in the Apply order (DIAMOND_MURFIRST) or nothing else is
+        // applied in this tile, and no Debye Post, which reads the field, runs beside them; otherwise consecutive faces
+        // of one axis in the Apply order share a barrier.
         bool murOne = false;
 #if DIAMOND_MUR && DIAMOND_MURMERGE
-        murOne = mur && (murAxes == 1u || murAxes == 2u || murAxes == 4u) && !deb && !rlc && !ade;
+        murOne = mur && (murAxes == 1u || murAxes == 2u || murAxes == 4u) && !deb && (DIAMOND_MURFIRST || (!rlc && !ade));
 #endif
         if (mur || deb)
         {
@@ -655,7 +674,7 @@ kernel void diamond(device float4* volt [[buffer(0)]], device float4* curr [[buf
 struct Phase { uint32_t depth, ts0, types, lbase0, ntx0, nty0, lbase1, ntx1, nty1; };
 struct Ext { uint32_t vcount, ccount, length, period0, numMur, numApply, rlcSerial, numUpml, numAde; };
 struct MurFace { uint32_t ny, nyP, nyPP, line, shift, n1, startTS, coef, size; };
-struct Upml { uint32_t x0, y0, z0, nx, ny, nz, cidx, flux; };
+struct Upml { uint32_t x0, y0, z0, nx, ny, nz, cidx, flux, rcpZ, okZ; };
 typedef std::array<uint32_t,4> U4;   // a uint4 in the kernel: 16-byte aligned in U
 struct Ofs { uint32_t xrun, xro, xele, mf, apply, rlcI, roff, rlist, upml, arun, aro, aele;
 			 uint32_t vsig, csig, mcoef, rlcC, ucoef, adeC;
@@ -1048,9 +1067,14 @@ bool Engine_Metal_Diamond::SetupGPU()
 		bool murMerge = EnvUInt("OPENEMS_DIAMOND_MURMERGE", 1)!=0;
 		for (const Engine_Ext_Mur_ABC* m : murs)
 			murMerge = murMerge && (numLines[m->m_ny]>=3);
+		// the Mur faces come before every lumped RLC and dispersive extension in the Apply order
+		bool murFirst = true;
+		for (size_t a=1; a<applyOrder.size(); ++a)
+			murFirst = murFirst && !(((applyOrder[a]>>16)==0) && ((applyOrder[a-1]>>16)!=0));
 		// the kernel without the parts this model does not use (fewer registers, more tiles in flight)
 		options.preprocessorMacros = @{@"DIAMOND_MUR": @(murs.empty() ? 0 : 1),
 									   @"DIAMOND_MURMERGE": @(murMerge ? 1 : 0),
+									   @"DIAMOND_MURFIRST": @(murFirst ? 1 : 0),
 									   @"DIAMOND_FASTIDX": @(EnvUInt("OPENEMS_DIAMOND_FASTIDX", 1) ? 1 : 0),
 									   @"DIAMOND_EXC": @((excSeen && Op->GetExcitationExtension()) ? 1 : 0),
 									   @"DIAMOND_RLC": @(rlcs.empty() ? 0 : 1),
@@ -1249,7 +1273,11 @@ bool Engine_Metal_Diamond::SetupGPU()
 							}
 							idx[((n*(size_t)NX+lx)*NY+ly)*NZ+lz] = it->second;
 						}
-			boxes.push_back({o->m_StartPos[0], o->m_StartPos[1], o->m_StartPos[2], NX, NY, NZ, addU(idx.data(), idx.size()), addS(6*N)});
+			// i / NZ in the kernel as a multiplication (see divW): exact for every float of a tile, at most 3 * NZ per column
+			// and fewer than 2^16 columns, when 2^16 * 3 * NZ * (NZ - 1) < 2^32
+			const uint32_t rcpZ = (NZ>1) ? (uint32_t)(0xffffffffu/NZ + 1u) : 0;
+			const uint32_t okZ = ((NZ>1) && (3ull*NZ*(NZ-1) < (1ull<<16))) ? 1 : 0;
+			boxes.push_back({o->m_StartPos[0], o->m_StartPos[1], o->m_StartPos[2], NX, NY, NZ, addU(idx.data(), idx.size()), addS(6*N), rcpZ, okZ});
 			upmlCells += N;
 		}
 		ofs.upml = addU((const uint32_t*)boxes.data(), boxes.size()*sizeof(Upml)/4);
