@@ -72,10 +72,12 @@ constant Dims dims = {DIAMOND_NX, DIAMOND_NY, DIAMOND_NZ, DIAMOND_NV};
 struct Phase { uint depth, ts0, types, lbase0, ntx0, nty0, lbase1, ntx1, nty1; };
 struct Ext { uint vcount, ccount, length, period0, numMur, numApply, rlcSerial, numUpml, numAde; }; // period0: 0 = no signal period
 struct MurFace { uint ny, nyP, nyPP, line, shift, n1, startTS, coef, size; };
-struct Upml { uint x0, y0, z0, nx, ny, nz, cidx, flux, rcpZ, okZ; };   // box start and lines, coefficient index (U), flux (St); ceil(2^32 / nz) and whether i / nz may use it
+// box start and lines, coefficient index (U), flux (St); ceil(2^32 / nz) and whether i / nz may use it; tall: the box
+// has every z line and is updated a z-vector at a time (upmlStage4: its index and flux are per z-vector)
+struct Upml { uint x0, y0, z0, nx, ny, nz, cidx, flux, rcpZ, okZ, tall; };
 // where the extension data sit in the read-only words (U), the read-only floats (Fc) and the state (St)
 struct Ofs { uint xrun, xro, xele, mf, apply, rlcI, roff, rlist, upml, arun, aro, aele;  // U
-             uint vsig, csig, mcoef, rlcC, ucoef, adeC;                                // Fc
+             uint vsig, csig, mcoef, rlcC, ucoef, adeC, ucoef4;                        // Fc
              uint mscr, rlcS, adeS; };                                                 // St
 
 // the f4vector of component n at (x, y, zv) in the N-I-J-K layout, and the float of cell z (z = lane*nv + zv)
@@ -324,10 +326,56 @@ inline void upmlStage(uint stage, bool eStep, const Upml u, device float* Fd, de
         const uint qx = divW(r, wy, rcpY, okY);
         const uint y = uint(y0) + (r - qx*wy), x = uint(x0) + qx;
         const uint c = ((n*u.nx + (x - u.x0))*u.ny + (y - u.y0))*u.nz + lz;
+#if DIAMOND_UIDX16
+        device const float* t = tab + 6*uint(((device const ushort*)(U + u.cidx))[c]) + co;
+#else
         device const float* t = tab + 6*U[u.cidx + c] + co;
+#endif
         const uint fi = F(n, x, y, u.z0 + lz, d);
         if (stage == 0) { const float h = fma(t[0], Fd[fi], -(t[1]*flux[c])); Fd[fi] = flux[c]; flux[c] = h; }
         else            { const float h = flux[c]; flux[c] = Fd[fi]; Fd[fi] = fma(t[2], flux[c], h); }
+    }
+}
+
+// The same for a box that has every z line (the x and y slabs: Create_UPML gives them all of z), a z-vector at a time:
+// the lanes are the cells z = lane*nv + zv, each with its own coefficient set, so the table tab4 holds per distinct
+// group of four sets vv vvfo vvfn ii iifo iifn as float4, with one index per component and z-vector; the flux as
+// float4 [e/h][n][x][y][zv]. The same operations per lane as upmlStage; the lanes past the last z line (the padding of
+// the last z-vector) keep their values, as on the CPU, which never touches them.
+inline void upmlStage4(uint stage, bool eStep, const Upml u, device float4* Fd, device const uint* U,
+                       device const float4* tab4, device float* St, int2 sx, int2 sy, constant Dims& d, uint tid, uint tgs)
+{
+    const int x0 = max(sx.x, int(u.x0)), x1 = min(sx.y, int(u.x0 + u.nx));
+    const int y0 = max(sy.x, int(u.y0)), y1 = min(sy.y, int(u.y0 + u.ny));
+    if (x1 <= x0 || y1 <= y0) return;
+    const uint wy = uint(y1 - y0), N4 = u.nx*u.ny*d.nv;
+    const uint count = uint(x1 - x0) * wy * 3 * d.nv;
+    device float4* flux = (device float4*)(St + u.flux) + (eStep ? 0 : 3*N4);
+    const uint co = eStep ? 0 : 3;
+    const uint rcpY = rcpW(wy);
+    const bool okY = okW(count, wy);
+    for (uint i = tid; i < count; i += tgs)
+    {
+        const uint zv = i % d.nv;
+        uint r = i / d.nv;
+        const uint n = r % 3;
+        r /= 3;
+        const uint qx = divW(r, wy, rcpY, okY);
+        const uint y = uint(y0) + (r - qx*wy), x = uint(x0) + qx;
+        const uint c = ((n*u.nx + (x - u.x0))*u.ny + (y - u.y0))*d.nv + zv;
+#if DIAMOND_U4IDX16
+        device const float4* t = tab4 + 6*uint(((device const ushort*)(U + u.cidx))[c]) + co;
+#else
+        device const float4* t = tab4 + 6*U[u.cidx + c] + co;
+#endif
+        const uint fi = I(n, x, y, zv, d);
+        const bool4 in = (uint4(0u, 1u, 2u, 3u)*d.nv + zv) < uint4(d.nz);
+        const float4 f = Fd[fi], fl = flux[c];
+        float4 nf, nfl;
+        if (stage == 0) { nfl = fma(t[0], f, -(t[1]*fl)); nf = fl; }
+        else            { nfl = f; nf = fma(t[2], f, fl); }
+        Fd[fi] = select(f, nf, in);
+        flux[c] = select(fl, nfl, in);
     }
 }
 
@@ -460,6 +508,7 @@ kernel void diamond(device float4* volt [[buffer(0)]], device float4* curr [[buf
     device const float* mcoef = Fc + o.mcoef;
     device const float* rlcC = Fc + o.rlcC;
     device const float* utab = Fc + o.ucoef;
+    device const float4* utab4 = (device const float4*)(Fc + o.ucoef4);
     device const uint4* arun = (device const uint4*)(U + o.arun);
     device const uint* aro = U + o.aro;
     device const uint4* aele = (device const uint4*)(U + o.aele);
@@ -546,7 +595,11 @@ kernel void diamond(device float4* volt [[buffer(0)]], device float4* curr [[buf
         if (upml)
         {
             for (uint u = e.numUpml; u-- > 0; )
-                if (upml & (1u << u)) upmlStage(0, eStep, up[u], eStep ? E : H, U, utab, St, sx, sy, d, tid, tgs);
+                if (upml & (1u << u))
+                {
+                    if (up[u].tall) upmlStage4(0, eStep, up[u], eStep ? volt : curr, U, utab4, St, sx, sy, d, tid, tgs);
+                    else upmlStage(0, eStep, up[u], eStep ? E : H, U, utab, St, sx, sy, d, tid, tgs);
+                }
             threadgroup_barrier(mem_flags::mem_device);
         }
 #endif
@@ -566,7 +619,11 @@ kernel void diamond(device float4* volt [[buffer(0)]], device float4* curr [[buf
         if (upml)
         {
             for (uint u = 0; u < e.numUpml; ++u)
-                if (upml & (1u << u)) upmlStage(1, eStep, up[u], eStep ? E : H, U, utab, St, sx, sy, d, tid, tgs);
+                if (upml & (1u << u))
+                {
+                    if (up[u].tall) upmlStage4(1, eStep, up[u], eStep ? volt : curr, U, utab4, St, sx, sy, d, tid, tgs);
+                    else upmlStage(1, eStep, up[u], eStep ? E : H, U, utab, St, sx, sy, d, tid, tgs);
+                }
             threadgroup_barrier(mem_flags::mem_device);
         }
 #endif
@@ -674,10 +731,10 @@ kernel void diamond(device float4* volt [[buffer(0)]], device float4* curr [[buf
 struct Phase { uint32_t depth, ts0, types, lbase0, ntx0, nty0, lbase1, ntx1, nty1; };
 struct Ext { uint32_t vcount, ccount, length, period0, numMur, numApply, rlcSerial, numUpml, numAde; };
 struct MurFace { uint32_t ny, nyP, nyPP, line, shift, n1, startTS, coef, size; };
-struct Upml { uint32_t x0, y0, z0, nx, ny, nz, cidx, flux, rcpZ, okZ; };
+struct Upml { uint32_t x0, y0, z0, nx, ny, nz, cidx, flux, rcpZ, okZ, tall; };
 typedef std::array<uint32_t,4> U4;   // a uint4 in the kernel: 16-byte aligned in U
 struct Ofs { uint32_t xrun, xro, xele, mf, apply, rlcI, roff, rlist, upml, arun, aro, aele;
-			 uint32_t vsig, csig, mcoef, rlcC, ucoef, adeC;
+			 uint32_t vsig, csig, mcoef, rlcC, ucoef, adeC, ucoef4;
 			 uint32_t mscr, rlcS, adeS; };
 
 unsigned int EnvUInt(const char* name, unsigned int def)
@@ -1045,6 +1102,71 @@ bool Engine_Metal_Diamond::SetupGPU()
 			}
 	}
 
+	// UPML boxes: one table of the distinct coefficient sets (vv vvfo vvfn ii iifo iifn) of all boxes, utab, and an index
+	// per component and box cell [n][x][y][z]. A box that has every z line (the x and y slabs) is updated a z-vector at
+	// a time (OPENEMS_DIAMOND_PML4=0: a float at a time, as the z slabs): its index is per component and z-vector
+	// [n][x][y][zv], into the table utab4 of the distinct groups of four sets (the lanes z = lane*nv + zv; a lane past the
+	// last z line has no set), each as six float4.
+	struct UpmlData { Engine_Ext_UPML* ext; std::vector<uint32_t> idx; bool tall; };
+	std::vector<UpmlData> upmlData;
+	std::vector<float> utab, utab4;
+	size_t upmlCells = 0;
+	{
+		const bool pml4 = EnvUInt("OPENEMS_DIAMOND_PML4", 1)!=0;
+		std::map<std::array<float,6>, uint32_t> lut;
+		std::map<std::array<uint32_t,4>, uint32_t> lut4;
+		for (Engine_Ext_UPML* u : upmls)
+		{
+			const Operator_Ext_UPML* o = u->m_Op_UPML;
+			const unsigned int NX = o->m_numLines[0], NY = o->m_numLines[1], NZ = o->m_numLines[2];
+			const size_t N = (size_t)NX*NY*NZ;
+			std::vector<uint32_t> idx(3*N);
+			for (unsigned int n=0; n<3; ++n)
+				for (unsigned int lx=0; lx<NX; ++lx)
+					for (unsigned int ly=0; ly<NY; ++ly)
+						for (unsigned int lz=0; lz<NZ; ++lz)
+						{
+							const std::array<float,6> key = {o->vv(n,lx,ly,lz), o->vvfo(n,lx,ly,lz), o->vvfn(n,lx,ly,lz),
+															 o->ii(n,lx,ly,lz), o->iifo(n,lx,ly,lz), o->iifn(n,lx,ly,lz)};
+							auto it = lut.find(key);
+							if (it==lut.end())
+							{
+								it = lut.insert(std::make_pair(key, (uint32_t)(utab.size()/6))).first;
+								utab.insert(utab.end(), key.begin(), key.end());
+							}
+							idx[((n*(size_t)NX+lx)*NY+ly)*NZ+lz] = it->second;
+						}
+			upmlCells += N;
+			const bool tall = pml4 && (o->m_StartPos[2]==0) && (NZ==numLines[2]);
+			if (tall)
+			{
+				std::vector<uint32_t> idx4(3*(size_t)NX*NY*numVectors);
+				for (size_t col=0; col<3*(size_t)NX*NY; ++col)
+					for (unsigned int zv=0; zv<numVectors; ++zv)
+					{
+						std::array<uint32_t,4> key;
+						for (unsigned int lane=0; lane<4; ++lane)
+						{
+							const unsigned int z = lane*numVectors + zv;
+							key[lane] = (z<NZ) ? idx[col*NZ+z] : 0xffffffffu;
+						}
+						auto it = lut4.find(key);
+						if (it==lut4.end())
+						{
+							it = lut4.insert(std::make_pair(key, (uint32_t)(utab4.size()/24))).first;
+							for (int k=0; k<6; ++k)
+								for (unsigned int lane=0; lane<4; ++lane)
+									utab4.push_back((key[lane]==0xffffffffu) ? 0.0f : utab[6*(size_t)key[lane]+k]);
+						}
+						idx4[col*numVectors+zv] = it->second;
+					}
+				idx.swap(idx4);
+			}
+			upmlData.push_back({u, std::move(idx), tall});
+		}
+	}
+	const bool uidx16 = utab.size()/6 <= 65536, u4idx16 = utab4.size()/24 <= 65536;
+
 	@autoreleasepool
 	{
 		NSError* error = nil;
@@ -1079,6 +1201,7 @@ bool Engine_Metal_Diamond::SetupGPU()
 									   @"DIAMOND_EXC": @((excSeen && Op->GetExcitationExtension()) ? 1 : 0),
 									   @"DIAMOND_RLC": @(rlcs.empty() ? 0 : 1),
 									   @"DIAMOND_UPML": @(upmls.empty() ? 0 : 1),
+									   @"DIAMOND_UIDX16": @(uidx16 ? 1 : 0), @"DIAMOND_U4IDX16": @(u4idx16 ? 1 : 0),
 									   @"DIAMOND_ADE": @(lors.empty() ? 0 : 1),
 									   @"DIAMOND_DEBYE": @(hasDebye ? 1 : 0),
 									   @"DIAMOND_SPLIT": @(split ? 1 : 0),
@@ -1246,42 +1369,42 @@ bool Engine_Metal_Diamond::SetupGPU()
 		ofs.rlcS = addS((size_t)md.numRLC*5);
 		ofs.apply = addU(applyOrder.data(), applyOrder.size());
 
-		// UPML boxes: one table of the distinct coefficient sets (vv vvfo vvfn ii iifo iifn) of all boxes, an index per
-		// component and box cell [n][x][y][z], the flux (zero, as the CPU's): voltages [n][x][y][z], then the currents
+		// UPML boxes (the tables were built before the kernel, see upmlData): per box its index, as 16-bit words when the
+		// table allows, and its flux (zero, as the CPU's): voltages, then currents; float4 data on 16-byte boundaries
 		std::vector<Upml> boxes;
-		std::vector<float> utab;
-		std::map<std::array<float,6>, uint32_t> lut;
-		size_t upmlCells = 0;
-		for (Engine_Ext_UPML* u : upmls)
+		auto addIdx = [&](const std::vector<uint32_t>& v, bool narrow) -> uint32_t
 		{
-			const Operator_Ext_UPML* o = u->m_Op_UPML;
+			if (!narrow)
+				return addU(v.data(), v.size());
+			std::vector<uint32_t> w((v.size()+1)/2, 0);
+			for (size_t k=0; k<v.size(); ++k)
+				((uint16_t*)w.data())[k] = (uint16_t)v[k];
+			return addU(w.data(), w.size());
+		};
+		for (const UpmlData& b : upmlData)
+		{
+			const Operator_Ext_UPML* o = b.ext->m_Op_UPML;
 			const unsigned int NX = o->m_numLines[0], NY = o->m_numLines[1], NZ = o->m_numLines[2];
 			const size_t N = (size_t)NX*NY*NZ;
-			std::vector<uint32_t> idx(3*N);
-			for (unsigned int n=0; n<3; ++n)
-				for (unsigned int lx=0; lx<NX; ++lx)
-					for (unsigned int ly=0; ly<NY; ++ly)
-						for (unsigned int lz=0; lz<NZ; ++lz)
-						{
-							const std::array<float,6> key = {o->vv(n,lx,ly,lz), o->vvfo(n,lx,ly,lz), o->vvfn(n,lx,ly,lz),
-															 o->ii(n,lx,ly,lz), o->iifo(n,lx,ly,lz), o->iifn(n,lx,ly,lz)};
-							auto it = lut.find(key);
-							if (it==lut.end())
-							{
-								it = lut.insert(std::make_pair(key, (uint32_t)(utab.size()/6))).first;
-								utab.insert(utab.end(), key.begin(), key.end());
-							}
-							idx[((n*(size_t)NX+lx)*NY+ly)*NZ+lz] = it->second;
-						}
 			// i / NZ in the kernel as a multiplication (see divW): exact for every float of a tile, at most 3 * NZ per column
 			// and fewer than 2^16 columns, when 2^16 * 3 * NZ * (NZ - 1) < 2^32
 			const uint32_t rcpZ = (NZ>1) ? (uint32_t)(0xffffffffu/NZ + 1u) : 0;
 			const uint32_t okZ = ((NZ>1) && (3ull*NZ*(NZ-1) < (1ull<<16))) ? 1 : 0;
-			boxes.push_back({o->m_StartPos[0], o->m_StartPos[1], o->m_StartPos[2], NX, NY, NZ, addU(idx.data(), idx.size()), addS(6*N), rcpZ, okZ});
-			upmlCells += N;
+			uint32_t flux;
+			if (b.tall)
+			{
+				Sn = (Sn+3) & ~(size_t)3;
+				flux = addS(24*(size_t)NX*NY*numVectors);
+			}
+			else
+				flux = addS(6*N);
+			boxes.push_back({o->m_StartPos[0], o->m_StartPos[1], o->m_StartPos[2], NX, NY, NZ,
+							 addIdx(b.idx, b.tall ? u4idx16 : uidx16), flux, rcpZ, okZ, b.tall ? 1u : 0u});
 		}
 		ofs.upml = addU((const uint32_t*)boxes.data(), boxes.size()*sizeof(Upml)/4);
 		ofs.ucoef = addF(utab.data(), utab.size());
+		Fb.resize((Fb.size()+3) & ~(size_t)3, 0);
+		ofs.ucoef4 = addF(utab4.data(), utab4.size());
 
 		// dispersive materials: flags per (extension, order): 1 voltage ADE, 2 current ADE, 4 voltage Lorentz term, 8 current
 		// Lorentz term, 16 Debye (poles << 8); Lorentz: 18 coefficients and 12 state floats per element, Debye with P poles:
@@ -1553,7 +1676,7 @@ bool Engine_Metal_Diamond::SetupGPU()
 				cout << (&c==&md.tilings[0] ? " " : ", ") << "K=" << c.K << " tiles " << c.M << "," << c.V << " (x " << c.numTiles[0] << "+"
 					 << c.numTiles[1] << ", y " << c.numTiles[2] << "+" << c.numTiles[3] << ", " << c.tg << " threads per tile)";
 			cout << ", " << murs.size() << " Mur faces, " << md.numRLC << " lumped RLC elements, " << upmls.size() << " UPML boxes ("
-				 << upmlCells << " cells, " << utab.size()/6 << " coefficient sets), " << numADE << " dispersive positions, "
+				 << upmlCells << " cells, " << utab.size()/6 << " coefficient sets, " << utab4.size()/24 << " for z-vectors), " << numADE << " dispersive positions, "
 				 << md.ext.vcount << "+" << md.ext.ccount << " excitation entries" << endl;
 		}
 	}
