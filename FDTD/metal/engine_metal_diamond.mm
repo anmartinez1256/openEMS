@@ -66,7 +66,10 @@ using namespace metal;
 struct Dims { uint nx, ny, nz, nv; };
 // the grid as compile-time constants (the kernel is built per model): the divisions by nv and nz become multiplications
 constant Dims dims = {DIAMOND_NX, DIAMOND_NY, DIAMOND_NZ, DIAMOND_NV};
-struct Phase { uint depth, ts0, xtype, ytype, lbase, nty; }; // type 0 = mountain, 1 = valley; lbase, nty: entry lists
+// One dispatch advances the tiles of one phase, or of two phases whose tiles do not depend on each other (mountain x
+// valley and valley x mountain: tile set tg.z). types: x type | y type << 1 of set 0, the same << 2 of set 1 (0 = mountain,
+// 1 = valley); per set the base of its tiles' entry lists and its tiles in x and y.
+struct Phase { uint depth, ts0, types, lbase0, ntx0, nty0, lbase1, ntx1, nty1; };
 struct Ext { uint vcount, ccount, length, period0, numMur, numApply, rlcSerial, numUpml, numAde; }; // period0: 0 = no signal period
 struct MurFace { uint ny, nyP, nyPP, line, shift, n1, startTS, coef, size; };
 struct Upml { uint x0, y0, z0, nx, ny, nz, cidx, flux; };   // box start and lines, coefficient index (U), flux (St)
@@ -386,7 +389,8 @@ inline void adeApply(device float* Fd, device const uint4* ar, device const uint
 kernel void diamond(device float4* volt [[buffer(0)]], device float4* curr [[buffer(1)]],
                     device const float4* pv [[buffer(2)]], device const float4* pi [[buffer(3)]],
                     device const uint* opi [[buffer(4)]], device const float4* pc [[buffer(5)]],
-                    device const int2* xr [[buffer(6)]], device const int2* yr [[buffer(7)]],
+                    device const int2* xr0 [[buffer(6)]], device const int2* yr0 [[buffer(7)]],
+                    device const int2* xr1 [[buffer(14)]], device const int2* yr1 [[buffer(15)]],
                     constant Phase& p [[buffer(8)]], constant Ext& e [[buffer(9)]],
                     device const uint* U [[buffer(10)]], device const float* Fc [[buffer(11)]],
                     device float* St [[buffer(12)]], constant Ofs& o [[buffer(13)]],
@@ -416,13 +420,20 @@ kernel void diamond(device float4* volt [[buffer(0)]], device float4* curr [[buf
     device float* adeS = St + o.adeS;
     constant Dims& d = dims;
     const uint tgs = tptg.x;
-    const int2 rx = xr[tg.x], ry = yr[tg.y];
+    // this threadgroup's tile: x and y mountains in xr0, yr0, valleys in xr1, yr1; a two-set dispatch has the grid of the
+    // larger set in each direction
+    const uint set = tg.z;
+    const uint xtype = (p.types >> (2*set)) & 1u, ytype = (p.types >> (2*set + 1)) & 1u;
+    const uint lbase = set ? p.lbase1 : p.lbase0, ntx = set ? p.ntx1 : p.ntx0, nty = set ? p.nty1 : p.nty0;
+    if (tg.x >= ntx || tg.y >= nty)
+        return;   // the same for the whole threadgroup
+    const int2 rx = (xtype ? xr1 : xr0)[tg.x], ry = (ytype ? yr1 : yr0)[tg.y];
     device float* E = (device float*)volt;
     device float* H = (device float*)curr;
     const uint cs = 4*d.nx*d.ny*d.nv;   // the floats of one field component
     // this tile's entry lists and runs, the same for every half-step: read once (a device load per half-step costs a few
     // per cent on small grids, where a half-step is about one cell update per thread)
-    const uint li = p.lbase + tg.x*p.nty + tg.y;
+    const uint li = lbase + tg.x*nty + tg.y;
 #if DIAMOND_RLC
     const bool rlcTile = roff[li+1] > roff[li];
 #endif
@@ -434,7 +445,7 @@ kernel void diamond(device float4* volt [[buffer(0)]], device float4* curr [[buf
 #endif
     for (uint s = 0; s < 2 * p.depth; ++s)
     {
-        const int2 sx = span(rx, p.xtype, s, int(d.nx)), sy = span(ry, p.ytype, s, int(d.ny));
+        const int2 sx = span(rx, xtype, s, int(d.nx)), sy = span(ry, ytype, s, int(d.ny));
         const int wx = sx.y - sx.x, wy = sy.y - sy.x;
         if (wx <= 0 || wy <= 0)
             continue;   // the same for the whole threadgroup
@@ -607,7 +618,7 @@ kernel void diamond(device float4* volt [[buffer(0)]], device float4* curr [[buf
 }
 )MSL";
 
-struct Phase { uint32_t depth, ts0, xtype, ytype, lbase, nty; };
+struct Phase { uint32_t depth, ts0, types, lbase0, ntx0, nty0, lbase1, ntx1, nty1; };
 struct Ext { uint32_t vcount, ccount, length, period0, numMur, numApply, rlcSerial, numUpml, numAde; };
 struct MurFace { uint32_t ny, nyP, nyPP, line, shift, n1, startTS, coef, size; };
 struct Upml { uint32_t x0, y0, z0, nx, ny, nz, cidx, flux; };
@@ -695,6 +706,7 @@ struct Engine_Metal_Diamond::State
 	unsigned int numRLC = 0;
 	Ext ext = {};
 	unsigned int batch = 64;
+	bool merge = true;  // the mountain x valley and valley x mountain tiles in one dispatch (OPENEMS_DIAMOND_MERGE=0: four dispatches per block)
 	bool even = true;   // a call's rest of fewer than K steps is spread over its last blocks (OPENEMS_DIAMOND_EVEN=0: K, K, .., rest)
 	// OPENEMS_DIAMOND_TIMING=1 prints these at the end: setup and IterateTS wall times, the calls, the GPU time of the
 	// command buffers (busy) and from the first start to the last end of each call (span); =2 also commits every phase
@@ -1056,6 +1068,7 @@ bool Engine_Metal_Diamond::SetupGPU()
 
 		md.batch = std::max(1u, EnvUInt("OPENEMS_DIAMOND_BATCH", 64));
 		md.even = EnvUInt("OPENEMS_DIAMOND_EVEN", 1)!=0;
+		md.merge = EnvUInt("OPENEMS_DIAMOND_MERGE", 1)!=0;
 		md.timing = EnvUInt("OPENEMS_DIAMOND_TIMING", 0);
 
 		// the extension data in three blobs: read-only words (Ub), read-only floats (Fb) and the state (Sn floats, zero); the
@@ -1558,6 +1571,10 @@ bool Engine_Metal_Diamond::IterateTS(unsigned int iterTS)
 				[enc setBuffer:md.Fc offset:0 atIndex:11];
 				[enc setBuffer:md.St offset:0 atIndex:12];
 				[enc setBytes:&c.ofs length:sizeof(Ofs) atIndex:13];
+				[enc setBuffer:c.tiles[0] offset:0 atIndex:6];    // x mountains, y mountains, x valleys, y valleys
+				[enc setBuffer:c.tiles[2] offset:0 atIndex:7];
+				[enc setBuffer:c.tiles[1] offset:0 atIndex:14];
+				[enc setBuffer:c.tiles[3] offset:0 atIndex:15];
 			};
 			auto end = [&](int ph)
 			{
@@ -1582,17 +1599,35 @@ bool Engine_Metal_Diamond::IterateTS(unsigned int iterTS)
 					const unsigned int rest = iterTS-done, blocks = (rest+c.K-1)/c.K;
 					depth = (rest+blocks-1)/blocks;
 				}
-				for (int ph=0; ph<4; ++ph)   // MM, MV, VM, VV
+				// MM, MV, VM, VV. A mountain x valley tile reads mountain x mountain cells and its own, a valley x mountain
+				// tile the same, and no cell is in both kinds within a block (a cell leaves the x mountain or the y mountain
+				// first): the two phases do not depend on each other and go in one dispatch (three per block, not four; the
+				// per-phase timing keeps them apart).
+				const bool two = md.merge && (md.timing<=1);
+				for (int ph=0; ph<4; ++ph)
 				{
 					const int xt = ph/2, yt = ph%2;
-					if ((c.numTiles[xt]==0) || (c.numTiles[2+yt]==0))
+					const uint32_t ntx = c.numTiles[xt], nty = c.numTiles[2+yt];
+					if (two && (ph==2))
+						continue;   // went with MV
+					Phase p = {depth, numTS+done, (uint32_t)(xt | (yt<<1)), c.lbase[ph], ntx, nty, 0, 0, 0};
+					MTLSize grid = MTLSizeMake(ntx, nty, 1);
+					if (two && (ph==1))
+					{
+						p.types |= (1u | (0u<<1)) << 2;   // VM
+						p.lbase1 = c.lbase[2];
+						p.ntx1 = c.numTiles[1];
+						p.nty1 = c.numTiles[2];
+						if ((ntx==0) || (nty==0))
+							p.ntx0 = p.nty0 = 0;
+						if ((p.ntx1==0) || (p.nty1==0))
+							p.ntx1 = p.nty1 = 0;
+						grid = MTLSizeMake(std::max(p.ntx0, p.ntx1), std::max(p.nty0, p.nty1), 2);
+					}
+					if ((grid.width==0) || (grid.height==0))
 						continue;
-					const Phase p = {depth, numTS+done, (uint32_t)xt, (uint32_t)yt, c.lbase[ph], c.numTiles[2+yt]};
-					[enc setBuffer:c.tiles[xt] offset:0 atIndex:6];
-					[enc setBuffer:c.tiles[2+yt] offset:0 atIndex:7];
 					[enc setBytes:&p length:sizeof(Phase) atIndex:8];
-					[enc dispatchThreadgroups:MTLSizeMake(c.numTiles[xt], c.numTiles[2+yt], 1)
-						threadsPerThreadgroup:MTLSizeMake(c.tg, 1, 1)];
+					[enc dispatchThreadgroups:grid threadsPerThreadgroup:MTLSizeMake(c.tg, 1, 1)];
 					if (md.timing>1)
 					{
 						end(ph);
