@@ -314,8 +314,49 @@ inline void rlcStage(uint stage, uint ext, device float* E, device const uint* r
 // before the update, 1 after it; the voltages in the E step, the currents in the H step. Clang's contraction of the
 // CPU expressions: vv*E - vvfo*flux is fma(vv, E, -(vvfo*flux)), flux_old + vvfn*E one fmadd. Coefficient sets:
 // vv vvfo vvfn ii iifo iifn, one index per component and box cell; the flux: voltages, then currents.
+#if DIAMOND_UPML3
+// DIAMOND_UPML3 (the coefficient sets fit 16-bit indices): the three components of a cell at a time. Per box cell
+// [x][y][z] two index words (set of component 0 | set of component 1 << 16, set of component 2) and the flux of the
+// three components as one float4 [e/h][x][y][z]; per set one float4 for the voltages (vv vvfo vvfn) and one for the
+// currents (ii iifo iifn). A third of the loop passes and half the loads of the loop over single floats below, the
+// same operations per component.
 inline void upmlStage(uint stage, bool eStep, const Upml u, device float* Fd, device const uint* U,
-                      device const float* tab, device float* St, int2 sx, int2 sy, constant Dims& d, uint tid, uint tgs)
+                      device const float4* tab, device float* St, int2 sx, int2 sy, constant Dims& d, uint tid, uint tgs, uint cs)
+{
+    const int x0 = max(sx.x, int(u.x0)), x1 = min(sx.y, int(u.x0 + u.nx));
+    const int y0 = max(sy.x, int(u.y0)), y1 = min(sy.y, int(u.y0 + u.ny));
+    if (x1 <= x0 || y1 <= y0) return;
+    const uint wy = uint(y1 - y0), N = u.nx*u.ny*u.nz;
+    const uint count = uint(x1 - x0) * wy * u.nz;
+    device float4* flux = (device float4*)(St + u.flux) + (eStep ? 0 : N);
+    device const uint2* idx = (device const uint2*)(U + u.cidx);
+    const uint co = eStep ? 0 : 1;
+    const uint rcpY = rcpW(wy);
+    const bool okZ = u.okZ != 0u, okY = okW(count, wy);
+    for (uint i = tid; i < count; i += tgs)
+    {
+        const uint r = divW(i, u.nz, u.rcpZ, okZ);
+        const uint lz = i - r*u.nz;
+        const uint qx = divW(r, wy, rcpY, okY);
+        const uint y = uint(y0) + (r - qx*wy), x = uint(x0) + qx;
+        const uint c = ((x - u.x0)*u.ny + (y - u.y0))*u.nz + lz;
+        const uint2 q = idx[c];
+        const float4 t0 = tab[2*(q.x & 0xffffu) + co], t1 = tab[2*(q.x >> 16) + co], t2 = tab[2*q.y + co];
+        const uint f0 = F(0, x, y, u.z0 + lz, d), f1 = f0 + cs, f2 = f1 + cs;
+        const float3 f = float3(Fd[f0], Fd[f1], Fd[f2]);
+        const float3 fl = flux[c].xyz;
+        float3 nf, nfl;
+        if (stage == 0) { nfl = fma(float3(t0.x, t1.x, t2.x), f, -(float3(t0.y, t1.y, t2.y)*fl)); nf = fl; }
+        else            { nfl = f; nf = fma(float3(t0.z, t1.z, t2.z), f, fl); }
+        Fd[f0] = nf.x;
+        Fd[f1] = nf.y;
+        Fd[f2] = nf.z;
+        flux[c] = float4(nfl, 0.0f);
+    }
+}
+#else
+inline void upmlStage(uint stage, bool eStep, const Upml u, device float* Fd, device const uint* U,
+                      device const float* tab, device float* St, int2 sx, int2 sy, constant Dims& d, uint tid, uint tgs, uint cs)
 {
     const int x0 = max(sx.x, int(u.x0)), x1 = min(sx.y, int(u.x0 + u.nx));
     const int y0 = max(sy.x, int(u.y0)), y1 = min(sy.y, int(u.y0 + u.ny));
@@ -345,6 +386,7 @@ inline void upmlStage(uint stage, bool eStep, const Upml u, device float* Fd, de
         else            { const float h = flux[c]; flux[c] = Fd[fi]; Fd[fi] = fma(t[2], flux[c], h); }
     }
 }
+#endif
 
 // The same for a box that has every z line (the x and y slabs: Create_UPML gives them all of z), a z-vector at a time:
 // the lanes are the cells z = lane*nv + zv, each with its own coefficient set, so the table tab4 holds per distinct
@@ -516,7 +558,11 @@ kernel void diamond(device float4* volt [[buffer(0)]], device float4* curr [[buf
     device const float* csig = Fc + o.csig;
     device const float* mcoef = Fc + o.mcoef;
     device const float* rlcC = Fc + o.rlcC;
+#if DIAMOND_UPML3
+    device const float4* utab = (device const float4*)(Fc + o.ucoef);
+#else
     device const float* utab = Fc + o.ucoef;
+#endif
     device const float4* utab4 = (device const float4*)(Fc + o.ucoef4);
     device const uint4* arun = (device const uint4*)(U + o.arun);
     device const uint* aro = U + o.aro;
@@ -607,7 +653,7 @@ kernel void diamond(device float4* volt [[buffer(0)]], device float4* curr [[buf
                 if (upml & (1u << u))
                 {
                     if (up[u].tall) upmlStage4(0, eStep, up[u], eStep ? volt : curr, U, utab4, St, sx, sy, d, tid, tgs);
-                    else upmlStage(0, eStep, up[u], eStep ? E : H, U, utab, St, sx, sy, d, tid, tgs);
+                    else upmlStage(0, eStep, up[u], eStep ? E : H, U, utab, St, sx, sy, d, tid, tgs, cs);
                 }
             threadgroup_barrier(mem_flags::mem_device);
         }
@@ -631,7 +677,7 @@ kernel void diamond(device float4* volt [[buffer(0)]], device float4* curr [[buf
                 if (upml & (1u << u))
                 {
                     if (up[u].tall) upmlStage4(1, eStep, up[u], eStep ? volt : curr, U, utab4, St, sx, sy, d, tid, tgs);
-                    else upmlStage(1, eStep, up[u], eStep ? E : H, U, utab, St, sx, sy, d, tid, tgs);
+                    else upmlStage(1, eStep, up[u], eStep ? E : H, U, utab, St, sx, sy, d, tid, tgs, cs);
                 }
             threadgroup_barrier(mem_flags::mem_device);
         }
@@ -1175,6 +1221,34 @@ bool Engine_Metal_Diamond::SetupGPU()
 		}
 	}
 	const bool uidx16 = utab.size()/6 <= 65536, u4idx16 = utab4.size()/24 <= 65536;
+	// the other boxes (the z slabs): the three components of a cell at a time when the sets fit 16-bit indices
+	// (OPENEMS_DIAMOND_PML3=0: a float at a time): two index words per cell [x][y][z] and the sets as two float4
+	const bool pml3 = uidx16 && (EnvUInt("OPENEMS_DIAMOND_PML3", 1)!=0);
+	std::vector<float> utab8;
+	if (pml3)
+	{
+		for (size_t k=0; k<utab.size()/6; ++k)
+			for (int h=0; h<2; ++h)
+			{
+				for (int j=0; j<3; ++j)
+					utab8.push_back(utab[6*k+3*h+j]);
+				utab8.push_back(0);
+			}
+		for (UpmlData& b : upmlData)
+		{
+			if (b.tall)
+				continue;
+			const Operator_Ext_UPML* o = b.ext->m_Op_UPML;
+			const size_t N = (size_t)o->m_numLines[0]*o->m_numLines[1]*o->m_numLines[2];
+			std::vector<uint32_t> idx2(2*N);
+			for (size_t c=0; c<N; ++c)
+			{
+				idx2[2*c] = b.idx[c] | (b.idx[N+c] << 16);
+				idx2[2*c+1] = b.idx[2*N+c];
+			}
+			b.idx.swap(idx2);
+		}
+	}
 
 	@autoreleasepool
 	{
@@ -1211,6 +1285,7 @@ bool Engine_Metal_Diamond::SetupGPU()
 									   @"DIAMOND_RLC": @(rlcs.empty() ? 0 : 1),
 									   @"DIAMOND_UPML": @(upmls.empty() ? 0 : 1),
 									   @"DIAMOND_UIDX16": @(uidx16 ? 1 : 0), @"DIAMOND_U4IDX16": @(u4idx16 ? 1 : 0),
+									   @"DIAMOND_UPML3": @(pml3 ? 1 : 0),
 									   @"DIAMOND_ADE": @(lors.empty() ? 0 : 1),
 									   @"DIAMOND_DEBYE": @(hasDebye ? 1 : 0),
 									   @"DIAMOND_SPLIT": @(split ? 1 : 0),
@@ -1399,19 +1474,30 @@ bool Engine_Metal_Diamond::SetupGPU()
 			// and fewer than 2^16 columns, when 2^16 * 3 * NZ * (NZ - 1) < 2^32
 			const uint32_t rcpZ = (NZ>1) ? (uint32_t)(0xffffffffu/NZ + 1u) : 0;
 			const uint32_t okZ = ((NZ>1) && (3ull*NZ*(NZ-1) < (1ull<<16))) ? 1 : 0;
-			uint32_t flux;
+			uint32_t flux, cidx;
 			if (b.tall)
 			{
 				Sn = (Sn+3) & ~(size_t)3;
 				flux = addS(24*(size_t)NX*NY*numVectors);
+				cidx = addIdx(b.idx, u4idx16);
+			}
+			else if (pml3)
+			{
+				Sn = (Sn+3) & ~(size_t)3;
+				flux = addS(8*N);
+				Ub.resize((Ub.size()+1) & ~(size_t)1, 0);
+				cidx = addU(b.idx.data(), b.idx.size());
 			}
 			else
+			{
 				flux = addS(6*N);
-			boxes.push_back({o->m_StartPos[0], o->m_StartPos[1], o->m_StartPos[2], NX, NY, NZ,
-							 addIdx(b.idx, b.tall ? u4idx16 : uidx16), flux, rcpZ, okZ, b.tall ? 1u : 0u});
+				cidx = addIdx(b.idx, uidx16);
+			}
+			boxes.push_back({o->m_StartPos[0], o->m_StartPos[1], o->m_StartPos[2], NX, NY, NZ, cidx, flux, rcpZ, okZ, b.tall ? 1u : 0u});
 		}
 		ofs.upml = addU((const uint32_t*)boxes.data(), boxes.size()*sizeof(Upml)/4);
-		ofs.ucoef = addF(utab.data(), utab.size());
+		Fb.resize((Fb.size()+3) & ~(size_t)3, 0);
+		ofs.ucoef = pml3 ? addF(utab8.data(), utab8.size()) : addF(utab.data(), utab.size());
 		Fb.resize((Fb.size()+3) & ~(size_t)3, 0);
 		ofs.ucoef4 = addF(utab4.data(), utab4.size());
 
