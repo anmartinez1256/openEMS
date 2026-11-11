@@ -1712,7 +1712,10 @@ void openEMS::RunFDTD()
 	// After that only with the wall-clock progress report, which then is a small overshoot
 	// and saves the (full-domain) energy estimates -- unless --exact-endcriteria asks
 	// for a machine-independent stopping point.
-	bool exactEndCrit = (Eng_Ext_SSD==NULL);
+	// A run without an end criteria (endCriteria = 0, a fixed number of timesteps) has nothing to stop on: no schedule,
+	// as in v0.37.0, and the energy only with the progress report. Each estimate is one pass of one thread over both
+	// fields, during which the engine waits (with a Nyquist period of 51 timesteps, 4-6 % of the run on 3-17 M cells).
+	bool exactEndCrit = (Eng_Ext_SSD==NULL) && ((endCrit>0) || m_exactEndCriteria);
 	if (exactEndCrit)
 	{
 		unsigned int endCritInterval = FDTD_Op->GetExcitationSignal()->GetNyquistNum();
