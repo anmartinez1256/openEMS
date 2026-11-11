@@ -29,16 +29,24 @@ class Engine_Ext_Cylinder : public Engine_Extension
 public:
 	Engine_Ext_Cylinder(Operator_Ext_Cylinder* op_ext);
 
+	//! The two Post hooks write the fields (the alpha copy, r=0), each on the x-line (r-line) it reads, and keep no
+	//! state: line hooks for the fused sweep, at any timestep (TS_LOCAL)
+	virtual unsigned int GetUsedHooks() const;
+
 	virtual void DoPostVoltageUpdates();
 
 	virtual void DoPostCurrentUpdates();
 
+	virtual void DoPostVoltageUpdatesLines(unsigned int x0, unsigned int x1);
+	virtual void DoPostCurrentUpdatesLines(unsigned int x0, unsigned int x1);
+
 protected:
+	//! for the x-lines [x0, x1)
 	template <typename EngType>
-	void DoPostVoltageUpdatesImpl(EngType* eng);
+	void DoPostVoltageUpdatesImpl(EngType* eng, unsigned int x0, unsigned int x1);
 
 	template <typename EngType>
-	void DoPostCurrentUpdatesImpl(EngType* eng);
+	void DoPostCurrentUpdatesImpl(EngType* eng, unsigned int x0, unsigned int x1);
 
 	Operator_Ext_Cylinder* cyl_Op;
 

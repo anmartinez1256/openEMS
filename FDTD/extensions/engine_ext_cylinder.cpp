@@ -35,12 +35,22 @@ Engine_Ext_Cylinder::Engine_Ext_Cylinder(Operator_Ext_Cylinder* op_ext) : Engine
 	m_Priority = ENG_EXT_PRIO_CYLINDER;
 }
 
+unsigned int Engine_Ext_Cylinder::GetUsedHooks() const
+{
+	OPENEMS_HOOKS_DECLARED_BY(Engine_Ext_Cylinder);
+	// r=0 reads the alpha currents of x-line 0 before the engine updates them (the fused sweep updates the currents of a
+	// line after the voltage hooks of that line), everything else stays on one x-line
+	return POST_VOLT | POST_CURR | PREPOST_WRITES_FIELDS | LINE_HOOKS | TS_LOCAL;
+}
+
 template <typename EngType>
-void Engine_Ext_Cylinder::DoPostVoltageUpdatesImpl(EngType* eng)
+void Engine_Ext_Cylinder::DoPostVoltageUpdatesImpl(EngType* eng, unsigned int x0, unsigned int x1)
 {
 	if (CC_closedAlpha==false) return;
+	if (x1>numLines[0])
+		x1 = numLines[0];
 
-	if (CC_R0_included)
+	if (CC_R0_included && (x0==0) && (x1>0))
 	{
 		unsigned int pos[3];
 		pos[0] = 0;
@@ -67,7 +77,7 @@ void Engine_Ext_Cylinder::DoPostVoltageUpdatesImpl(EngType* eng)
 	unsigned int pos[3];
 	// copy tangential voltages from last alpha-plane to first
 	unsigned int last_A_Line = numLines[1]-2;
-	for (pos[0]=0; pos[0]<numLines[0]; ++pos[0])
+	for (pos[0]=x0; pos[0]<x1; ++pos[0])
 	{
 		for (pos[2]=0; pos[2]<numLines[2]; ++pos[2])
 		{
@@ -78,14 +88,16 @@ void Engine_Ext_Cylinder::DoPostVoltageUpdatesImpl(EngType* eng)
 }
 
 template <typename EngType>
-void Engine_Ext_Cylinder::DoPostCurrentUpdatesImpl(EngType* eng)
+void Engine_Ext_Cylinder::DoPostCurrentUpdatesImpl(EngType* eng, unsigned int x0, unsigned int x1)
 {
 	if (CC_closedAlpha==false) return;
+	if (x1>numLines[0]-1)
+		x1 = numLines[0]-1;
 
 	//close alpha
 	unsigned int pos[3];
 	// copy tangential currents from first alpha-plane to last
-	for (pos[0]=0; pos[0]<numLines[0]-1; ++pos[0])
+	for (pos[0]=x0; pos[0]<x1; ++pos[0])
 	{
 		unsigned int last_A_Line = numLines[1]-2;
 		for (pos[2]=0; pos[2]<numLines[2]-1; ++pos[2])
@@ -98,10 +110,20 @@ void Engine_Ext_Cylinder::DoPostCurrentUpdatesImpl(EngType* eng)
 
 void Engine_Ext_Cylinder::DoPostVoltageUpdates()
 {
-	ENG_DISPATCH(DoPostVoltageUpdatesImpl);
+	ENG_DISPATCH_ARGS(DoPostVoltageUpdatesImpl, 0u, numLines[0]);
 }
 
 void Engine_Ext_Cylinder::DoPostCurrentUpdates()
 {
-	ENG_DISPATCH(DoPostCurrentUpdatesImpl);
+	ENG_DISPATCH_ARGS(DoPostCurrentUpdatesImpl, 0u, numLines[0]);
+}
+
+void Engine_Ext_Cylinder::DoPostVoltageUpdatesLines(unsigned int x0, unsigned int x1)
+{
+	ENG_DISPATCH_ARGS(DoPostVoltageUpdatesImpl, x0, x1);
+}
+
+void Engine_Ext_Cylinder::DoPostCurrentUpdatesLines(unsigned int x0, unsigned int x1)
+{
+	ENG_DISPATCH_ARGS(DoPostCurrentUpdatesImpl, x0, x1);
 }
