@@ -550,18 +550,19 @@ kernel void diamond(device float4* volt [[buffer(0)]], device float4* curr [[buf
                     constant Phase& p [[buffer(8)]], constant Ext& e [[buffer(9)]],
                     device const uint* U [[buffer(10)]], device const float* Fc [[buffer(11)]],
                     device float* St [[buffer(12)]], constant Ofs& o [[buffer(13)]],
+                    device const uint* UT [[buffer(16)]],
                     uint3 tg [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]],
                     uint3 tptg [[threads_per_threadgroup]])
 {
     // Where the extension data sit is the same for every thread: the offsets that do not depend on the tiling, and the
     // counts, are compile-time constants (OFS_*, EXT_*: the kernel is built per model), so no thread carries these
-    // pointers across the barriers; the per-tile lists of a tiling come from o.
-    device const uint4* xrun = (device const uint4*)(U + o.xrun);
-    device const uint* xro = U + o.xro;
-    device const uint* roff = U + o.roff;
-    device const uint* rlist = U + o.rlist;
-    device const uint4* arun = (device const uint4*)(U + o.arun);
-    device const uint* aro = U + o.aro;
+    // pointers across the barriers; the per-tile lists of a tiling are in UT, at the offsets in o.
+    device const uint4* xrun = (device const uint4*)(UT + o.xrun);
+    device const uint* xro = UT + o.xro;
+    device const uint* roff = UT + o.roff;
+    device const uint* rlist = UT + o.rlist;
+    device const uint4* arun = (device const uint4*)(UT + o.arun);
+    device const uint* aro = UT + o.aro;
     constant Dims& d = dims;
     const uint tgs = tptg.x;
     // this threadgroup's tile: x and y mountains in xr0, yr0, valleys in xr1, yr1; a two-set dispatch has the grid of the
@@ -847,8 +848,9 @@ struct Engine_Metal_Diamond::State
 		unsigned int K = 4, M = 8, V = 8, tg = 0;
 		id<MTLBuffer> tiles[4] = {nil, nil, nil, nil};
 		unsigned int numTiles[4] = {0, 0, 0, 0}, lbase[4] = {0, 0, 0, 0};
-		id<MTLBuffer> U = nil;
+		id<MTLBuffer> U = nil;     // its per-tile lists (the kernel's UT)
 		Ofs ofs = {};
+		bool out = false;          // while tuning: clearly slower than the best after two timed command buffers, not timed further
 		double best = 0;           // while tuning: the least GPU time per step of its timed command buffers
 		unsigned int samples = 0;
 	};
@@ -858,7 +860,7 @@ struct Engine_Metal_Diamond::State
 	bool warm = false;             // the first command buffer of the run is encoded
 	unsigned int tune = 4;
 	unsigned long long rr = 0, tuneSteps = 0;
-	id<MTLBuffer> Fc = nil, St = nil;   // the extension data of all tilings: read-only floats, state
+	id<MTLBuffer> Fc = nil, St = nil, U = nil;   // the extension data of all tilings: read-only floats, state, read-only words
 	unsigned int numRLC = 0;
 	Ext ext = {};
 	unsigned int batch = 64;
@@ -1521,8 +1523,9 @@ bool Engine_Metal_Diamond::SetupGPU()
 			return false;
 		}
 		md.Fc = buffer(Fb.data(), Fb.size()*4);
+		md.U = buffer(Ub.data(), Ub.size()*4);
 		md.St = [md.dev newBufferWithLength:std::max<size_t>(16, Sn*4) options:MTLResourceStorageModeShared];
-		if ((md.Fc==nil) || (md.St==nil))
+		if ((md.Fc==nil) || (md.St==nil) || (md.U==nil))
 		{
 			cerr << "Engine_Metal_Diamond: cannot allocate the extension buffers, running the CPU loops" << endl;
 			return false;
@@ -1643,7 +1646,16 @@ bool Engine_Metal_Diamond::SetupGPU()
 				cand.push_back({K, M, Vw});
 			}
 			else
-				cand = {{4, 8, 8}, {4, 12, 8}, {3, 8, 6}, {3, 6, 6}};
+			{
+				// the first four from the sweeps of cg23 and cg27 (above); the last three from a sweep of thirteen tilings
+				// on cg30k (eight models, 2026-11-11): K=4 10,6 ran 6-8 % ahead of the four on a 3 M cell box and on patch
+				// x5, K=4 9,2 (luikore's shape) 10 % on a 257-line-tall 17 M cell box, K=5 12,8 5 % on notch x3
+				// (OPENEMS_DIAMOND_CAND=n: only the first n)
+				cand = {{4, 8, 8}, {4, 12, 8}, {3, 8, 6}, {3, 6, 6}, {4, 10, 6}, {4, 9, 2}, {5, 12, 8}};
+				const unsigned int nc = EnvUInt("OPENEMS_DIAMOND_CAND", 0);
+				if ((nc>0) && (nc<cand.size()))
+					cand.resize(nc);
+			}
 		}
 		for (const auto& kmv : cand)
 		{
@@ -1740,8 +1752,8 @@ bool Engine_Metal_Diamond::SetupGPU()
 			lists(ri, 5, ro, rl);
 			tileRuns(aruns, arun, aro);
 
-			// this tiling's words: the shared ones, then its lists
-			std::vector<uint32_t> W(Ub);
+			// this tiling's words: its lists (the shared words are in md.U)
+			std::vector<uint32_t> W;
 			auto addW = [&](const uint32_t* p, size_t n) -> uint32_t { const size_t o = W.size(); W.insert(W.end(), p, p+n); return (uint32_t)o; };
 			auto addW4 = [&](const std::vector<U4>& v) -> uint32_t { W.resize((W.size()+3) & ~(size_t)3, 0); return addW((const uint32_t*)v.data(), 4*v.size()); };
 			c.ofs = ofs;
@@ -1820,13 +1832,21 @@ bool Engine_Metal_Diamond::IterateTS(unsigned int iterTS)
 			State::Tiling& c = md.tilings[info[0]];
 			c.best = c.samples ? std::min(c.best, sec) : sec;
 			++c.samples;
-			bool ready = true;
+			// two stages, so that more candidates do not mean more steps of tuning: once every tiling has two timed command
+			// buffers, those more than 6 % behind the fastest are out (they keep their time for the report)
+			bool ready = true, two = true;
 			unsigned int best = 0;
 			for (unsigned int n=0; n<md.tilings.size(); ++n)
 			{
-				ready = ready && (md.tilings[n].samples>=md.tune);
-				if (md.tilings[n].best<md.tilings[best].best)
+				two = two && (md.tilings[n].samples>=std::min(2u, md.tune));
+				if (md.tilings[n].samples && (!md.tilings[best].samples || (md.tilings[n].best<md.tilings[best].best)))
 					best = n;
+			}
+			for (unsigned int n=0; n<md.tilings.size(); ++n)
+			{
+				if (two && !md.tilings[n].out && (md.tilings[n].best>1.06*md.tilings[best].best))
+					md.tilings[n].out = true;
+				ready = ready && (md.tilings[n].out || (md.tilings[n].samples>=md.tune));
 			}
 			if (!ready)
 				continue;
@@ -1860,7 +1880,14 @@ bool Engine_Metal_Diamond::IterateTS(unsigned int iterTS)
 			// the buffers and warms the GPU up) run the first tiling, so no tiling always gets the short ones
 			const unsigned int batch = md.tuning ? std::max(1u, md.batch/2) : md.batch;   // tuning: more samples in fewer steps
 			const bool timedCB = md.tuning && md.warm && ((done==0) || (iterTS-done>=batch));
-			const unsigned int ti = timedCB ? (unsigned int)(md.rr++ % md.tilings.size()) : md.cur;
+			unsigned int ti = md.cur;
+			if (timedCB)
+				for (size_t n=0; n<md.tilings.size(); ++n)   // the next tiling that is still in
+				{
+					ti = (unsigned int)(md.rr++ % md.tilings.size());
+					if (!md.tilings[ti].out)
+						break;
+				}
 			md.warm = true;
 			const State::Tiling& c = md.tilings[ti];
 			const unsigned int first = done;
@@ -1875,7 +1902,8 @@ bool Engine_Metal_Diamond::IterateTS(unsigned int iterTS)
 				for (int n=0; n<6; ++n)
 					[enc setBuffer:bufs[n] offset:0 atIndex:n];
 				[enc setBytes:&md.ext length:sizeof(Ext) atIndex:9];
-				[enc setBuffer:c.U offset:0 atIndex:10];
+				[enc setBuffer:md.U offset:0 atIndex:10];
+				[enc setBuffer:c.U offset:0 atIndex:16];
 				[enc setBuffer:md.Fc offset:0 atIndex:11];
 				[enc setBuffer:md.St offset:0 atIndex:12];
 				[enc setBytes:&c.ofs length:sizeof(Ofs) atIndex:13];
