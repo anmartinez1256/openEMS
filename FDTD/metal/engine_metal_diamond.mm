@@ -435,6 +435,8 @@ inline void upmlStage4(uint stage, bool eStep, const Upml u, device float4* Fd, 
 // orders one after the other, the list order within an order). Run: float index of component 0 (component n at + n*cs),
 // x << 16 | y, first and end element; element: coefficient offset, state offset (the H step's parts included), flags
 // (1 voltage ADE, 2 current ADE, 4 voltage Lorentz term, 8 current Lorentz term, 16 Debye, poles << 8).
+// The three components of a cell go together (a third of the loop passes of a component at a time, and fewer loads):
+// every group of three floats below is a float4 with a zero behind it, and the offsets count float4.
 // Lorentz coefficients v_int, v_ext, v_Lor, i_int, i_ext, i_Lor [3] each; state: volt ADE, volt Lorentz, curr ADE,
 // curr Lorentz [3]. Pre (DoPre*UpdatesLines, before the update; reads the field only): Lor += v_Lor*ADE one fmadd,
 // ADE *= v_int, then ADE += v_ext*(f - Lor) one fmadd (two statements: not contracted across them).
@@ -447,87 +449,86 @@ inline bool inSpan(uint xy, int2 sx, int2 sy)
     return x >= sx.x && x < sx.y && y >= sy.x && y < sy.y;
 }
 
-inline void adePre(bool eStep, device const float* Fd, device const uint4* ar, device const uint4* ae, device const float* ac,
-                   device float* as, uint r0, uint r1, int2 sx, int2 sy, uint cs, uint tid, uint tgs)
+inline void adePre(bool eStep, device const float* Fd, device const uint4* ar, device const uint4* ae, device const float4* ac,
+                   device float4* as, uint r0, uint r1, int2 sx, int2 sy, uint cs, uint tid, uint tgs)
 {
-    const uint cnt = 3*(r1 - r0);
-    for (uint i = tid; i < cnt; i += tgs)
+    for (uint i = r0 + tid; i < r1; i += tgs)
     {
-        const uint4 R = ar[r0 + i/3];
+        const uint4 R = ar[i];
         if (!inSpan(R.y, sx, sy)) continue;
-        const uint n = i % 3;
-        const float f = Fd[R.x + n*cs];
+        const float3 f = float3(Fd[R.x], Fd[R.x + cs], Fd[R.x + 2*cs]);
         for (uint l = R.z; l < R.w; ++l)
         {
             const uint4 q = ae[l];
-            device const float* c = ac + q.x;
-            device float* st = as + q.y;
+            device const float4* c = ac + q.x;
+            device float4* st = as + q.y;
             if (q.z & 16u)
             {
-                float pre = 0.0f;
+                float3 pre = float3(0.0f);
                 for (uint pl = 0; pl < (q.z >> 8); ++pl)
                 {
-                    const float w0 = st[6 + 3*pl + n];
-                    const float w = fma(c[6*pl + n], w0, c[6*pl + 3 + n] * f);
+                    const float3 w0 = st[2 + pl].xyz;
+                    const float3 w = fma(c[2*pl].xyz, w0, c[2*pl + 1].xyz * f);
                     pre = pre + (w - w0);
-                    st[6 + 3*pl + n] = w;
+                    st[2 + pl] = float4(w, 0.0f);
                 }
-                st[3+n] = pre;
+                st[1] = float4(pre, 0.0f);
             }
             else if (q.z & (eStep ? 4u : 8u))
             {
-                st[3+n] = fma(c[6+n], st[n], st[3+n]);
-                st[n] = st[n] * c[n];
-                st[n] = fma(c[3+n], f - st[3+n], st[n]);
+                const float3 lor = fma(c[2].xyz, st[0].xyz, st[1].xyz);
+                float3 ade = st[0].xyz * c[0].xyz;
+                ade = fma(c[1].xyz, f - lor, ade);
+                st[1] = float4(lor, 0.0f);
+                st[0] = float4(ade, 0.0f);
             }
             else
             {
-                st[n] = st[n] * c[n];
-                st[n] = fma(c[3+n], f, st[n]);
+                float3 ade = st[0].xyz * c[0].xyz;
+                ade = fma(c[1].xyz, f, ade);
+                st[0] = float4(ade, 0.0f);
             }
         }
     }
 }
 
-inline void adePost(device const float* Fd, device const uint4* ar, device const uint4* ae, device const float* ac,
-                    device float* as, uint r0, uint r1, int2 sx, int2 sy, uint cs, uint tid, uint tgs)
+inline void adePost(device const float* Fd, device const uint4* ar, device const uint4* ae, device const float4* ac,
+                    device float4* as, uint r0, uint r1, int2 sx, int2 sy, uint cs, uint tid, uint tgs)
 {
-    const uint cnt = 3*(r1 - r0);
-    for (uint i = tid; i < cnt; i += tgs)
+    for (uint i = r0 + tid; i < r1; i += tgs)
     {
-        const uint4 R = ar[r0 + i/3];
+        const uint4 R = ar[i];
         if (!inSpan(R.y, sx, sy)) continue;
-        const uint n = i % 3;
-        const float vr = Fd[R.x + n*cs];
+        const float3 vr = float3(Fd[R.x], Fd[R.x + cs], Fd[R.x + 2*cs]);
         for (uint l = R.z; l < R.w; ++l)
         {
             const uint4 q = ae[l];
             if ((q.z & 16u) == 0) continue;
-            device const float* c = ac + q.x;
-            device float* st = as + q.y;
+            device const float4* c = ac + q.x;
+            device float4* st = as + q.y;
             const uint P = q.z >> 8;
-            const float v = (vr - st[3+n]) * c[6*P + n];
-            st[n] = vr - v;
+            const float3 v = (vr - st[1].xyz) * c[2*P].xyz;
+            st[0] = float4(vr - v, 0.0f);
             for (uint pl = 0; pl < P; ++pl)
-                st[6 + 3*pl + n] = fma(c[6*pl + 3 + n], v, st[6 + 3*pl + n]);
+                st[2 + pl] = float4(fma(c[2*pl + 1].xyz, v, st[2 + pl].xyz), 0.0f);
         }
     }
 }
 
 // Engine_Ext_Dispersive::Apply2*Lines for the runs of one extension: field -= ADE, a run's elements in their order
-inline void adeApply(device float* Fd, device const uint4* ar, device const uint4* ae, device const float* as, uint r0, uint r1,
+inline void adeApply(device float* Fd, device const uint4* ar, device const uint4* ae, device const float4* as, uint r0, uint r1,
                      int2 sx, int2 sy, uint cs, uint tid, uint tgs)
 {
-    const uint cnt = 3*(r1 - r0);
-    for (uint i = tid; i < cnt; i += tgs)
+    for (uint i = r0 + tid; i < r1; i += tgs)
     {
-        const uint4 R = ar[r0 + i/3];
+        const uint4 R = ar[i];
         if (!inSpan(R.y, sx, sy)) continue;
-        const uint n = i % 3, fi = R.x + n*cs;
-        float v = Fd[fi];
+        float3 v = float3(Fd[R.x], Fd[R.x + cs], Fd[R.x + 2*cs]);
         for (uint l = R.z; l < R.w; ++l)
-            v = v - as[ae[l].y + n];
-        Fd[fi] = v;
+            v = v - as[ae[l].y].xyz;
+        Fd[R.x] = v.x;
+        Fd[R.x + cs] = v.y;
+        Fd[R.x + 2*cs] = v.z;
     }
 }
 
@@ -567,10 +568,10 @@ kernel void diamond(device float4* volt [[buffer(0)]], device float4* curr [[buf
     device const uint4* arun = (device const uint4*)(U + o.arun);
     device const uint* aro = U + o.aro;
     device const uint4* aele = (device const uint4*)(U + o.aele);
-    device const float* adeC = Fc + o.adeC;
+    device const float4* adeC = (device const float4*)(Fc + o.adeC);
     device float* mscr = St + o.mscr;
     device float* rlcS = St + o.rlcS;
-    device float* adeS = St + o.adeS;
+    device float4* adeS = (device float4*)(St + o.adeS);
     constant Dims& d = dims;
     const uint tgs = tptg.x;
     // this threadgroup's tile: x and y mountains in xr0, yr0, valleys in xr1, yr1; a two-set dispatch has the grid of the
@@ -1502,8 +1503,9 @@ bool Engine_Metal_Diamond::SetupGPU()
 		ofs.ucoef4 = addF(utab4.data(), utab4.size());
 
 		// dispersive materials: flags per (extension, order): 1 voltage ADE, 2 current ADE, 4 voltage Lorentz term, 8 current
-		// Lorentz term, 16 Debye (poles << 8); Lorentz: 18 coefficients and 12 state floats per element, Debye with P poles:
-		// 6P+3 coefficients, 6+3P state floats; the state is zero (as the CPU's). The kernel goes over runs: the elements of
+		// Lorentz term, 16 Debye (poles << 8); Lorentz: 6 coefficient groups and 4 state groups per element, Debye with P
+		// poles: 2P+1 coefficient groups, 2+P state groups (a group: the three components as a float4, its last float zero;
+		// offsets count groups); the state is zero (as the CPU's). The kernel goes over runs: the elements of
 		// one extension at one cell for one step type (E: voltage ADE, H: current ADE) in the CPU's order (the orders one after
 		// the other, the list order within an order), so one thread subtracts them all from its field value in that order
 		// (Engine_Ext_Dispersive::Apply2*Lines) and the orders share one pass. Run: the float index of component 0, x << 16 | y,
@@ -1523,17 +1525,20 @@ bool Engine_Metal_Diamond::SetupGPU()
 				const uint32_t P = o->m_PoleCount;
 				for (unsigned int i=0; i<o->m_LM_Count.at(0); ++i)
 				{
-					at[0][{o->m_LM_pos[0][0][i], o->m_LM_pos[0][1][i], o->m_LM_pos[0][2][i]}].push_back({(uint32_t)acf.size(), (uint32_t)adeState, 1 | 16 | (P<<8), 0});
+					at[0][{o->m_LM_pos[0][0][i], o->m_LM_pos[0][1][i], o->m_LM_pos[0][2][i]}].push_back({(uint32_t)(acf.size()/4), (uint32_t)adeState, 1 | 16 | (P<<8), 0});
 					for (uint32_t pl=0; pl<P; ++pl)
 					{
 						for (int n=0; n<3; ++n)
 							acf.push_back(o->v_relax_ADE[pl][n][i]);
+						acf.push_back(0);
 						for (int n=0; n<3; ++n)
 							acf.push_back(o->v_drive_ADE[pl][n][i]);
+						acf.push_back(0);
 					}
 					for (int n=0; n<3; ++n)
 						acf.push_back(o->v_solve_ADE[n][i]);
-					adeState += 6 + 3*P;
+					acf.push_back(0);
+					adeState += 2 + P;
 					++numADE;
 				}
 			}
@@ -1550,29 +1555,29 @@ bool Engine_Metal_Diamond::SetupGPU()
 					{
 						const std::array<uint32_t,3> cell = {o->m_LM_pos[ord][0][i], o->m_LM_pos[ord][1][i], o->m_LM_pos[ord][2][i]};
 						if (vOn)
-							at[0][cell].push_back({(uint32_t)acf.size(), (uint32_t)adeState, g, 0});
+							at[0][cell].push_back({(uint32_t)(acf.size()/4), (uint32_t)adeState, g, 0});
 						if (cOn)
-							at[1][cell].push_back({(uint32_t)acf.size()+9, (uint32_t)adeState+6, g, 0});
-						float c[18] = {};
+							at[1][cell].push_back({(uint32_t)(acf.size()/4)+3, (uint32_t)adeState+2, g, 0});
+						float c[24] = {};
 						for (int n=0; n<3; ++n)
 						{
 							if (vOn)
 							{
 								c[n] = o->v_int_ADE[ord][n][i];
-								c[3+n] = o->v_ext_ADE[ord][n][i];
+								c[4+n] = o->v_ext_ADE[ord][n][i];
 								if (o->m_volt_Lor_ADE_On[ord])
-									c[6+n] = o->v_Lor_ADE[ord][n][i];
+									c[8+n] = o->v_Lor_ADE[ord][n][i];
 							}
 							if (cOn)
 							{
-								c[9+n] = o->i_int_ADE[ord][n][i];
-								c[12+n] = o->i_ext_ADE[ord][n][i];
+								c[12+n] = o->i_int_ADE[ord][n][i];
+								c[16+n] = o->i_ext_ADE[ord][n][i];
 								if (o->m_curr_Lor_ADE_On[ord])
-									c[15+n] = o->i_Lor_ADE[ord][n][i];
+									c[20+n] = o->i_Lor_ADE[ord][n][i];
 							}
 						}
-						acf.insert(acf.end(), c, c+18);
-						adeState += 12;
+						acf.insert(acf.end(), c, c+24);
+						adeState += 4;
 						++numADE;
 					}
 				}
@@ -1588,8 +1593,10 @@ bool Engine_Metal_Diamond::SetupGPU()
 		}
 		md.ext.numAde = lors.size();
 		ofs.aele = addU4(aele);
+		Fb.resize((Fb.size()+3) & ~(size_t)3, 0);   // float4 groups, counted in float4
 		ofs.adeC = addF(acf.data(), acf.size());
-		ofs.adeS = addS(adeState);
+		Sn = (Sn+3) & ~(size_t)3;
+		ofs.adeS = addS(4*adeState);
 
 		if ((Fb.size()>=(1ull<<32)) || (Sn>=(1ull<<32)))
 		{
