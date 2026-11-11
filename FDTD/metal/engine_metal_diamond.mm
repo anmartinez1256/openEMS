@@ -201,12 +201,14 @@ inline int2 span(int2 r, uint type, uint s, int n)
 
 // Engine_Ext_Excitation: index into the signal for timestep ts (0 <= pos <= ts: without a period, the CPU's pos % (ts+1)
 // is pos)
-inline int excPos(uint ts, uint delay, constant Ext& e)
+inline int excPos(uint ts, uint delay)
 {
     int pos = int(ts) - int(delay);
     pos *= (pos > 0);
-    if (e.period0) pos %= int(e.period0);
-    pos *= (pos < int(e.length));
+#if EXT_PERIOD0
+    pos %= int(EXT_PERIOD0);
+#endif
+    pos *= (pos < int(EXT_LENGTH));
     return pos;
 }
 
@@ -535,6 +537,11 @@ inline void adeApply(device float* Fd, device const uint4* ar, device const uint
 // One threadgroup advances one tile over p.depth timesteps in place, z complete, with a threadgroup barrier between
 // the stages; the extensions run per tile in the CPU engine's order (Pre in reverse extension order, update, Post,
 // Apply in extension order). Metal has 31 buffer slots, so the extension data come in three blobs (U, Fc, St).
+#if DIAMOND_UPML3
+#define UTAB ((device const float4*)(Fc + OFS_UCOEF))
+#else
+#define UTAB (Fc + OFS_UCOEF)
+#endif
 kernel void diamond(device float4* volt [[buffer(0)]], device float4* curr [[buffer(1)]],
                     device const float4* pv [[buffer(2)]], device const float4* pi [[buffer(3)]],
                     device const uint* opi [[buffer(4)]], device const float4* pc [[buffer(5)]],
@@ -546,32 +553,15 @@ kernel void diamond(device float4* volt [[buffer(0)]], device float4* curr [[buf
                     uint3 tg [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]],
                     uint3 tptg [[threads_per_threadgroup]])
 {
+    // Where the extension data sit is the same for every thread: the offsets that do not depend on the tiling, and the
+    // counts, are compile-time constants (OFS_*, EXT_*: the kernel is built per model), so no thread carries these
+    // pointers across the barriers; the per-tile lists of a tiling come from o.
     device const uint4* xrun = (device const uint4*)(U + o.xrun);
     device const uint* xro = U + o.xro;
-    device const uint2* xele = (device const uint2*)(U + o.xele);
-    device const MurFace* mf = (device const MurFace*)(U + o.mf);
-    device const uint* apply = U + o.apply;
-    device const uint* rlcI = U + o.rlcI;
     device const uint* roff = U + o.roff;
     device const uint* rlist = U + o.rlist;
-    device const Upml* up = (device const Upml*)(U + o.upml);
-    device const float* vsig = Fc + o.vsig;
-    device const float* csig = Fc + o.csig;
-    device const float* mcoef = Fc + o.mcoef;
-    device const float* rlcC = Fc + o.rlcC;
-#if DIAMOND_UPML3
-    device const float4* utab = (device const float4*)(Fc + o.ucoef);
-#else
-    device const float* utab = Fc + o.ucoef;
-#endif
-    device const float4* utab4 = (device const float4*)(Fc + o.ucoef4);
     device const uint4* arun = (device const uint4*)(U + o.arun);
     device const uint* aro = U + o.aro;
-    device const uint4* aele = (device const uint4*)(U + o.aele);
-    device const float4* adeC = (device const float4*)(Fc + o.adeC);
-    device float* mscr = St + o.mscr;
-    device float* rlcS = St + o.rlcS;
-    device float4* adeS = (device float4*)(St + o.adeS);
     constant Dims& d = dims;
     const uint tgs = tptg.x;
     // this threadgroup's tile: x and y mountains in xr0, yr0, valleys in xr1, yr1; a two-set dispatch has the grid of the
@@ -592,7 +582,7 @@ kernel void diamond(device float4* volt [[buffer(0)]], device float4* curr [[buf
     const bool rlcTile = roff[li+1] > roff[li];
 #endif
 #if DIAMOND_ADE
-    const uint3 ar = uint3(aro[2*li*e.numAde], aro[(2*li+1)*e.numAde], aro[(2*li+2)*e.numAde]);   // [x, y) E, [y, z) H
+    const uint3 ar = uint3(aro[2*li*EXT_NUMADE], aro[(2*li+1)*EXT_NUMADE], aro[(2*li+2)*EXT_NUMADE]);   // [x, y) E, [y, z) H
 #endif
 #if DIAMOND_EXC
     const uint3 xq = uint3(xro[2*li], xro[2*li+1], xro[2*li+2]);   // [x, y) voltages, [y, z) currents
@@ -612,7 +602,7 @@ kernel void diamond(device float4* volt [[buffer(0)]], device float4* curr [[buf
         bool ade = false;   // dispersive runs in this tile for this step type: [a0, a1); ab: their ranges per extension
         uint ab = 0, a0 = 0, a1 = 0;
 #if DIAMOND_ADE
-        ab = (li*2 + (eStep ? 0u : 1u)) * e.numAde;
+        ab = (li*2 + (eStep ? 0u : 1u)) * EXT_NUMADE;
         a0 = eStep ? ar.x : ar.y;
         a1 = eStep ? ar.y : ar.z;
         ade = a1 > a0;
@@ -621,40 +611,40 @@ kernel void diamond(device float4* volt [[buffer(0)]], device float4* curr [[buf
         uint murAxes = 0;   // their axes (bit ny)
 #if DIAMOND_MUR
         if (eStep)
-            for (uint f = 0; f < e.numMur; ++f)
+            for (uint f = 0; f < EXT_NUMMUR; ++f)
             {
-                const int L = int(mf[f].line);
-                if (ts < mf[f].startTS) continue;
-                if (mf[f].ny == 0 && (L < sx.x || L >= sx.y)) continue;
-                if (mf[f].ny == 1 && (L < sy.x || L >= sy.y)) continue;
+                const int L = int(((device const MurFace*)(U + OFS_MF))[f].line);
+                if (ts < ((device const MurFace*)(U + OFS_MF))[f].startTS) continue;
+                if (((device const MurFace*)(U + OFS_MF))[f].ny == 0 && (L < sx.x || L >= sx.y)) continue;
+                if (((device const MurFace*)(U + OFS_MF))[f].ny == 1 && (L < sy.x || L >= sy.y)) continue;
                 mur |= 1u << f;
-                murAxes |= 1u << mf[f].ny;
+                murAxes |= 1u << ((device const MurFace*)(U + OFS_MF))[f].ny;
             }
 #endif
         if (mur || ade)
         {
             // the Pre stages that only read the field (Mur, Drude/Lorentz) run before the UPML's, which writes it
 #if DIAMOND_MUR
-            for (uint f = 0; f < e.numMur; ++f)
-                if (mur & (1u << f)) murStage(0, mf + f, E, mcoef, mscr, sx, sy, d, tid, tgs);
+            for (uint f = 0; f < EXT_NUMMUR; ++f)
+                if (mur & (1u << f)) murStage(0, ((device const MurFace*)(U + OFS_MF)) + f, E, (Fc + OFS_MCOEF), (St + OFS_MSCR), sx, sy, d, tid, tgs);
 #endif
 #if DIAMOND_ADE
-            if (ade) adePre(eStep, eStep ? E : H, arun, aele, adeC, adeS, a0, a1, sx, sy, cs, tid, tgs);
+            if (ade) adePre(eStep, eStep ? E : H, arun, ((device const uint4*)(U + OFS_AELE)), ((device const float4*)(Fc + OFS_ADEC)), ((device float4*)(St + OFS_ADES)), a0, a1, sx, sy, cs, tid, tgs);
 #endif
             threadgroup_barrier(mem_flags::mem_device);
         }
         uint upml = 0;   // the UPML boxes with cells in this tile (the boxes do not overlap: one barrier per stage)
 #if DIAMOND_UPML
-        for (uint u = 0; u < e.numUpml; ++u)
-            if (int(up[u].x0) < sx.y && int(up[u].x0 + up[u].nx) > sx.x && int(up[u].y0) < sy.y && int(up[u].y0 + up[u].ny) > sy.x)
+        for (uint u = 0; u < EXT_NUMUPML; ++u)
+            if (int(((device const Upml*)(U + OFS_UPML))[u].x0) < sx.y && int(((device const Upml*)(U + OFS_UPML))[u].x0 + ((device const Upml*)(U + OFS_UPML))[u].nx) > sx.x && int(((device const Upml*)(U + OFS_UPML))[u].y0) < sy.y && int(((device const Upml*)(U + OFS_UPML))[u].y0 + ((device const Upml*)(U + OFS_UPML))[u].ny) > sy.x)
                 upml |= 1u << u;
         if (upml)
         {
-            for (uint u = e.numUpml; u-- > 0; )
+            for (uint u = EXT_NUMUPML; u-- > 0; )
                 if (upml & (1u << u))
                 {
-                    if (up[u].tall) upmlStage4(0, eStep, up[u], eStep ? volt : curr, U, utab4, St, sx, sy, d, tid, tgs);
-                    else upmlStage(0, eStep, up[u], eStep ? E : H, U, utab, St, sx, sy, d, tid, tgs, cs);
+                    if (((device const Upml*)(U + OFS_UPML))[u].tall) upmlStage4(0, eStep, ((device const Upml*)(U + OFS_UPML))[u], eStep ? volt : curr, U, ((device const float4*)(Fc + OFS_UCOEF4)), St, sx, sy, d, tid, tgs);
+                    else upmlStage(0, eStep, ((device const Upml*)(U + OFS_UPML))[u], eStep ? E : H, U, UTAB, St, sx, sy, d, tid, tgs, cs);
                 }
             threadgroup_barrier(mem_flags::mem_device);
         }
@@ -674,11 +664,11 @@ kernel void diamond(device float4* volt [[buffer(0)]], device float4* curr [[buf
 #if DIAMOND_UPML
         if (upml)
         {
-            for (uint u = 0; u < e.numUpml; ++u)
+            for (uint u = 0; u < EXT_NUMUPML; ++u)
                 if (upml & (1u << u))
                 {
-                    if (up[u].tall) upmlStage4(1, eStep, up[u], eStep ? volt : curr, U, utab4, St, sx, sy, d, tid, tgs);
-                    else upmlStage(1, eStep, up[u], eStep ? E : H, U, utab, St, sx, sy, d, tid, tgs, cs);
+                    if (((device const Upml*)(U + OFS_UPML))[u].tall) upmlStage4(1, eStep, ((device const Upml*)(U + OFS_UPML))[u], eStep ? volt : curr, U, ((device const float4*)(Fc + OFS_UCOEF4)), St, sx, sy, d, tid, tgs);
+                    else upmlStage(1, eStep, ((device const Upml*)(U + OFS_UPML))[u], eStep ? E : H, U, UTAB, St, sx, sy, d, tid, tgs, cs);
                 }
             threadgroup_barrier(mem_flags::mem_device);
         }
@@ -700,11 +690,11 @@ kernel void diamond(device float4* volt [[buffer(0)]], device float4* curr [[buf
         if (mur || deb)
         {
 #if DIAMOND_MUR
-            for (uint f = 0; f < e.numMur; ++f)
-                if (mur & (1u << f)) murStage(murOne ? 3 : 1, mf + f, E, mcoef, mscr, sx, sy, d, tid, tgs);
+            for (uint f = 0; f < EXT_NUMMUR; ++f)
+                if (mur & (1u << f)) murStage(murOne ? 3 : 1, ((device const MurFace*)(U + OFS_MF)) + f, E, (Fc + OFS_MCOEF), (St + OFS_MSCR), sx, sy, d, tid, tgs);
 #endif
 #if DIAMOND_DEBYE
-            if (deb) adePost(E, arun, aele, adeC, adeS, a0, a1, sx, sy, cs, tid, tgs);
+            if (deb) adePost(E, arun, ((device const uint4*)(U + OFS_AELE)), ((device const float4*)(Fc + OFS_ADEC)), ((device float4*)(St + OFS_ADES)), a0, a1, sx, sy, cs, tid, tgs);
 #endif
             threadgroup_barrier(mem_flags::mem_device);
         }
@@ -714,33 +704,33 @@ kernel void diamond(device float4* volt [[buffer(0)]], device float4* curr [[buf
             // one after the other: Mur faces of different axes share their edge cells, an element may sit on a face; in
             // the H step only the Drude/Lorentz currents
             uint pend = 3;   // the axis of the Mur faces applied since the last barrier (3: none)
-            for (uint a = 0; a < e.numApply; ++a)
+            for (uint a = 0; a < EXT_NUMAPPLY; ++a)
             {
-                const uint idx = apply[a] & 0xffffu;
-                if ((apply[a] >> 16) == 0)
+                const uint idx = (U + OFS_APPLY)[a] & 0xffffu;
+                if (((U + OFS_APPLY)[a] >> 16) == 0)
                 {
 #if DIAMOND_MUR
                     if (mur & (1u << idx))
                     {
 #if DIAMOND_MURMERGE
-                        if (pend != 3 && pend != mf[idx].ny)
+                        if (pend != 3 && pend != ((device const MurFace*)(U + OFS_MF))[idx].ny)
                             threadgroup_barrier(mem_flags::mem_device);
-                        murStage(2, mf + idx, E, mcoef, mscr, sx, sy, d, tid, tgs);
-                        pend = mf[idx].ny;
+                        murStage(2, ((device const MurFace*)(U + OFS_MF)) + idx, E, (Fc + OFS_MCOEF), (St + OFS_MSCR), sx, sy, d, tid, tgs);
+                        pend = ((device const MurFace*)(U + OFS_MF))[idx].ny;
 #else
-                        murStage(2, mf + idx, E, mcoef, mscr, sx, sy, d, tid, tgs);
+                        murStage(2, ((device const MurFace*)(U + OFS_MF)) + idx, E, (Fc + OFS_MCOEF), (St + OFS_MSCR), sx, sy, d, tid, tgs);
                         threadgroup_barrier(mem_flags::mem_device);
 #endif
                     }
 #endif
                 }
-                else if ((apply[a] >> 16) == 2)
+                else if (((U + OFS_APPLY)[a] >> 16) == 2)
                 {
 #if DIAMOND_ADE
                     if (ade && aro[ab + idx + 1] > aro[ab + idx])
                     {
                         if (pend != 3) { threadgroup_barrier(mem_flags::mem_device); pend = 3; }
-                        adeApply(eStep ? E : H, arun, aele, adeS, aro[ab + idx], aro[ab + idx + 1], sx, sy, cs, tid, tgs);
+                        adeApply(eStep ? E : H, arun, ((device const uint4*)(U + OFS_AELE)), ((device float4*)(St + OFS_ADES)), aro[ab + idx], aro[ab + idx + 1], sx, sy, cs, tid, tgs);
                         threadgroup_barrier(mem_flags::mem_device);
                     }
 #endif
@@ -749,9 +739,9 @@ kernel void diamond(device float4* volt [[buffer(0)]], device float4* curr [[buf
                 {
 #if DIAMOND_RLC
                     if (pend != 3) { threadgroup_barrier(mem_flags::mem_device); pend = 3; }
-                    rlcStage(0, idx, E, rlcI, rlcC, rlcS, roff, rlist, li, sx, sy, d, tid, tgs, e.rlcSerial != 0);
+                    rlcStage(0, idx, E, (U + OFS_RLCI), (Fc + OFS_RLCC), (St + OFS_RLCS), roff, rlist, li, sx, sy, d, tid, tgs, EXT_RLCSERIAL != 0);
                     threadgroup_barrier(mem_flags::mem_device);
-                    rlcStage(1, idx, E, rlcI, rlcC, rlcS, roff, rlist, li, sx, sy, d, tid, tgs, e.rlcSerial != 0);
+                    rlcStage(1, idx, E, (U + OFS_RLCI), (Fc + OFS_RLCC), (St + OFS_RLCS), roff, rlist, li, sx, sy, d, tid, tgs, EXT_RLCSERIAL != 0);
                     threadgroup_barrier(mem_flags::mem_device);
 #endif
                 }
@@ -766,7 +756,7 @@ kernel void diamond(device float4* volt [[buffer(0)]], device float4* curr [[buf
         const uint x0 = eStep ? xq.x : xq.y, x1 = eStep ? xq.y : xq.z;
         if (x1 > x0)
         {
-            device const float* sig = eStep ? vsig : csig;
+            device const float* sig = eStep ? (Fc + OFS_VSIG) : (Fc + OFS_CSIG);
             device float* f = eStep ? E : H;
             for (uint r = x0 + tid; r < x1; r += tgs)
             {
@@ -774,7 +764,7 @@ kernel void diamond(device float4* volt [[buffer(0)]], device float4* curr [[buf
                 if (!inSpan(R.y, sx, sy)) continue;
                 float v = f[R.x];
                 for (uint l = R.z; l < R.w; ++l)
-                    v = fma(as_type<float>(xele[l].x), sig[excPos(ts, xele[l].y, e)], v);
+                    v = fma(as_type<float>(((device const uint2*)(U + OFS_XELE))[l].x), sig[excPos(ts, ((device const uint2*)(U + OFS_XELE))[l].y)], v);
                 f[R.x] = v;
             }
             threadgroup_barrier(mem_flags::mem_device);
@@ -1253,79 +1243,6 @@ bool Engine_Metal_Diamond::SetupGPU()
 
 	@autoreleasepool
 	{
-		NSError* error = nil;
-		MTLCompileOptions* options = [MTLCompileOptions new];
-		// IEEE float semantics: the fields must agree with the CPU engines
-#if __MAC_OS_X_VERSION_MAX_ALLOWED >= 150000
-		if (@available(macOS 15.0, *))
-			options.mathMode = MTLMathModeSafe;
-		else
-#endif
-		{
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Wdeprecated-declarations"
-			options.fastMathEnabled = NO;
-#pragma clang diagnostic pop
-		}
-		// Mur faces of one axis share barriers (see the kernel) when their lines keep them apart: a face line is never the
-		// opposite face's shift line with three lines or more. OPENEMS_DIAMOND_MURMERGE=0: one barrier per face and stage,
-		// as before.
-		bool murMerge = EnvUInt("OPENEMS_DIAMOND_MURMERGE", 1)!=0;
-		for (const Engine_Ext_Mur_ABC* m : murs)
-			murMerge = murMerge && (numLines[m->m_ny]>=3);
-		// the Mur faces come before every lumped RLC and dispersive extension in the Apply order
-		bool murFirst = true;
-		for (size_t a=1; a<applyOrder.size(); ++a)
-			murFirst = murFirst && !(((applyOrder[a]>>16)==0) && ((applyOrder[a-1]>>16)!=0));
-		// the kernel without the parts this model does not use (fewer registers, more tiles in flight)
-		options.preprocessorMacros = @{@"DIAMOND_MUR": @(murs.empty() ? 0 : 1),
-									   @"DIAMOND_MURMERGE": @(murMerge ? 1 : 0),
-									   @"DIAMOND_MURFIRST": @(murFirst ? 1 : 0),
-									   @"DIAMOND_FASTIDX": @(EnvUInt("OPENEMS_DIAMOND_FASTIDX", 1) ? 1 : 0),
-									   @"DIAMOND_EXC": @((excSeen && Op->GetExcitationExtension()) ? 1 : 0),
-									   @"DIAMOND_RLC": @(rlcs.empty() ? 0 : 1),
-									   @"DIAMOND_UPML": @(upmls.empty() ? 0 : 1),
-									   @"DIAMOND_UIDX16": @(uidx16 ? 1 : 0), @"DIAMOND_U4IDX16": @(u4idx16 ? 1 : 0),
-									   @"DIAMOND_UPML3": @(pml3 ? 1 : 0),
-									   @"DIAMOND_ADE": @(lors.empty() ? 0 : 1),
-									   @"DIAMOND_DEBYE": @(hasDebye ? 1 : 0),
-									   @"DIAMOND_SPLIT": @(split ? 1 : 0),
-									   @"DIAMOND_NX": @(numLines[0]), @"DIAMOND_NY": @(numLines[1]),
-									   @"DIAMOND_NZ": @(numLines[2]), @"DIAMOND_NV": @(numVectors)};
-		id<MTLLibrary> lib = [md.dev newLibraryWithSource:[NSString stringWithUTF8String:DIAMOND_SOURCE] options:options error:&error];
-		if (lib==nil)
-		{
-			cerr << "Engine_Metal_Diamond: kernel compilation failed: " << [[error localizedDescription] UTF8String] << endl;
-			return false;
-		}
-		id<MTLFunction> fn = [lib newFunctionWithName:@"diamond"];
-		// The threads per tile are 256, 512 or 1024 unless OPENEMS_DIAMOND_TG says otherwise: whole SIMD groups, which the
-		// pipeline may be told (OPENEMS_DIAMOND_TGFLAG=0: not told). Checked against the pipeline's width below.
-		const unsigned int envTG = EnvUInt("OPENEMS_DIAMOND_TG", 0);
-		auto pipeline = [&](bool whole) -> id<MTLComputePipelineState>
-		{
-			MTLComputePipelineDescriptor* desc = [MTLComputePipelineDescriptor new];
-			desc.computeFunction = fn;
-			desc.threadGroupSizeIsMultipleOfThreadExecutionWidth = whole ? YES : NO;
-			return [md.dev newComputePipelineStateWithDescriptor:desc options:MTLPipelineOptionNone reflection:nil error:&error];
-		};
-		bool whole = (EnvUInt("OPENEMS_DIAMOND_TGFLAG", 1)!=0) && (envTG%32==0);
-		md.pso = pipeline(whole);
-		if ((md.pso!=nil) && whole)
-		{
-			const NSUInteger w = md.pso.threadExecutionWidth, mx = md.pso.maxTotalThreadsPerThreadgroup;
-			bool ok = (w>0);
-			for (NSUInteger tg : {(NSUInteger)256, (NSUInteger)512, (NSUInteger)1024, (NSUInteger)envTG})
-				ok = ok && (tg==0 || (std::min(tg, mx) % w)==0);
-			if (!ok)
-				md.pso = pipeline(false);
-		}
-		if (md.pso==nil)
-		{
-			cerr << "Engine_Metal_Diamond: pipeline creation failed: " << [[error localizedDescription] UTF8String] << endl;
-			return false;
-		}
-		md.queue = [md.dev newCommandQueue];
 
 		auto buffer = [&](const void* data, size_t bytes) -> id<MTLBuffer>
 		{
@@ -1611,6 +1528,89 @@ bool Engine_Metal_Diamond::SetupGPU()
 			return false;
 		}
 		memset([md.St contents], 0, std::max<size_t>(16, Sn*4));
+
+		// the kernel, built for this model: after the extension data, whose offsets and counts it has as constants
+		NSError* error = nil;
+		MTLCompileOptions* options = [MTLCompileOptions new];
+		// IEEE float semantics: the fields must agree with the CPU engines
+#if __MAC_OS_X_VERSION_MAX_ALLOWED >= 150000
+		if (@available(macOS 15.0, *))
+			options.mathMode = MTLMathModeSafe;
+		else
+#endif
+		{
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+			options.fastMathEnabled = NO;
+#pragma clang diagnostic pop
+		}
+		// Mur faces of one axis share barriers (see the kernel) when their lines keep them apart: a face line is never the
+		// opposite face's shift line with three lines or more. OPENEMS_DIAMOND_MURMERGE=0: one barrier per face and stage,
+		// as before.
+		bool murMerge = EnvUInt("OPENEMS_DIAMOND_MURMERGE", 1)!=0;
+		for (const Engine_Ext_Mur_ABC* m : murs)
+			murMerge = murMerge && (numLines[m->m_ny]>=3);
+		// the Mur faces come before every lumped RLC and dispersive extension in the Apply order
+		bool murFirst = true;
+		for (size_t a=1; a<applyOrder.size(); ++a)
+			murFirst = murFirst && !(((applyOrder[a]>>16)==0) && ((applyOrder[a-1]>>16)!=0));
+		// the kernel without the parts this model does not use (fewer registers, more tiles in flight)
+		options.preprocessorMacros = @{@"DIAMOND_MUR": @(murs.empty() ? 0 : 1),
+									   @"DIAMOND_MURMERGE": @(murMerge ? 1 : 0),
+									   @"DIAMOND_MURFIRST": @(murFirst ? 1 : 0),
+									   @"DIAMOND_FASTIDX": @(EnvUInt("OPENEMS_DIAMOND_FASTIDX", 1) ? 1 : 0),
+									   @"DIAMOND_EXC": @((excSeen && Op->GetExcitationExtension()) ? 1 : 0),
+									   @"DIAMOND_RLC": @(rlcs.empty() ? 0 : 1),
+									   @"DIAMOND_UPML": @(upmls.empty() ? 0 : 1),
+									   @"DIAMOND_UIDX16": @(uidx16 ? 1 : 0), @"DIAMOND_U4IDX16": @(u4idx16 ? 1 : 0),
+									   @"DIAMOND_UPML3": @(pml3 ? 1 : 0),
+									   @"DIAMOND_ADE": @(lors.empty() ? 0 : 1),
+									   @"DIAMOND_DEBYE": @(hasDebye ? 1 : 0),
+									   @"DIAMOND_SPLIT": @(split ? 1 : 0),
+									   @"DIAMOND_NX": @(numLines[0]), @"DIAMOND_NY": @(numLines[1]),
+									   @"DIAMOND_NZ": @(numLines[2]), @"DIAMOND_NV": @(numVectors),
+									   @"OFS_XELE": @(ofs.xele), @"OFS_MF": @(ofs.mf), @"OFS_APPLY": @(ofs.apply), @"OFS_RLCI": @(ofs.rlcI),
+									   @"OFS_UPML": @(ofs.upml), @"OFS_AELE": @(ofs.aele), @"OFS_VSIG": @(ofs.vsig), @"OFS_CSIG": @(ofs.csig),
+									   @"OFS_MCOEF": @(ofs.mcoef), @"OFS_RLCC": @(ofs.rlcC), @"OFS_UCOEF": @(ofs.ucoef),
+									   @"OFS_UCOEF4": @(ofs.ucoef4), @"OFS_ADEC": @(ofs.adeC), @"OFS_MSCR": @(ofs.mscr),
+									   @"OFS_RLCS": @(ofs.rlcS), @"OFS_ADES": @(ofs.adeS),
+									   @"EXT_NUMMUR": @(md.ext.numMur), @"EXT_NUMAPPLY": @(md.ext.numApply),
+									   @"EXT_RLCSERIAL": @(md.ext.rlcSerial), @"EXT_NUMUPML": @(md.ext.numUpml),
+									   @"EXT_NUMADE": @(md.ext.numAde), @"EXT_PERIOD0": @(md.ext.period0), @"EXT_LENGTH": @(md.ext.length)};
+		id<MTLLibrary> lib = [md.dev newLibraryWithSource:[NSString stringWithUTF8String:DIAMOND_SOURCE] options:options error:&error];
+		if (lib==nil)
+		{
+			cerr << "Engine_Metal_Diamond: kernel compilation failed: " << [[error localizedDescription] UTF8String] << endl;
+			return false;
+		}
+		id<MTLFunction> fn = [lib newFunctionWithName:@"diamond"];
+		// The threads per tile are 256, 512 or 1024 unless OPENEMS_DIAMOND_TG says otherwise: whole SIMD groups, which the
+		// pipeline may be told (OPENEMS_DIAMOND_TGFLAG=0: not told). Checked against the pipeline's width below.
+		const unsigned int envTG = EnvUInt("OPENEMS_DIAMOND_TG", 0);
+		auto pipeline = [&](bool whole) -> id<MTLComputePipelineState>
+		{
+			MTLComputePipelineDescriptor* desc = [MTLComputePipelineDescriptor new];
+			desc.computeFunction = fn;
+			desc.threadGroupSizeIsMultipleOfThreadExecutionWidth = whole ? YES : NO;
+			return [md.dev newComputePipelineStateWithDescriptor:desc options:MTLPipelineOptionNone reflection:nil error:&error];
+		};
+		bool whole = (EnvUInt("OPENEMS_DIAMOND_TGFLAG", 1)!=0) && (envTG%32==0);
+		md.pso = pipeline(whole);
+		if ((md.pso!=nil) && whole)
+		{
+			const NSUInteger w = md.pso.threadExecutionWidth, mx = md.pso.maxTotalThreadsPerThreadgroup;
+			bool ok = (w>0);
+			for (NSUInteger tg : {(NSUInteger)256, (NSUInteger)512, (NSUInteger)1024, (NSUInteger)envTG})
+				ok = ok && (tg==0 || (std::min(tg, mx) % w)==0);
+			if (!ok)
+				md.pso = pipeline(false);
+		}
+		if (md.pso==nil)
+		{
+			cerr << "Engine_Metal_Diamond: pipeline creation failed: " << [[error localizedDescription] UTF8String] << endl;
+			return false;
+		}
+		md.queue = [md.dev newCommandQueue];
 
 		// tilings: K time steps per block, mountains of width M and valleys of width V in x and y. OPENEMS_DIAMOND_K and
 		// OPENEMS_DIAMOND_TILE (M,V or M:V) set one; otherwise IterateTS gives its first command buffers the tilings below
