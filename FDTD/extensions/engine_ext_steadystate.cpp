@@ -15,6 +15,7 @@
 *	along with this program.  If not, see <http://www.gnu.org/licenses/>.
 */
 
+#include <algorithm>
 #include "engine_ext_steadystate.h"
 #include "operator_ext_steadystate.h"
 #include "FDTD/engine_sse.h"
@@ -83,6 +84,11 @@ unsigned int Engine_Ext_SteadyState::GetUsedHooks() const
 {
 	OPENEMS_HOOKS_DECLARED_BY(Engine_Ext_SteadyState);
 	return APPLY_VOLT | (m_Lines ? LINE_HOOKS | ((m_Op_SS->m_TS_period>2u*m_NrThreads) ? TS_LOCAL : 0) : 0);
+}
+
+unsigned int Engine_Ext_SteadyState::GetMaxBlockDepth() const
+{
+	return std::max(1u, (unsigned int)m_Op_SS->m_TS_period);
 }
 
 bool Engine_Ext_SteadyState::IsEvaluationStep(unsigned int TS) const

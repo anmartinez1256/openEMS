@@ -113,6 +113,10 @@ public:
 	//! The lower line x of every pair (x, x+1) that one of the voltage line hooks couples: a hook on x that reads x+1,
 	//! or a hook on x+1 that reads x (e.g. a Mur ABC on an x-face). Both lines are then swept in one block by one thread.
 	virtual void GetCoupledLines(std::vector<unsigned int>& /*lines*/) const {}
+	//! TS_LOCAL extensions: how many timesteps its line hooks may run in one block of the tiled sweep (OPENEMS_TBLOCK),
+	//! where the x-lines of a block are up to that many timesteps minus one apart, whatever the thread count.
+	//! Unlimited by default; the steady-state detection allows one period.
+	virtual unsigned int GetMaxBlockDepth() const {return ~0u;}
 
 	//! Set the Engine to this extension. This will usually done automatically by Engine::AddExtension
 	virtual void SetEngine(Engine* eng) {m_Eng=eng;}

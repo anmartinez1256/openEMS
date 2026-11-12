@@ -43,8 +43,12 @@ protected:
 	void UpdateVoltages_IJKN(unsigned int startX, unsigned int numX);
 	void UpdateCurrents_IJKN(unsigned int startX, unsigned int numX);
 	//! The loops above, with the coefficients from the packed or the geometry tables (CoefPacked, CoefGeom in the .cpp)
-	template<class C> void UpdateVoltages_IJKN_T(unsigned int startX, unsigned int numX, const C& coef);
-	template<class C> void UpdateCurrents_IJKN_T(unsigned int startX, unsigned int numX, const C& coef);
+	template<class C> void UpdateVoltages_IJKN_T(unsigned int startX, unsigned int numX, const C& coef, unsigned int y0, unsigned int y1);
+	template<class C> void UpdateCurrents_IJKN_T(unsigned int startX, unsigned int numX, const C& coef, unsigned int y0, unsigned int y1);
+	//! The same updates for the y lines [y0, y1) of the x lines only, for the tiled sweep of the multithreaded engine,
+	//! whose threads share a block of x lines; only with UseIJKN()
+	void UpdateVoltagesY(unsigned int startX, unsigned int numX, unsigned int y0, unsigned int y1);
+	void UpdateCurrentsY(unsigned int startX, unsigned int numX, unsigned int y0, unsigned int y1);
 	//! true if both field arrays use the I-J-K-N layout (component stride 1, z stride 3) and the packed or
 	//! the geometry coefficient tables below exist (not with OPENEMS_NO_PACKED_COEFF or after a failed allocation);
 	//! otherwise the generic loops run and Engine_Multithread does not fuse its sweep

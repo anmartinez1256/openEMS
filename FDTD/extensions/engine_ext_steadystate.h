@@ -42,6 +42,9 @@ public:
 	//! records keep three periods, the copies and the count of copied lines are not touched again before the next
 	//! evaluation step), and every evaluation sees the records and copies of its timestep
 	virtual unsigned int GetUsedHooks() const;
+	//! One period: a block of the tiled sweep then holds one evaluation step at most, and the lines that run ahead
+	//! write into the third period of the records. (RunFDTD never asks for more than half a period per call anyway.)
+	virtual unsigned int GetMaxBlockDepth() const;
 
 	virtual void Apply2Voltages();
 	virtual void Apply2Current();

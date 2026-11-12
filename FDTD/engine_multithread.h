@@ -142,6 +142,39 @@ protected:
 	std::vector<Engine_Extension*> m_LineHooks[6]; //!< per hook group: the extensions to call, in order
 	void SetupFused();
 	std::string m_FusedMsg; //!< the last fused-sweep line printed (verbose>0), see ReportFused()
+
+	//! The tiled sweep (OPENEMS_TBLOCK=k, with the fused sweep's conditions): temporal blocking with ONE tile of
+	//! x-lines for all threads, as upstream master's cpu engine does it. A block of k timesteps on a tile [a, b):
+	//! the core runs the voltages of step t on [a+t, b-t) and its currents on [a+t, b-t-1) for t = 0 .. k-1 (no
+	//! shrinking at a domain edge), then the wedge at every tile boundary c the voltages on [c-t, c+t) and the
+	//! currents on [c-t-1, c+t). Each range is a task: every thread updates its y lines of it, then all meet at
+	//! the barrier. Between two updates a hook stage runs the Post and Apply hooks of the task before and the Pre
+	//! hooks of the task after: the x-lines of both are cut once into one share per thread, so all hooks of an
+	//! x-line (and of a coupled pair) run on one thread in the order of a one-thread sweep, and the hooks of other
+	//! lines are independent of them (the line hook contract). Every cell gets the operands of the unfused update
+	//! (bit-identical), and the fields of a tile stay in the cache for k timesteps.
+	struct TileTask
+	{
+		bool volt;               //!< voltages (and their hooks), or currents
+		unsigned int x0, x1;     //!< the x-lines [x0, x1)
+		unsigned int ts;         //!< the timestep within the block
+	};
+	bool m_Tiled;
+	unsigned int m_TileK, m_TileW;
+	std::vector<std::vector<TileTask> > m_TilePlan; //!< [depth]: the tasks of a block of depth timesteps, 1 .. m_TileK
+	std::string m_TiledMsg;
+	//! The threads' shares in the tiled sweep, cumulative in 1/65536 ([0] = 0, [threads] = 65536): the y lines of
+	//! an update and the x-lines of a hook stage are cut at them. Equal at first; BalanceTiled() moves them to the
+	//! measured speed of every thread between two IterateTS() calls (a thread on an efficiency core is slower, and
+	//! every task ends at a barrier, so the slowest share sets the pace). OPENEMS_BALANCE=0 keeps them equal.
+	std::vector<unsigned int> m_TileCum;
+	bool m_TileHooksAll; //!< the hook stages on all threads; OPENEMS_TBLOCK_HOOKS=0: on thread 0 alone
+	void SetupTiled(const std::vector<unsigned int>& coupled);
+	void TiledRun(int threadID, unsigned int iterTS);
+	//! The x-lines of one thread in a hook stage over the lines [p0, p1) and [q0, q1) (either may be empty):
+	//! [s[0], s[1]) and [s[2], s[3]), the second one only when the two ranges have a gap between them
+	void TileHookShare(int threadID, unsigned int p0, unsigned int p1, unsigned int q0, unsigned int q1, unsigned int s[4]) const;
+	void BalanceTiled();
 	void ReportFused(const std::string& msg);
 	void FusedTimestep(int threadID);
 

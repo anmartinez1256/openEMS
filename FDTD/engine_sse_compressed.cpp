@@ -556,7 +556,7 @@ struct CoefGeom
 };
 }
 
-template<class C> void Engine_SSE_Compressed::UpdateVoltages_IJKN_T(unsigned int startX, unsigned int numX, const C& coef)
+template<class C> void Engine_SSE_Compressed::UpdateVoltages_IJKN_T(unsigned int startX, unsigned int numX, const C& coef, unsigned int y0, unsigned int y1)
 {
 	// (x,y,z-vector) holds the three components at [0..2], z-vectors are 3 apart
 	f4vector* __restrict volt = f4_volt_ptr->data();
@@ -572,7 +572,7 @@ template<class C> void Engine_SSE_Compressed::UpdateVoltages_IJKN_T(unsigned int
 	for (unsigned int x=startX; x<startX+numX; ++x)
 	{
 		const ptrdiff_t shx = (x>0) ? sx : 0;
-		for (unsigned int y=0; y<ny; ++y)
+		for (unsigned int y=y0; (y<y1) && (y<ny); ++y)
 		{
 			const ptrdiff_t shy = (y>0) ? sy : 0;
 			f4vector* __restrict v = volt + x*sx + y*sy;
@@ -622,7 +622,7 @@ template<class C> void Engine_SSE_Compressed::UpdateVoltages_IJKN_T(unsigned int
 	}
 }
 
-template<class C> void Engine_SSE_Compressed::UpdateCurrents_IJKN_T(unsigned int startX, unsigned int numX, const C& coef)
+template<class C> void Engine_SSE_Compressed::UpdateCurrents_IJKN_T(unsigned int startX, unsigned int numX, const C& coef, unsigned int y0, unsigned int y1)
 {
 	const f4vector* __restrict volt = f4_volt_ptr->data();
 	f4vector* __restrict curr = f4_curr_ptr->data();
@@ -636,7 +636,7 @@ template<class C> void Engine_SSE_Compressed::UpdateCurrents_IJKN_T(unsigned int
 
 	for (unsigned int x=startX; x<startX+numX; ++x)
 	{
-		for (unsigned int y=0; y+1<ny; ++y)
+		for (unsigned int y=y0; (y<y1) && (y+1<ny); ++y)
 		{
 			const f4vector* __restrict v = volt + x*sx + y*sy;
 			f4vector* __restrict c = curr + x*sx + y*sy;
@@ -688,16 +688,26 @@ template<class C> void Engine_SSE_Compressed::UpdateCurrents_IJKN_T(unsigned int
 
 void Engine_SSE_Compressed::UpdateVoltages_IJKN(unsigned int startX, unsigned int numX)
 {
-	if (!m_MatV.empty())
-		UpdateVoltages_IJKN_T(startX, numX, CoefGeom{m_GeomV.data(), m_MatTabV.data(), m_MatV.data()});
-	else
-		UpdateVoltages_IJKN_T(startX, numX, CoefPacked{m_PackedV.data()->c});
+	UpdateVoltagesY(startX, numX, 0, numLines[1]);
 }
 
 void Engine_SSE_Compressed::UpdateCurrents_IJKN(unsigned int startX, unsigned int numX)
 {
-	if (!m_MatI.empty())
-		UpdateCurrents_IJKN_T(startX, numX, CoefGeom{m_GeomI.data(), m_MatTabI.data(), m_MatI.data()});
+	UpdateCurrentsY(startX, numX, 0, numLines[1]);
+}
+
+void Engine_SSE_Compressed::UpdateVoltagesY(unsigned int startX, unsigned int numX, unsigned int y0, unsigned int y1)
+{
+	if (!m_MatV.empty())
+		UpdateVoltages_IJKN_T(startX, numX, CoefGeom{m_GeomV.data(), m_MatTabV.data(), m_MatV.data()}, y0, y1);
 	else
-		UpdateCurrents_IJKN_T(startX, numX, CoefPacked{m_PackedI.data()->c});
+		UpdateVoltages_IJKN_T(startX, numX, CoefPacked{m_PackedV.data()->c}, y0, y1);
+}
+
+void Engine_SSE_Compressed::UpdateCurrentsY(unsigned int startX, unsigned int numX, unsigned int y0, unsigned int y1)
+{
+	if (!m_MatI.empty())
+		UpdateCurrents_IJKN_T(startX, numX, CoefGeom{m_GeomI.data(), m_MatTabI.data(), m_MatI.data()}, y0, y1);
+	else
+		UpdateCurrents_IJKN_T(startX, numX, CoefPacked{m_PackedI.data()->c}, y0, y1);
 }
