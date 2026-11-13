@@ -42,6 +42,8 @@
 #include <mutex>
 #include <string>
 #include <cstdlib>
+#include <cstdio>
+#include <cstring>
 #ifdef __APPLE__
 #include <sys/sysctl.h>
 #elif !defined(_WIN32)
@@ -109,10 +111,54 @@ static unsigned int PerformanceCores()
 	return 0;
 }
 
-//! first thread count of the automatic search: the performance cores (Apple) or half the hardware threads
+//! the cores of an Apple CPU outside its efficiency cluster: every hw.perflevelN whose name is not "Efficiency"
+//! (an M5: the 4 "Super" cores; an M5 Pro: 5 "Super" + 10 "Performance"); 0 elsewhere or when unknown
+static unsigned int NonEfficiencyCores()
+{
+#ifdef __APPLE__
+	int levels = 0;
+	size_t len = sizeof(levels);
+	if ((sysctlbyname("hw.nperflevels", &levels, &len, NULL, 0)!=0) || (levels<1))
+		return 0;
+	unsigned int sum = 0;
+	for (int k=0; k<levels; ++k)
+	{
+		char key[64], name[64] = {0};
+		snprintf(key, sizeof(key), "hw.perflevel%d.name", k);
+		len = sizeof(name)-1;
+		if (sysctlbyname(key, name, &len, NULL, 0)!=0)
+			return 0;
+		if (strcmp(name, "Efficiency")==0)
+			continue;
+		int cores = 0;
+		snprintf(key, sizeof(key), "hw.perflevel%d.physicalcpu", k);
+		len = sizeof(cores);
+		if ((sysctlbyname(key, &cores, &len, NULL, 0)!=0) || (cores<1))
+			return 0;
+		sum += cores;
+	}
+	return sum;
+#else
+	return 0;
+#endif
+}
+
+//! the tuner's start rule: OPENEMS_TUNE_START=p is the rule up to patch 0040 (start at hw.perflevel0, search
+//! upwards in steps of 2, one step down); unset or anything else starts at every core outside the efficiency
+//! cluster and steps down by 2 for as long as that is faster
+static bool TuneStartAtPerflevel0()
+{
+	const char* env = getenv("OPENEMS_TUNE_START");
+	return env && (strcmp(env, "p")==0);
+}
+
+//! first thread count of the automatic search: the cores outside the efficiency cluster (Apple; with
+//! OPENEMS_TUNE_START=p the performance cores of hw.perflevel0), else half the hardware threads
 static unsigned int StartThreads(unsigned int maxThreads)
 {
-	unsigned int n = PerformanceCores();
+	unsigned int n = TuneStartAtPerflevel0() ? 0 : NonEfficiencyCores();
+	if (n==0)
+		n = PerformanceCores();
 	if (n==0)
 		n = (maxThreads+1)/2;
 	return std::max(1u, std::min(n, maxThreads));
@@ -215,6 +261,7 @@ void Engine_Multithread::Init()
 			m_Tuner.todo.push_back(m_numThreads-2);
 		m_Tuner.speed.assign(m_max_numThreads+1, 0);
 		m_Tuner.refined = false;
+		m_Tuner.descend = !TuneStartAtPerflevel0();
 		m_Tuner.ts = 0;
 		m_Tuner.time = 0;
 		const char* env = getenv("OPENEMS_TUNE_WINDOW_MS");
@@ -453,6 +500,9 @@ void Engine_Multithread::TuneThreads(unsigned int iterTS, double seconds)
 	// clearly slower with more threads: skip the larger counts
 	if ((m_numThreads>t.start) && (speed<0.85*t.best_speed))
 		t.todo.erase(std::remove_if(t.todo.begin(), t.todo.end(), [&](unsigned int n) {return n>m_numThreads;}), t.todo.end());
+	// faster with fewer threads than the start: try 2 fewer still (before the queued counts)
+	if (t.descend && !t.refined && (m_numThreads<t.start) && (t.best==m_numThreads) && (m_numThreads>2) && (t.speed[m_numThreads-2]==0))
+		t.todo.insert(t.todo.begin(), m_numThreads-2);
 	while (true)
 	{
 		while (!t.todo.empty() && (t.speed[t.todo.front()]>0))

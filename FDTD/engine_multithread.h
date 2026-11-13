@@ -248,7 +248,8 @@ protected:
 		std::vector<unsigned int> todo;   //!< thread counts still to time, in this order
 		std::vector<double> speed;        //!< timesteps/s by thread count (0: not timed)
 		bool refined;        //!< the neighbours of the best coarse count are queued
-		double settle;       //!< time left before the timing of the current thread count starts (s)
+		bool descend;        //!< below the start, keep stepping down by 2 while that is faster
+		double settle;      //!< time left before the timing of the current thread count starts (s)
 		unsigned int ts;     //!< timesteps timed with the current thread count
 		double time;         //!< and their time (s)
 		double window;       //!< time to measure each thread count (s)
@@ -257,9 +258,11 @@ protected:
 	} m_Tuner;
 	//! Run \a n timesteps on the threads, returns the time (s)
 	double RunTimesteps(unsigned int n);
-	//! Times P (the performance-core count on Apple, half the hardware threads elsewhere; see StartThreads),
-	//! then P+2, P+4, .. up to the maximum (until one is clearly slower than the best) and P-2, then the two
-	//! neighbours of the fastest; keeps the fastest count. Every candidate is clamped to m_Tuner.maxUse.
+	//! Times P (on Apple the cores outside the efficiency cluster, half the hardware threads elsewhere; see
+	//! StartThreads), then P+2, P+4, .. up to the maximum (until one is clearly slower than the best) and P-2,
+	//! P-4, .. for as long as each is the fastest so far, then the two neighbours of the fastest; keeps the
+	//! fastest count. Every candidate is clamped to m_Tuner.maxUse. OPENEMS_TUNE_START=p: start at the
+	//! performance cores of hw.perflevel0 and stop the way down after P-2 (the rule up to patch 0040).
 	//! (Coarse steps: the speed is not monotonic, e.g. P+1 threads can be slower than P and P+2.)
 	void TuneThreads(unsigned int iterTS, double seconds);
 
