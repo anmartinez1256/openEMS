@@ -65,8 +65,24 @@ public:
 	//! (every position has its own state and reads only its own cell); same operations per position
 	virtual void DoPreVoltageUpdatesLines(unsigned int x0, unsigned int x1);
 	virtual void DoPostVoltageUpdatesLines(unsigned int x0, unsigned int x1);
+	//! with the packed groups, the whole-grid Apply runs the packed line hook over every x-line (one state)
+	virtual void Apply2Voltages();
+	virtual void Apply2VoltagesLines(unsigned int x0, unsigned int x1);
 
 protected:
+	//! Packed groups (OPENEMS_ADE_PACKED=0: off): the positions in groups of up to four of one x-line
+	//! (Engine_Ext_Dispersive::SetupGroups), the state and coefficients of a group in one block of m_BlockStride
+	//! floats, per component n at n*(3P+3)*4: W[pole] (P x 4 lanes), pre (4), correction volt_ADE (4),
+	//! v_relax[pole] (P x 4), v_drive[pole] (P x 4), v_solve (4). Four lanes at a time, the same operations per lane
+	//! as the one-position loops. While packed, every hook (whole grid or lines) uses the blocks.
+	virtual void SetupPacked();
+	bool m_Packed;
+	unsigned int m_BlockStride;
+	std::vector<float> m_Block;
+	void PrePacked(unsigned int x0, unsigned int x1);
+	void PostPacked(unsigned int x0, unsigned int x1);
+	void ApplyPacked(unsigned int x0, unsigned int x1);
+
 	template <typename EngType>
 	void DoPreVoltageUpdatesImpl(EngType* eng);
 

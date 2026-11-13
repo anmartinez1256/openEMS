@@ -18,10 +18,16 @@
 #include "engine_ext_debyematerial.h"
 #include "operator_ext_debyematerial.h"
 #include "FDTD/engine_sse.h"
+#include "tools/global.h"
+#include <cstdlib>
+#include <iostream>
+#include <new>
 
 Engine_Ext_DebyeMaterial::Engine_Ext_DebyeMaterial(Operator_Ext_DebyeMaterial* op_ext_debye) : Engine_Ext_Dispersive(op_ext_debye)
 {
 	m_Op_Ext_Deb = op_ext_debye;
+	m_Packed = false;
+	m_BlockStride = 0;
 	// the base allocated volt_ADE[0], which carries the joint correction
 	unsigned int count = m_Op_Ext_Deb->m_LM_Count.at(0);
 
@@ -94,6 +100,8 @@ void Engine_Ext_DebyeMaterial::DoPreVoltageUpdatesImpl(EngType* eng)
 
 void Engine_Ext_DebyeMaterial::DoPreVoltageUpdates()
 {
+	if (m_Packed)
+		return PrePacked(0, ~0u);
 	ENG_DISPATCH(DoPreVoltageUpdatesImpl);
 }
 
@@ -120,11 +128,171 @@ void Engine_Ext_DebyeMaterial::DoPostVoltageUpdatesImpl(EngType* eng)
 
 void Engine_Ext_DebyeMaterial::DoPostVoltageUpdates()
 {
+	if (m_Packed)
+		return PostPacked(0, ~0u);
 	ENG_DISPATCH(DoPostVoltageUpdatesImpl);
+}
+
+void Engine_Ext_DebyeMaterial::Apply2Voltages()
+{
+	if (m_Packed)
+		return ApplyPacked(0, ~0u);
+	Engine_Ext_Dispersive::Apply2Voltages();
+}
+
+void Engine_Ext_DebyeMaterial::Apply2VoltagesLines(unsigned int x0, unsigned int x1)
+{
+	if (m_Packed)
+		return ApplyPacked(x0, x1);
+	Engine_Ext_Dispersive::Apply2VoltagesLines(x0, x1);
+}
+
+void Engine_Ext_DebyeMaterial::SetupPacked()
+{
+	m_Packed = false;
+	std::vector<float>().swap(m_Block);
+	const char* env = getenv("OPENEMS_ADE_PACKED");
+	if (env && *env && (atoi(env)==0))
+		return;
+	const unsigned int P = m_Op_Ext_Deb->m_PoleCount;
+	// Debye has voltage ADE of order 0 only; the packed hooks replace exactly those
+	if ((P<1) || (m_Op_Ext_Deb->m_Order!=1) || !m_Op_Ext_Deb->m_volt_ADE_On[0] || m_Op_Ext_Deb->m_curr_ADE_On[0])
+		return;
+	if (!SetupGroups())
+		return;
+	const size_t groups = m_GroupX.size();
+	m_BlockStride = 3*(3*P+3)*4;
+	if ((uint64_t)groups*m_BlockStride*sizeof(float) > 2*FieldBytes())
+	{
+		ClearGroups();
+		return;
+	}
+	try
+	{
+		m_Block.assign((size_t)groups*m_BlockStride, 0.0f);
+	}
+	catch (std::bad_alloc&)
+	{
+		ClearGroups();
+		return;
+	}
+	// coefficients, and the current state (zero before the first step) of every used lane
+	for (size_t g=0; g<groups; ++g)
+		for (unsigned int l=0; l<m_GroupLanes[g]; ++l)
+		{
+			const unsigned int i = m_GroupK[g]+l;   // = the original position index (SetupGroups: in x order)
+			for (unsigned int n=0; n<3; ++n)
+			{
+				float* c = &m_Block[g*m_BlockStride + (size_t)n*(3*P+3)*4];
+				for (unsigned int o=0; o<P; ++o)
+				{
+					c[4*o+l] = volt_pole_ADE[o][n][i];
+					c[4*(P+2+o)+l] = m_Op_Ext_Deb->v_relax_ADE[o][n][i];
+					c[4*(2*P+2+o)+l] = m_Op_Ext_Deb->v_drive_ADE[o][n][i];
+				}
+				c[4*P+l] = volt_pre_ADE[n][i];
+				c[4*(P+1)+l] = volt_ADE[0][n][i];
+				c[4*(3*P+2)+l] = m_Op_Ext_Deb->v_solve_ADE[n][i];
+			}
+		}
+	m_Packed = true;
+	if (g_settings.GetVerboseLevel()>1)
+		std::cout << GetExtensionName() << ": packed hooks, " << groups << " groups of " << m_Op_Ext_Deb->m_LM_Count.at(0)
+				  << " positions, " << m_Block.size()*sizeof(float)/1048576.0 << " MiB" << std::endl;
+}
+
+// the operations of DoPreVoltageUpdatesLines() per lane: W = v_relax*W + v_drive*V, pre += W - W_old
+void Engine_Ext_DebyeMaterial::PrePacked(unsigned int x0, unsigned int x1)
+{
+	const float* __restrict volt = (const float*)((Engine_sse*)m_Eng)->f4_volt_ptr->data();
+	unsigned int g0, g1;
+	GroupRange(x0, x1, g0, g1);
+	const unsigned int P = m_Op_Ext_Deb->m_PoleCount;
+	const unsigned int cs = (3*P+3)*4;
+	for (unsigned int g=g0; g<g1; ++g)
+	{
+		float* __restrict b = &m_Block[(size_t)g*m_BlockStride];
+		const unsigned int* __restrict f = &m_GroupFi[12*(size_t)g];
+		for (unsigned int n=0; n<3; ++n)
+		{
+			float* __restrict c = b + n*cs;
+			const unsigned int* fn = f + 4*n;
+			const v4sf v = {volt[fn[0]], volt[fn[1]], volt[fn[2]], volt[fn[3]]};
+			v4sf pre = {0.0f, 0.0f, 0.0f, 0.0f};
+			for (unsigned int o=0; o<P; ++o)
+			{
+				const v4sf w = Load4(c+4*o);
+				const v4sf W = Load4(c+4*(P+2+o))*w + Load4(c+4*(2*P+2+o))*v;
+				pre += W - w;
+				Store4(c+4*o, W);
+			}
+			Store4(c+4*P, pre);
+		}
+	}
+}
+
+// the operations of DoPostVoltageUpdatesLines() per lane: V = (V_raw - pre)*v_solve, correction = V_raw - V, W += v_drive*V
+void Engine_Ext_DebyeMaterial::PostPacked(unsigned int x0, unsigned int x1)
+{
+	const float* __restrict volt = (const float*)((Engine_sse*)m_Eng)->f4_volt_ptr->data();
+	unsigned int g0, g1;
+	GroupRange(x0, x1, g0, g1);
+	const unsigned int P = m_Op_Ext_Deb->m_PoleCount;
+	const unsigned int cs = (3*P+3)*4;
+	for (unsigned int g=g0; g<g1; ++g)
+	{
+		float* __restrict b = &m_Block[(size_t)g*m_BlockStride];
+		const unsigned int* __restrict f = &m_GroupFi[12*(size_t)g];
+		for (unsigned int n=0; n<3; ++n)
+		{
+			float* __restrict c = b + n*cs;
+			const unsigned int* fn = f + 4*n;
+			const v4sf v_raw = {volt[fn[0]], volt[fn[1]], volt[fn[2]], volt[fn[3]]};
+			const v4sf v_n = (v_raw - Load4(c+4*P)) * Load4(c+4*(3*P+2));
+			Store4(c+4*(P+1), v_raw - v_n);
+			for (unsigned int o=0; o<P; ++o)
+				Store4(c+4*o, Load4(c+4*o) + Load4(c+4*(2*P+2+o))*v_n);
+		}
+	}
+}
+
+// the operation of Apply2VoltagesLines() per lane: V -= correction (only the used lanes are written)
+void Engine_Ext_DebyeMaterial::ApplyPacked(unsigned int x0, unsigned int x1)
+{
+	float* __restrict volt = (float*)((Engine_sse*)m_Eng)->f4_volt_ptr->data();
+	unsigned int g0, g1;
+	GroupRange(x0, x1, g0, g1);
+	const unsigned int P = m_Op_Ext_Deb->m_PoleCount;
+	const unsigned int cs = (3*P+3)*4;
+	for (unsigned int g=g0; g<g1; ++g)
+	{
+		const float* __restrict b = &m_Block[(size_t)g*m_BlockStride];
+		const unsigned int* __restrict f = &m_GroupFi[12*(size_t)g];
+		const unsigned int lanes = m_GroupLanes[g];
+		for (unsigned int n=0; n<3; ++n)
+		{
+			const float* c = b + n*cs + 4*(P+1);
+			const unsigned int* fn = f + 4*n;
+			if (lanes==4)
+			{
+				v4sf v = {volt[fn[0]], volt[fn[1]], volt[fn[2]], volt[fn[3]]};
+				v = v - Load4(c);
+				volt[fn[0]] = v[0];
+				volt[fn[1]] = v[1];
+				volt[fn[2]] = v[2];
+				volt[fn[3]] = v[3];
+			}
+			else
+				for (unsigned int l=0; l<lanes; ++l)
+					volt[fn[l]] = volt[fn[l]] - c[l];
+		}
+	}
 }
 
 void Engine_Ext_DebyeMaterial::DoPreVoltageUpdatesLines(unsigned int x0, unsigned int x1)
 {
+	if (m_Packed)
+		return PrePacked(x0, x1);
 	const float* __restrict volt = (const float*)((Engine_sse*)m_Eng)->f4_volt_ptr->data();
 	unsigned int k0, k1;
 	LineRange(0, x0, x1, k0, k1);
@@ -153,6 +321,8 @@ void Engine_Ext_DebyeMaterial::DoPreVoltageUpdatesLines(unsigned int x0, unsigne
 
 void Engine_Ext_DebyeMaterial::DoPostVoltageUpdatesLines(unsigned int x0, unsigned int x1)
 {
+	if (m_Packed)
+		return PostPacked(x0, x1);
 	const float* __restrict volt = (const float*)((Engine_sse*)m_Eng)->f4_volt_ptr->data();
 	unsigned int k0, k1;
 	LineRange(0, x0, x1, k0, k1);

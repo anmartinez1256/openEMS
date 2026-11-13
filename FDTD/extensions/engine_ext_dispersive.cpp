@@ -22,6 +22,7 @@
 #include <algorithm>
 #include <cstdlib>
 #include <iostream>
+#include <new>
 
 Engine_Ext_Dispersive::Engine_Ext_Dispersive(Operator_Ext_Dispersive* op_ext_disp) : Engine_Extension(op_ext_disp)
 {
@@ -159,6 +160,76 @@ void Engine_Ext_Dispersive::SetupLines()
 	if (g_settings.GetVerboseLevel()>1)
 		std::cout << GetExtensionName() << ": line hooks, " << (m_Op_Ext_Disp->m_Order>0 ? m_Op_Ext_Disp->m_LM_Count.at(0) : 0) << " positions of order 0, orders merged: voltages "
 				  << (m_VoltMerged ? m_VoltOrders.size() : 0) << ", currents " << (m_CurrMerged ? m_CurrOrders.size() : 0) << std::endl;
+	SetupPacked();
+}
+
+uint64_t Engine_Ext_Dispersive::FieldBytes() const
+{
+	const Engine_sse* eng = (const Engine_sse*)m_Eng;
+	return 2*(uint64_t)eng->f4_volt_ptr->size()*sizeof(f4vector);
+}
+
+void Engine_Ext_Dispersive::ClearGroups()
+{
+	std::vector<unsigned int>().swap(m_GroupX);
+	std::vector<unsigned int>().swap(m_GroupK);
+	std::vector<unsigned char>().swap(m_GroupLanes);
+	std::vector<unsigned int>().swap(m_GroupFi);
+}
+
+bool Engine_Ext_Dispersive::SetupGroups()
+{
+	ClearGroups();
+	if (!m_LinesReady || (m_Op_Ext_Disp->m_Order<1))
+		return false;
+	const std::vector<unsigned int>& idx = m_SortedIdx[0];
+	const std::vector<unsigned int>& X = m_SortedX[0];
+	const std::vector<unsigned int>& fi = m_FloatIdx[0];
+	const size_t count = idx.size();
+	if (count==0)
+		return false;
+	// the packed state is kept per sorted position k: the positions must already be in x order, and each listed once
+	// (four lanes of one group are written together)
+	for (size_t k=0; k<count; ++k)
+		if (idx[k]!=k)
+			return false;
+	{
+		std::vector<unsigned int> f(count);
+		for (size_t k=0; k<count; ++k)
+			f[k] = fi[3*k];
+		std::sort(f.begin(), f.end());
+		if (std::adjacent_find(f.begin(), f.end())!=f.end())
+			return false;
+	}
+	try
+	{
+		for (size_t k=0; k<count; )
+		{
+			const unsigned int x = X[k];
+			unsigned char lanes = 0;
+			while ((k+lanes<count) && (lanes<4) && (X[k+lanes]==x))
+				++lanes;
+			m_GroupX.push_back(x);
+			m_GroupK.push_back((unsigned int)k);
+			m_GroupLanes.push_back(lanes);
+			for (unsigned int n=0; n<3; ++n)
+				for (unsigned int l=0; l<4; ++l)
+					m_GroupFi.push_back(fi[3*(k+(l<lanes ? l : 0))+n]);
+			k += lanes;
+		}
+	}
+	catch (std::bad_alloc&)
+	{
+		ClearGroups();
+		return false;
+	}
+	return true;
+}
+
+void Engine_Ext_Dispersive::GroupRange(unsigned int x0, unsigned int x1, unsigned int& g0, unsigned int& g1) const
+{
+	g0 = std::lower_bound(m_GroupX.begin(), m_GroupX.end(), x0) - m_GroupX.begin();
+	g1 = std::lower_bound(m_GroupX.begin(), m_GroupX.end(), x1) - m_GroupX.begin();
 }
 
 bool Engine_Ext_Dispersive::MergeOrders(const bool* on, std::vector<int>& orders) const

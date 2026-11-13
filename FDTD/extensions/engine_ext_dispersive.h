@@ -68,7 +68,23 @@ protected:
 	//! the merged Apply2*Lines(): field[float index] -= ADE of every order, in order
 	void ApplyMerged(float* field, FDTD_FLOAT*** ade, const std::vector<int>& orders, unsigned int x0, unsigned int x1);
 	void SetupLines();
+	//! called at the end of SetupLines(): subclasses build their packed groups here
+	virtual void SetupPacked() {}
 	void LineRange(int o, unsigned int x0, unsigned int x1, unsigned int& k0, unsigned int& k1) const;
+
+	//! Groups for packed hooks: the positions of order 0 (in x order, each listed once) in groups of up to four
+	//! positions of ONE x-line, so a group is never shared by two threads; built by SetupGroups(), false (and empty)
+	//! when the positions do not allow it
+	bool SetupGroups();
+	void ClearGroups();
+	//! the groups of the x-lines [x0, x1)
+	void GroupRange(unsigned int x0, unsigned int x1, unsigned int& g0, unsigned int& g1) const;
+	std::vector<unsigned int> m_GroupX;      //!< [g]: x-line of group g (ascending)
+	std::vector<unsigned int> m_GroupK;      //!< [g]: first position (index k of order 0) of group g
+	std::vector<unsigned char> m_GroupLanes; //!< [g]: positions in group g, 1..4
+	std::vector<unsigned int> m_GroupFi;     //!< [12*g+4*n+l]: float index of component n of lane l (unused lanes: lane 0's)
+	//! the bytes of the engine's voltage and current arrays (the limit for packed copies: twice this)
+	uint64_t FieldBytes() const;
 	bool AnyVoltADE() const;
 	bool AnyCurrADE() const;
 
