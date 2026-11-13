@@ -61,8 +61,11 @@ protected:
 	};
 	PackedSide m_PV, m_PI;
 	virtual void SetupPacked();
+	virtual uint64_t PackedBytes() const {return (uint64_t)(m_PV.block.size()+m_PI.block.size())*sizeof(float);}
+	//! r: why the side was not packed, need: the bytes it would have needed, used: the bytes already packed in this engine
 	bool SetupSide(PackedSide& s, bool merged, const std::vector<int>& orders, FDTD_FLOAT*** ade, FDTD_FLOAT*** lor,
-				   FDTD_FLOAT*** c_int, FDTD_FLOAT*** c_ext, FDTD_FLOAT*** c_lor, const bool* lor_on);
+				   FDTD_FLOAT*** c_int, FDTD_FLOAT*** c_ext, FDTD_FLOAT*** c_lor, const bool* lor_on,
+				   PackRefusal& r, uint64_t& need, uint64_t& used);
 	void PrePacked(const float* field, PackedSide& s, unsigned int x0, unsigned int x1);
 	void ApplyPacked(float* field, const PackedSide& s, unsigned int x0, unsigned int x1);
 

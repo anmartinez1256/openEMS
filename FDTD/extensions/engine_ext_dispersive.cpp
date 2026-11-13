@@ -169,6 +169,36 @@ uint64_t Engine_Ext_Dispersive::FieldBytes() const
 	return 2*(uint64_t)eng->f4_volt_ptr->size()*sizeof(f4vector);
 }
 
+uint64_t Engine_Ext_Dispersive::PackedBytesOfOthers() const
+{
+	uint64_t sum = 0;
+	if (!m_Eng)
+		return 0;
+	for (size_t n=0; n<m_Eng->GetExtensionCount(); ++n)
+	{
+		const Engine_Ext_Dispersive* e = dynamic_cast<const Engine_Ext_Dispersive*>(m_Eng->GetExtension(n));
+		if (e && (e!=this))
+			sum += e->PackedBytes();
+	}
+	return sum;
+}
+
+bool Engine_Ext_Dispersive::PackedOff()
+{
+	const char* env = getenv("OPENEMS_ADE_PACKED");
+	return env && *env && (atoi(env)==0);
+}
+
+void Engine_Ext_Dispersive::ReportPackRefusal(PackRefusal r, const char* what, uint64_t need, uint64_t used) const
+{
+	if ((r==PACK_OFF) && (g_settings.GetVerboseLevel()>1))
+		std::cout << GetExtensionName() << ": ADE packing not used" << what << " (OPENEMS_ADE_PACKED=0)" << std::endl;
+	else if (((r==PACK_LIMIT) || (r==PACK_ALLOC)) && (g_settings.GetVerboseLevel()>0))
+		std::cout << GetExtensionName() << ": ADE packing not used" << what << " (" << (r==PACK_LIMIT ? "memory limit" : "allocation failed")
+				  << "): would need " << need << " bytes, limit " << 2*FieldBytes() << " bytes (twice the field arrays), "
+				  << used << " bytes already packed in this engine" << std::endl;
+}
+
 void Engine_Ext_Dispersive::ClearGroups()
 {
 	std::vector<unsigned int>().swap(m_GroupX);

@@ -84,18 +84,28 @@ void Engine_Ext_LorentzMaterial::SetupPacked()
 {
 	m_PV = PackedSide();
 	m_PI = PackedSide();
-	const char* env = getenv("OPENEMS_ADE_PACKED");
-	if (env && *env && (atoi(env)==0))
-		return;
+#if defined(__GNUC__) || defined(__clang__)
 	if (!m_VoltMerged && !m_CurrMerged)
 		return;
 	if (!SetupGroups())
 		return;
 	Operator_Ext_LorentzMaterial* op = m_Op_Ext_Lor;
+	PackRefusal rv, ri;
+	uint64_t nv, ni, uv, ui;
 	const bool v = SetupSide(m_PV, m_VoltMerged, m_VoltOrders, volt_ADE, volt_Lor_ADE, op->v_int_ADE, op->v_ext_ADE,
-							 op->v_Lor_ADE, op->m_volt_Lor_ADE_On);
+							 op->v_Lor_ADE, op->m_volt_Lor_ADE_On, rv, nv, uv);
 	const bool i = SetupSide(m_PI, m_CurrMerged, m_CurrOrders, curr_ADE, curr_Lor_ADE, op->i_int_ADE, op->i_ext_ADE,
-							 op->i_Lor_ADE, op->m_curr_Lor_ADE_On);
+							 op->i_Lor_ADE, op->m_curr_Lor_ADE_On, ri, ni, ui);
+	// one line for the extension: a side refused by the memory limit or a failed allocation, else OPENEMS_ADE_PACKED=0
+	{
+		const bool mv = (rv==PACK_LIMIT) || (rv==PACK_ALLOC);
+		const bool mi = (ri==PACK_LIMIT) || (ri==PACK_ALLOC);
+		if (mv || mi)
+			ReportPackRefusal(mv ? rv : ri, mv && mi ? " for voltages and currents" : (mv ? " for voltages" : " for currents"),
+							  (mv ? nv : 0) + (mi ? ni : 0), mv ? uv : ui);
+		else if ((rv==PACK_OFF) || (ri==PACK_OFF))
+			ReportPackRefusal(PACK_OFF, "", 0, 0);
+	}
 	if (!v && !i)
 	{
 		ClearGroups();
@@ -105,20 +115,36 @@ void Engine_Ext_LorentzMaterial::SetupPacked()
 		std::cout << GetExtensionName() << ": packed hooks, " << m_GroupX.size() << " groups of " << m_Op_Ext_Lor->m_LM_Count.at(0)
 				  << " positions, voltages " << (v ? m_PV.orders.size() : 0) << " orders, currents " << (i ? m_PI.orders.size() : 0)
 				  << " orders, " << (m_PV.block.size()+m_PI.block.size())*sizeof(float)/1048576.0 << " MiB" << std::endl;
+#endif
 }
 
 bool Engine_Ext_LorentzMaterial::SetupSide(PackedSide& s, bool merged, const std::vector<int>& orders, FDTD_FLOAT*** ade,
-	FDTD_FLOAT*** lor, FDTD_FLOAT*** c_int, FDTD_FLOAT*** c_ext, FDTD_FLOAT*** c_lor, const bool* lor_on)
+	FDTD_FLOAT*** lor, FDTD_FLOAT*** c_int, FDTD_FLOAT*** c_ext, FDTD_FLOAT*** c_lor, const bool* lor_on,
+	PackRefusal& r, uint64_t& need, uint64_t& used)
 {
 	s = PackedSide();
+	r = PACK_NOT_ELIGIBLE;
+	need = 0;
+	used = 0;
 	// the groups are built on the positions of order 0; MergeOrders() made sure every merged order has the same ones
 	if (!merged || orders.empty() || (m_FloatIdx[orders[0]]!=m_FloatIdx[0]))
 		return false;
+	if (PackedOff())
+	{
+		r = PACK_OFF;
+		return false;
+	}
 	const size_t groups = m_GroupX.size();
 	const unsigned int no = orders.size();
 	const unsigned int stride = 3*no*20;
-	if ((uint64_t)(m_PV.block.size()+m_PI.block.size()+groups*stride)*sizeof(float) > 2*FieldBytes())
+	// the limit counts every packed block of this engine: the other extensions' and this one's other side (s is empty)
+	need = (uint64_t)groups*stride*sizeof(float);
+	used = PackedBytesOfOthers() + PackedBytes();
+	if (used+need > 2*FieldBytes())
+	{
+		r = PACK_LIMIT;
 		return false;
+	}
 	try
 	{
 		s.block.assign(groups*stride, 0.0f);
@@ -126,8 +152,10 @@ bool Engine_Ext_LorentzMaterial::SetupSide(PackedSide& s, bool merged, const std
 	catch (std::bad_alloc&)
 	{
 		s = PackedSide();
+		r = PACK_ALLOC;
 		return false;
 	}
+	r = PACK_OK;
 	s.stride = stride;
 	s.orders = orders;
 	for (int o : orders)
@@ -156,6 +184,7 @@ bool Engine_Ext_LorentzMaterial::SetupSide(PackedSide& s, bool merged, const std
 	return true;
 }
 
+#if defined(__GNUC__) || defined(__clang__)
 // the operations of PreMerged() per lane
 void Engine_Ext_LorentzMaterial::PrePacked(const float* __restrict field, PackedSide& s, unsigned int x0, unsigned int x1)
 {
@@ -229,6 +258,13 @@ void Engine_Ext_LorentzMaterial::ApplyPacked(float* __restrict field, const Pack
 		}
 	}
 }
+#else
+// without the vector extensions SetupPacked() never packs (m_PV.on, m_PI.on stay false), so these are never called
+void Engine_Ext_LorentzMaterial::PrePacked(const float* field, PackedSide& s, unsigned int x0, unsigned int x1)
+{UNUSED(field); UNUSED(s); UNUSED(x0); UNUSED(x1);}
+void Engine_Ext_LorentzMaterial::ApplyPacked(float* field, const PackedSide& s, unsigned int x0, unsigned int x1)
+{UNUSED(field); UNUSED(s); UNUSED(x0); UNUSED(x1);}
+#endif
 
 void Engine_Ext_LorentzMaterial::Apply2Voltages()
 {

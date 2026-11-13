@@ -151,20 +151,27 @@ void Engine_Ext_DebyeMaterial::SetupPacked()
 {
 	m_Packed = false;
 	std::vector<float>().swap(m_Block);
-	const char* env = getenv("OPENEMS_ADE_PACKED");
-	if (env && *env && (atoi(env)==0))
-		return;
+#if defined(__GNUC__) || defined(__clang__)
 	const unsigned int P = m_Op_Ext_Deb->m_PoleCount;
 	// Debye has voltage ADE of order 0 only; the packed hooks replace exactly those
 	if ((P<1) || (m_Op_Ext_Deb->m_Order!=1) || !m_Op_Ext_Deb->m_volt_ADE_On[0] || m_Op_Ext_Deb->m_curr_ADE_On[0])
 		return;
 	if (!SetupGroups())
 		return;
-	const size_t groups = m_GroupX.size();
-	m_BlockStride = 3*(3*P+3)*4;
-	if ((uint64_t)groups*m_BlockStride*sizeof(float) > 2*FieldBytes())
+	if (PackedOff())
 	{
 		ClearGroups();
+		ReportPackRefusal(PACK_OFF, "", 0, 0);
+		return;
+	}
+	const size_t groups = m_GroupX.size();
+	m_BlockStride = 3*(3*P+3)*4;
+	const uint64_t need = (uint64_t)groups*m_BlockStride*sizeof(float);
+	const uint64_t used = PackedBytesOfOthers();
+	if (used+need > 2*FieldBytes())
+	{
+		ClearGroups();
+		ReportPackRefusal(PACK_LIMIT, "", need, used);
 		return;
 	}
 	try
@@ -173,7 +180,9 @@ void Engine_Ext_DebyeMaterial::SetupPacked()
 	}
 	catch (std::bad_alloc&)
 	{
+		std::vector<float>().swap(m_Block);
 		ClearGroups();
+		ReportPackRefusal(PACK_ALLOC, "", need, used);
 		return;
 	}
 	// coefficients, and the current state (zero before the first step) of every used lane
@@ -199,8 +208,10 @@ void Engine_Ext_DebyeMaterial::SetupPacked()
 	if (g_settings.GetVerboseLevel()>1)
 		std::cout << GetExtensionName() << ": packed hooks, " << groups << " groups of " << m_Op_Ext_Deb->m_LM_Count.at(0)
 				  << " positions, " << m_Block.size()*sizeof(float)/1048576.0 << " MiB" << std::endl;
+#endif
 }
 
+#if defined(__GNUC__) || defined(__clang__)
 // the operations of DoPreVoltageUpdatesLines() per lane: W = v_relax*W + v_drive*V, pre += W - W_old
 void Engine_Ext_DebyeMaterial::PrePacked(unsigned int x0, unsigned int x1)
 {
@@ -288,6 +299,12 @@ void Engine_Ext_DebyeMaterial::ApplyPacked(unsigned int x0, unsigned int x1)
 		}
 	}
 }
+#else
+// without the vector extensions SetupPacked() never packs (m_Packed stays false), so these are never called
+void Engine_Ext_DebyeMaterial::PrePacked(unsigned int x0, unsigned int x1) {UNUSED(x0); UNUSED(x1);}
+void Engine_Ext_DebyeMaterial::PostPacked(unsigned int x0, unsigned int x1) {UNUSED(x0); UNUSED(x1);}
+void Engine_Ext_DebyeMaterial::ApplyPacked(unsigned int x0, unsigned int x1) {UNUSED(x0); UNUSED(x1);}
+#endif
 
 void Engine_Ext_DebyeMaterial::DoPreVoltageUpdatesLines(unsigned int x0, unsigned int x1)
 {

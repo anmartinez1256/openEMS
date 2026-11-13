@@ -85,6 +85,18 @@ protected:
 	std::vector<unsigned int> m_GroupFi;     //!< [12*g+4*n+l]: float index of component n of lane l (unused lanes: lane 0's)
 	//! the bytes of the engine's voltage and current arrays (the limit for packed copies: twice this)
 	uint64_t FieldBytes() const;
+	//! Packed blocks need the GCC/clang vector extensions (v4sf, Load4/Store4); other compilers never build them.
+	//! The limit counts per engine: the packed blocks of all dispersive extensions of one engine together stay
+	//! within twice the field bytes (summed over the extensions of m_Eng, so every engine starts at zero).
+	enum PackRefusal {PACK_OK=0, PACK_NOT_ELIGIBLE, PACK_OFF, PACK_LIMIT, PACK_ALLOC};
+	//! the bytes of this extension's packed blocks
+	virtual uint64_t PackedBytes() const {return 0;}
+	//! the bytes of the packed blocks of the other dispersive extensions of this engine
+	uint64_t PackedBytesOfOthers() const;
+	//! OPENEMS_ADE_PACKED=0
+	static bool PackedOff();
+	//! the line for packing not used: OPENEMS_ADE_PACKED=0 at verbose > 1, memory limit / failed allocation at verbose >= 1
+	void ReportPackRefusal(PackRefusal r, const char* what, uint64_t need, uint64_t used) const;
 	bool AnyVoltADE() const;
 	bool AnyCurrADE() const;
 

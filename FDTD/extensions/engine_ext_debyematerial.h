@@ -76,6 +76,7 @@ protected:
 	//! v_relax[pole] (P x 4), v_drive[pole] (P x 4), v_solve (4). Four lanes at a time, the same operations per lane
 	//! as the one-position loops. While packed, every hook (whole grid or lines) uses the blocks.
 	virtual void SetupPacked();
+	virtual uint64_t PackedBytes() const {return (uint64_t)m_Block.size()*sizeof(float);}
 	bool m_Packed;
 	unsigned int m_BlockStride;
 	std::vector<float> m_Block;
